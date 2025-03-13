@@ -1,2 +1,2 @@
-# LLM-Ad-Integration
+# llm-ad-integration
 Embedding Advertisements into LLM Generations
