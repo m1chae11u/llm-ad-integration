@@ -23,7 +23,8 @@ llm-ad-integration/
 │   └── utils/                 # Shared utilities
 ```
 
---- This is only if we are using RunPod
+--- 
+This is only if we are using RunPod
 
 ## 1. Set Up RunPod Container
 
@@ -47,8 +48,8 @@ Host runpod
 ```
 Maybe we can automate this with a Python or shell script.
 
---- Both Locally and Remotely (On RunPod)
-
+---
+Both Locally and Remotely (On RunPod)
 ## 2. Set Up Virtual Environment
 
 ```bash
@@ -92,8 +93,8 @@ This script will:
 - Judge coherence/helpfulness/salience
 - Prepare for reward modeling
 
---- Only for RunPod
-
+--- 
+Only for RunPod
 ## 6. Cleanup
 
 To save GPU space:
