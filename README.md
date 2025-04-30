@@ -24,9 +24,7 @@ llm-ad-integration/
 ```
 
 --- 
-This is only if we are using RunPod
-
-## 1. Set Up RunPod Container
+## 1. Set Up RunPod Container (This is only if we are using RunPod)
 
 1. Go to [runpod.io](https://runpod.io/) and launch a container (e.g., PyTorch template, 16GB or 24GB GPU). (if we don't have yet, CHECK IN WITH TEAM FIRST)
 2. Enable **SSH Access** and copy the SSH command provided.
@@ -49,8 +47,8 @@ Host runpod
 Maybe we can automate this with a Python or shell script.
 
 ---
-Both Locally and Remotely (On RunPod)
-## 2. Set Up Virtual Environment
+
+## 2. Set Up Virtual Environment - Both Locally and Remotely (On RunPod)
 
 ```bash
 python3 -m venv venv
@@ -94,8 +92,8 @@ This script will:
 - Prepare for reward modeling
 
 --- 
-Only for RunPod
-## 6. Cleanup
+
+## 6. Cleanup (Only for RunPod)
 
 To save GPU space:
 ```bash
