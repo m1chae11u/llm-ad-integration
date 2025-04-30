@@ -22,4 +22,4 @@ Response:
 Ad Information:
 {ad_info}
     """
-    return call_llm_and_extract_json(prompt, keys=["S1", "S2", "S3", "explanation"])
+    return call_deepseek_and_extract_json(prompt, keys=["S1", "S2", "S3", "explanation"])

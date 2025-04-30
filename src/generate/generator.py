@@ -1,72 +1,46 @@
-import requests
-import json
-import time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
-from runpod_config import RUNPOD_API_KEY, RUNPOD_ENDPOINT_ID, MAX_TOKENS, TEMPERATURE, TOP_P
 
-print("\nInitializing RunPod connection...")
-headers = {
-    "Authorization": f"Bearer {RUNPOD_API_KEY}",
-    "Content-Type": "application/json"
-}
+print("\nLoading DeepSeek model and tokenizer...")
+model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto",
+    trust_remote_code=True
+)
 
-def call_runpod(prompt: str) -> str:
-    """Call RunPod API to generate response."""
-    print(f"\nCalling RunPod API with prompt length: {len(prompt)}")
+def generate_text(prompt: str) -> str:
+    """Generate text using local DeepSeek model."""
+    print(f"\nGenerating with prompt length: {len(prompt)}")
     
-    payload = {
-        "input": {
-            "prompt": prompt,
-            "max_tokens": MAX_TOKENS,
-            "temperature": TEMPERATURE,
-            "top_p": TOP_P
-        }
-    }
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     
-    try:
-        # Start the job
-        response = requests.post(
-            f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run",
-            headers=headers,
-            json=payload
-        )
-        response.raise_for_status()
-        job_id = response.json()["id"]
-        print(f"Job started with ID: {job_id}")
-        
-        # Poll for completion
-        while True:
-            status_response = requests.get(
-                f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{job_id}",
-                headers=headers
-            )
-            status_response.raise_for_status()
-            status = status_response.json()
-            
-            if status["status"] == "COMPLETED":
-                print("Job completed successfully")
-                return status["output"]["text"]
-            elif status["status"] == "FAILED":
-                print("Job failed")
-                raise Exception(f"RunPod job failed: {status.get('error', 'Unknown error')}")
-            
-            print("Job still running, waiting...")
-            time.sleep(2)  # Wait 2 seconds before checking again
-            
-    except Exception as e:
-        print(f"Error calling RunPod API: {e}")
-        raise
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        temperature=0.7,
+        top_p=0.95,
+        pad_token_id=tokenizer.eos_token_id
+    )
+    
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Remove the original prompt from the response
+    response = response[len(prompt):].strip()
+    return response
 
 def generate_response_without_ad(user_query: str) -> str:
     prompt = get_prompt_without_ad(user_query)
-    response = call_runpod(prompt)
+    response = generate_text(prompt)
     if "FINAL ANSWER:" in response:
         return response.split("FINAL ANSWER:")[-1].strip()
     return response.strip()
 
 def generate_response_with_ad(user_query: str, ad_text: str) -> str:
     prompt = get_prompt_with_ad(user_query, ad_text)
-    response = call_runpod(prompt)
+    response = generate_text(prompt)
     if "FINAL ANSWER:" in response:
         return response.split("FINAL ANSWER:")[-1].strip()
     return response.strip()

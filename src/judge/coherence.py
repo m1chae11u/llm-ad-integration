@@ -22,4 +22,4 @@ User Query:
 LLM Response:
 {response}
     """
-    return call_llm_and_extract_json(prompt, keys=["C1", "C2", "C3", "C4", "explanation"])
+    return call_deepseek_and_extract_json(prompt, keys=["C1", "C2", "C3", "C4", "explanation"])

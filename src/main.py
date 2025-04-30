@@ -1,5 +1,4 @@
 # main.py
-
 from generate.generator import generate_responses
 from judge.coherence import judge_coherence
 from judge.helpfulness import judge_helpfulness
@@ -15,7 +14,7 @@ df = pd.read_csv("data/merged_queries_ads.csv")
 print(f"Loaded {len(df)} rows of data")
 
 checkpoint_file = "checkpoints/judge_results.csv"
-checkpoint_interval = 10
+checkpoint_interval = 5
 
 if os.path.exists(checkpoint_file):
     results = pd.read_csv(checkpoint_file).to_dict(orient="records")
