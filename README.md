@@ -4,7 +4,7 @@ This project integrates large language model (LLM) generation with ad relevance 
 
 ---
 
-## 🧠 Project Structure
+## Project Structure
 ```
 llm-ad-integration/
 ├── archived/                  # all the archived files are here
@@ -23,7 +23,7 @@ llm-ad-integration/
 │   └── utils/                 # Shared utilities
 ```
 
----
+--- This is only if we are using RunPod
 
 ## 1. Set Up RunPod Container
 
@@ -47,9 +47,9 @@ Host runpod
 ```
 Maybe we can automate this with a Python or shell script.
 
----
+--- Both Locally and Remotely (On RunPod)
 
-## 2. Set Up Virtual Environment (Inside Pod)
+## 2. Set Up Virtual Environment
 
 ```bash
 python3 -m venv venv
@@ -92,7 +92,7 @@ This script will:
 - Judge coherence/helpfulness/salience
 - Prepare for reward modeling
 
----
+--- Only for RunPod
 
 ## 6. Cleanup
 
