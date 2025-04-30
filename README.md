@@ -1,6 +1,6 @@
 # LLM Ad Integration Project
 
-This project integrates large language model (LLM) generation with ad relevance scoring, reward modeling, and reinforcement learning. It runs on a GPU container via [RunPod.io](https://runpod.io/) and connects through VSCode or Cursor using SSH.
+This project integrates large language model (LLM) generation with ad relevance scoring, reward modeling, and reinforcement learning. 
 
 ---
 
