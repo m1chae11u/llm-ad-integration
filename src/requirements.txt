@@ -1,0 +1,10 @@
+transformers
+accelerate
+pandas
+tqdm
+openai
+scikit-learn
+numpy
+rich
+torch
+faiss-cpu
