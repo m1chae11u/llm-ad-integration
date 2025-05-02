@@ -22,6 +22,8 @@ print("\nAvailable columns:", df.columns.tolist())  # Print available columns
 checkpoint_file = "checkpoints/judge_results.csv"
 checkpoint_interval = 5
 
+os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+
 if os.path.exists(checkpoint_file):
     results = pd.read_csv(checkpoint_file).to_dict(orient="records")
     processed_ids = {int(r["ad_index"]) for r in results}  # Changed from Query ID to ad_index
