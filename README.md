@@ -27,8 +27,24 @@ llm-ad-integration/
 ## 1. Set Up RunPod Container (This is only if we are using RunPod)
 
 1. Go to [runpod.io](https://runpod.io/) and launch a container (e.g., PyTorch template, 16GB or 24GB GPU). (if we don't have yet, CHECK IN WITH TEAM FIRST)
-2. Enable **SSH Access** and copy the SSH command provided.
-3. On your local machine, open your terminal and run:
+
+2. On RunPod:
+- Enable SSH Access
+- Copy the SSH connection command provided (you'll need this later)
+
+3. On your local machine, 
+- If you haven't gotten an SSH key, generate one:
+  ```bash
+    ssh-keygen -t ed25519 -C "your_email@example.com"
+  ```
+- Press Enter to accept the default location: '~/.ssh/id_ed25519'
+- Add your public key to RunPod: 
+  ```bash
+    cat ~/.ssh/id_ed25519.pub
+  ```
+- Copy the output and paste it into RunPod’s SSH settings.
+
+- Open your terminal and run:
    ```bash
    ssh -i ~/.ssh/id_ed25519 your_pod_user@ssh.runpod.io
    ```
