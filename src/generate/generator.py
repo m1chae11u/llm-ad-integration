@@ -22,23 +22,26 @@ print("Model loaded and compiled successfully!")
 
 def clean_response(response: str) -> str:
     """Clean up the response by removing thinking processes and other unwanted content."""
-    # Remove any content between <think> tags
+    # If <think> is present, remove everything before and including it
+    response = re.sub(r'^.*?<think>', '', response, flags=re.DOTALL)
+
+    # Remove any content between <think> and </think> (if it wasn't already stripped above)
     response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
-    
+
     # Remove any content that looks like thinking/planning
     response = re.sub(r'(?:Let me|I\'ll|I will|First|Next|Then|Finally).*?(?=\n\n|\Z)', '', response, flags=re.DOTALL)
-    
+
     # Remove any system messages or AI disclaimers
     response = re.sub(r'(?:As an AI|I am an AI|I\'m an AI|As a language model).*?(?=\n\n|\Z)', '', response, flags=re.DOTALL)
-    
-    # Remove any content before "FINAL ANSWER:" if it exists
+
+    # If "FINAL ANSWER:" exists, keep only what's after it
     if "FINAL ANSWER:" in response:
         response = response.split("FINAL ANSWER:")[-1]
-    
-    # Clean up any remaining whitespace and newlines
-    response = response.strip()
-    
-    return response
+
+    # Clean up whitespace
+    return response.strip()
+
+
 
 def generate_text(prompt: str) -> str:
     """Generate text using local DeepSeek model."""
