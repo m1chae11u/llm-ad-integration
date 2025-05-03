@@ -26,7 +26,7 @@ def load_model():
 def clean_response(response: str) -> str:
     """Clean up the response by removing thinking processes and other unwanted content."""
     # If <think> is present, remove everything before and including it
-    response = re.sub(r'^.*?<think>', '', response, flags=re.DOTALL)
+    response = re.sub(r'^.*?</think>', '', response, flags=re.DOTALL)
 
     # Remove any content between <think> and </think> (if it wasn't already stripped above)
     response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
