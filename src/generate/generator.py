@@ -4,21 +4,24 @@ import re
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
 from tqdm import tqdm
 
-# Load model and tokenizer only once
-print("\nLoading DeepSeek model and tokenizer...")
-model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="auto",
-    trust_remote_code=True
-)
+_model = None
+_tokenizer = None
 
-# Optimize model for inference
-print("Compiling model for faster inference...")
-model = torch.compile(model)
-print("Model loaded and compiled successfully!")
+def load_model():
+    global _model, _tokenizer
+    if _model is None or _tokenizer is None:
+        print("\nLoading DeepSeek model and tokenizer...")
+        model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+        _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        _model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        print("✅ Model loaded")
+    return _model, _tokenizer
+
 
 def clean_response(response: str) -> str:
     """Clean up the response by removing thinking processes and other unwanted content."""
@@ -46,7 +49,8 @@ def clean_response(response: str) -> str:
 def generate_text(prompt: str) -> str:
     """Generate text using local DeepSeek model."""
     print(f"\nGenerating with prompt length: {len(prompt)}")
-    
+    model, tokenizer = load_model()
+
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     
     print("Starting generation...")

@@ -7,11 +7,14 @@ from judge.detectability import judge_detectability
 import pandas as pd
 import os
 from tqdm import tqdm
-import torch
+import torch, gc
+gc.collect()
+torch.cuda.empty_cache()
+torch.cuda.ipc_collect()
 import time
 
 # Set batch size for processing
-BATCH_SIZE = 4  # Process 4 queries at a time
+BATCH_SIZE = 2  # Process 4 queries at a time
 
 # --- Load data ---
 print("Loading data...")
@@ -20,7 +23,7 @@ print(f"Loaded {len(df)} rows of data")
 print("\nAvailable columns:", df.columns.tolist())  # Print available columns
 
 checkpoint_file = "checkpoints/judge_results.csv"
-checkpoint_interval = 5
+checkpoint_interval = 1
 
 os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
 
