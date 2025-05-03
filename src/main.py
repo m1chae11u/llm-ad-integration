@@ -103,6 +103,9 @@ for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing batches"):
         if len(results) % checkpoint_interval == 0:
             pd.DataFrame(results).to_csv(checkpoint_file, index=False)
             print(f"Saved checkpoint with {len(results)} results")
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
 # Final save
 pd.DataFrame(results).to_csv(checkpoint_file, index=False)

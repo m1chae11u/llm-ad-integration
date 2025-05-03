@@ -56,7 +56,7 @@ def generate_text(prompt: str) -> str:
     print("Starting generation...")
     outputs = model.generate(
         **inputs,
-        max_new_tokens=512,      # Reduced from 512 to speed up generation
+        max_new_tokens=512,      
         temperature=0.7,         # Balanced between creativity and coherence
         top_p=0.95,             # Allow for diverse but high-quality responses
         do_sample=True,         # Enable sampling for better quality
