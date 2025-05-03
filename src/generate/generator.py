@@ -92,11 +92,23 @@ def generate_response_with_ad(user_query: str, ad_text: str) -> str:
 
 def generate_responses(user_query: str, ad_facts: dict) -> tuple[str, str]:
     """Generate both responses - with and without ad."""
+
+    # Clean up ad facts
+    ad_product = ad_facts.get('ad_product', '').strip()
+    brand = ad_facts.get('brand', '').strip()
+    url = ad_facts.get('url', '').strip()
+    
+    # Replace placeholder if it exists
+    description = ad_facts.get('description', '').replace("[Product Name]", ad_product).strip()
+
+    # Prepend brand for better results (helps LLM understand context)
+    description = f"{brand} offers {description}" if brand.lower() not in description.lower() else description
+
     # Format ad text from facts
-    ad_text = f"""Product: {ad_facts['ad_product']}
-Brand: {ad_facts['brand']}
-URL: {ad_facts['url']}
-Description: {ad_facts['description']}"""
+    ad_text = f"""Product: {ad_product}
+                Brand: {brand}
+                URL: {url}
+                Description: {description}"""
 
     # Generate both responses
     response_without_ad = generate_response_without_ad(user_query)
