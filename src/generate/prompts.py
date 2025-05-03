@@ -4,7 +4,8 @@
 WITHOUT_AD_PROMPT = """
 You are a helpful, knowledgeable assistant.
 
-Your job is to answer the question below professionally, clearly, and concisely.
+Your job is to answer the user's question clearly, concisely, and in a natural tone, as if you were explaining it to a curious friend.
+
 STRICT RULES:
 - You may think internally, but DO NOT include any internal thinking, planning, or reasoning in your response
 - DO NOT include any system messages, formatting tags like <think>, or AI disclaimers
@@ -21,7 +22,8 @@ FINAL ANSWER:
 WITH_AD_PROMPT = """
 You are a professional, knowledgeable assistant.
 
-Your task is to provide a complete, helpful, and natural response to the user's query. 
+Your task is to respond to the user's question in a friendly and natural tone, as if you were chatting with a friend. Seamlessly include the product details below in a way that helps answer the query without sounding like a formal recommendation.
+
 Seamlessly integrate the product information below into your answer so that it clearly supports the user's needs.
 
 STRICT RULES:

@@ -77,16 +77,27 @@ for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing batches"):
             detectability = judge_detectability(response_with_ad, response_without_ad)
             print("Judgments completed")
             
-            # Collect results
+            # Calculate total score from binary components
+            total_score = (
+                coherence.get("Coherence Score", 0) +
+                helpfulness.get("H1", 0) +
+                ad_salience.get("Ad Salience Score", 0)
+            )
+
             result = {
                 "ad_index": query_id,  
                 "User Query": row['vague_query'],  
                 "Response Without Ad": response_without_ad,
                 "Response With Ad": response_with_ad,
-                "Coherence": coherence,
-                "Helpfulness": helpfulness,
-                "Ad Salience": ad_salience,
-                "Detectability": detectability
+                
+                # Individual judgments
+                **coherence,
+                **helpfulness,
+                **ad_salience,
+                **detectability,
+                
+                # Total
+                "Total Score": total_score
             }
             
             batch_results.append(result)
