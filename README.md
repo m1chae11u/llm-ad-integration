@@ -123,3 +123,49 @@ huggingface-cli cache purge
 - `.venv`, `__pycache__`, and `.env` should be excluded via `.gitignore`.
 - Do not hardcode RunPod IPs — update your SSH config instead.
 
++-----------------------------------------------------+
+|        Step 1: Load Data (merged_queries_ads.csv)   |
++-------------------------------+---------------------+
+                                |
+                                v
++-----------------------------------------------------+
+|  Step 2: generate_responses(query, ad_facts, model) |
+|        → Response Without Ad (A)                    |
+|        → Response With Ad (B)                       |
++-----------------------------------------------------+
+                                |
+                                v
++-----------------------------------------------------+
+|  Step 3: Judging                                     |
+|   ├─ judge_detectability(A, B)                       |
+|   ├─ judge_coherence(B, query)                       |
+|   ├─ judge_helpfulness(query, B)                     |
+|   └─ judge_salience(query, B, ad_facts)              |
++-----------------------------------------------------+
+                                |
+                                v
++-----------------------------------------------------+
+| Step 4: compute_reward()                             |
+|   = Sum of judge scores + (1 - detectability)        |
++-----------------------------------------------------+
+                                |
+                                v
++-----------------------------------------------------+
+| Step 5: PPOTrainer.step(query_tensor, B, reward)     |
+|   (Fine-tune policy model)                           |
++-----------------------------------------------------+
+                                |
+                                v
++-----------------------------------------------------+
+| 🔁 Step 5.5: Resample Past Query (every N steps)     |
+|   • Pick a past query                                |
+|   • Generate response with *updated* model           |
+|   • Compute new reward & log                         |
++-----------------------------------------------------+
+                                |
+                                v
++-----------------------------------------------------+
+| Step 6: Logging & Model Saving                       |
+|   • Save reward + breakdown to CSV                   |
+|   • Periodically save model + tokenizer              |
++-----------------------------------------------------+
