@@ -7,7 +7,7 @@ from tqdm import tqdm
 from trl import PPOTrainer, PPOConfig
 
 from generate.generator import generate_responses
-from reward import compute_reward
+from training.reward import compute_reward
 
 def run_ppo_finetuning(model, tokenizer, model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"):
     # --- PPO config & trainer ---

@@ -1,7 +1,6 @@
 # from generate.generator import generate_responses
 # from reward import compute_reward  
 # import pandas as pd
-# import torch
 # import gc
 # import os
 # from tqdm import tqdm
@@ -79,6 +78,7 @@
 # print("\n🏁 PPO fine-tuning complete.")
 
 
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from training.evaluation import evaluate_logged_responses
 from training.ppo_loop import run_ppo_finetuning
