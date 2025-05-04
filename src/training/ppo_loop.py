@@ -12,7 +12,6 @@ from training.reward import compute_reward
 def run_ppo_finetuning(model, tokenizer, model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"):
     # --- PPO config & trainer ---
     ppo_config = PPOConfig(
-        model_name=model_name,
         batch_size=1,
         mini_batch_size=1,
         learning_rate=1.4e-5,
