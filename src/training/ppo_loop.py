@@ -11,13 +11,22 @@ from training.reward import compute_reward
 
 def run_ppo_finetuning(model, tokenizer, model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"):
     # --- PPO config & trainer ---
+
+    # PPO config first
     ppo_config = PPOConfig(
-        batch_size=1,
-        mini_batch_size=1,
         learning_rate=1.4e-5,
-        optimize_cuda_cache=True
+        batch_size=1,
+        mini_batch_size=1
     )
-    ppo_trainer = PPOTrainer(config=ppo_config, model=model, tokenizer=tokenizer)
+
+    # Fix: Provide all required positional args for trl==0.4.7
+    ppo_trainer = PPOTrainer(
+        ppo_config,
+        model=model,
+        ref_model=None,
+        tokenizer=tokenizer,
+        dataset=[]  # You are calling `.step()` manually, so pass an empty list
+    )
 
     # --- Load data ---
     print("Loading data...")
@@ -90,7 +99,7 @@ def run_ppo_finetuning(model, tokenizer, model_name="deepseek-ai/DeepSeek-R1-Dis
                 ])
 
             # Periodically resample and log updated rollout
-            if idx % 20 == 0:  # Every 20 steps, resample a past query
+            if idx % 20 == 0:
                 sample_idx = max(0, idx - 10)
                 past_query = df.iloc[sample_idx]["vague_query"]
                 past_ad_facts = {
@@ -108,12 +117,12 @@ def run_ppo_finetuning(model, tokenizer, model_name="deepseek-ai/DeepSeek-R1-Dis
 
             print(f"[{idx}] Reward: {reward_score:.2f} | Query: {user_query[:40]}")
 
-            # Memory cleanup
+            # Cleanup
             gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-            # Periodic model saving
+            # Save model periodically
             if idx % 50 == 0 or idx == len(df) - 1:
                 output_dir = "checkpoints/ppo_finetuned_deepseek"
                 os.makedirs(output_dir, exist_ok=True)
@@ -125,5 +134,15 @@ def run_ppo_finetuning(model, tokenizer, model_name="deepseek-ai/DeepSeek-R1-Dis
         except Exception as e:
             print(f"Error on row {idx}: {e}")
             continue
+
+    # --- Summary Statistics ---
+    summary_file = "logs/ppo_reward_summary.csv"
+    rewards_df = pd.read_csv(log_file)
+    if not rewards_df.empty:
+        rewards_df["Step"] = pd.to_numeric(rewards_df["Step"], errors='coerce')
+        rewards_df["Total Reward"] = pd.to_numeric(rewards_df["Total Reward"], errors='coerce')
+        rewards_df.dropna(subset=["Total Reward"], inplace=True)
+        rewards_df.groupby(rewards_df["Step"] // 10 * 10)["Total Reward"].mean().to_csv(summary_file)
+        print(f"\n📈 PPO reward summary saved to {summary_file}")
 
     print("\nPPO fine-tuning complete.")
