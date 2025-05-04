@@ -1,123 +1,102 @@
-# main.py
-from generate.generator import generate_responses
-from judge.coherence import judge_coherence
-from judge.helpfulness import judge_helpfulness
-from judge.salience import judge_ad_salience
-from judge.detectability import judge_detectability
-import pandas as pd
-import os
-from tqdm import tqdm
-import torch, gc
-gc.collect()
-torch.cuda.empty_cache()
-torch.cuda.ipc_collect()
-import time
+# from generate.generator import generate_responses
+# from reward import compute_reward  
+# import pandas as pd
+# import torch
+# import gc
+# import os
+# from tqdm import tqdm
+# import time
 
-# Set batch size for processing
-BATCH_SIZE = 2  # Process 4 queries at a time
+# from transformers import AutoModelForCausalLM, AutoTokenizer
+# from trl import PPOTrainer, PPOConfig
 
-# --- Load data ---
-print("Loading data...")
-df = pd.read_csv("data/merged_queries_ads.csv") 
-print(f"Loaded {len(df)} rows of data")
-print("\nAvailable columns:", df.columns.tolist())  # Print available columns
+# # --- Load model and tokenizer ---
+# print("Loading DeepSeek model...")
+# MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+# tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+# model = AutoModelForCausalLM.from_pretrained(
+#     MODEL_NAME,
+#     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+#     device_map="auto",
+#     trust_remote_code=True
+# )
+# print("Model loaded\n")
 
-checkpoint_file = "checkpoints/judge_results.csv"
-checkpoint_interval = 1
+# # --- PPO config & trainer ---
+# ppo_config = PPOConfig(
+#     model_name=MODEL_NAME,
+#     batch_size=1,
+#     mini_batch_size=1,
+#     learning_rate=1.4e-5,
+#     optimize_cuda_cache=True
+# )
+# ppo_trainer = PPOTrainer(config=ppo_config, model=model, tokenizer=tokenizer)
 
-os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+# # --- Load data ---
+# print("Loading data...")
+# df = pd.read_csv("data/merged_queries_ads.csv")
+# print(f"Loaded {len(df)} rows\n")
 
-if os.path.exists(checkpoint_file):
-    results = pd.read_csv(checkpoint_file).to_dict(orient="records")
-    processed_ids = {int(r["ad_index"]) for r in results}  # Changed from Query ID to ad_index
-    print(f"Found {len(processed_ids)} previously processed queries")
-else:
-    results = []
-    processed_ids = set()
-    print("No previous checkpoint found, starting from scratch")
+# # --- PPO loop ---
+# for idx, row in tqdm(df.iterrows(), total=len(df), desc="PPO Fine-tuning"):
+#     try:
+#         user_query = row["vague_query"]
+#         ad_facts = {
+#             "ad_product": row["ad_product"],
+#             "brand": row["brand"],
+#             "url": row["url"],
+#             "description": row["ad_description"]
+#         }
 
-# --- Main Loop ---
-print("\nStarting processing...")
-total_queries = len(df)
-processed_count = 0
+#         # Tokenize query (for PPO step)
+#         query_tensor = tokenizer(user_query, return_tensors="pt").input_ids.to(model.device)
 
-# Process in batches
-for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing batches"):
-    batch = df.iloc[i:i+BATCH_SIZE]
-    batch_results = []
-    
-    for _, row in batch.iterrows():
-        query_id = int(row["ad_index"])  # Changed from Query ID to ad_index
-        if query_id in processed_ids:
-            continue
-            
-        try:
-            print(f"\nProcessing query {query_id} ({processed_count + 1}/{total_queries})")
-            
-            # Format ad facts
-            ad_facts = {
-                'ad_product': row['ad_product'],
-                'brand': row['brand'],
-                'url': row['url'],
-                'description': row['ad_description']
-            }
-            
-            # Generate responses
-            print("Starting response generation...")
-            start_time = time.time()
-            response_without_ad, response_with_ad = generate_responses(row['vague_query'], ad_facts)
-            generation_time = time.time() - start_time
-            print(f"Generation completed in {generation_time:.2f} seconds")
-            
-            # Run judgments
-            print("Running judgments...")
-            coherence = judge_coherence(response_with_ad, row['vague_query'])
-            helpfulness = judge_helpfulness(row['vague_query'], response_with_ad)
-            ad_salience = judge_ad_salience(row['vague_query'], response_with_ad, ad_facts)
-            detectability = judge_detectability(response_with_ad, response_without_ad)
-            print("Judgments completed")
-            
-            # Calculate total score from binary components
-            total_score = (
-                coherence.get("Coherence Score", 0) +
-                helpfulness.get("H1", 0) +
-                ad_salience.get("Ad Salience Score", 0)
-            )
+#         # Generate responses
+#         response_without_ad, response_with_ad = generate_responses(user_query, ad_facts, model, tokenizer)
 
-            result = {
-                "ad_index": query_id,  
-                "User Query": row['vague_query'],  
-                "Response Without Ad": response_without_ad,
-                "Response With Ad": response_with_ad,
-                
-                # Individual judgments
-                **coherence,
-                **helpfulness,
-                **ad_salience,
-                **detectability,
-                
-                # Total
-                "Total Score": total_score
-            }
-            
-            batch_results.append(result)
-            processed_ids.add(query_id)
-            processed_count += 1
-            
-        except Exception as e:
-            print(f"Error processing query {query_id}: {str(e)}")
-            continue
-    
-    # Save batch results
-    if batch_results:
-        results.extend(batch_results)
-        if len(results) % checkpoint_interval == 0:
-            pd.DataFrame(results).to_csv(checkpoint_file, index=False)
-            print(f"Saved checkpoint with {len(results)} results")
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+#         # Compute reward using judges
+#         reward_score = compute_reward(user_query, response_with_ad, response_without_ad, ad_facts)
+#         reward_tensor = torch.tensor([reward_score]).to(model.device)
 
-# Final save
-pd.DataFrame(results).to_csv(checkpoint_file, index=False)
-print(f"\nProcessing complete. Total results: {len(results)}")
+#         # PPO step: fine-tune on one query-response pair
+#         ppo_trainer.step(
+#             [query_tensor.squeeze(0)],
+#             [tokenizer.encode(response_with_ad, return_tensors="pt").squeeze(0).to(model.device)],
+#             [reward_tensor]
+#         )
+
+#         print(f"[{idx}] Reward: {reward_score:.2f} | Query: {user_query[:40]}")
+
+#         # Optional cleanup
+#         gc.collect()
+#         torch.cuda.empty_cache()
+#         torch.cuda.ipc_collect()
+
+#     except Exception as e:
+#         print(f"Error on row {idx}: {e}")
+#         continue
+
+# print("\n🏁 PPO fine-tuning complete.")
+
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from evaluation import evaluate_logged_responses
+from training.ppo_loop import run_ppo_finetuning
+
+def load_model_and_tokenizer():
+    print("Loading DeepSeek model...")
+    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+        trust_remote_code=True
+    )
+    print("✅ Model loaded\n")
+    return model, tokenizer
+
+if __name__ == "__main__":
+    model, tokenizer = load_model_and_tokenizer()
+    run_ppo_finetuning(model, tokenizer)
+    evaluate_logged_responses("logs/full_responses_log.csv")
