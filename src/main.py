@@ -80,7 +80,7 @@
 
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from evaluation import evaluate_logged_responses
+from training.evaluation import evaluate_logged_responses
 from training.ppo_loop import run_ppo_finetuning
 
 def load_model_and_tokenizer():
