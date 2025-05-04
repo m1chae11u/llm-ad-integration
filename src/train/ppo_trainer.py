@@ -1,5 +1,7 @@
 from transformers import AutoTokenizer
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from judge.coherence import judge_coherence
 from judge.helpfulness import judge_helpfulness
 from judge.salience import judge_ad_salience
@@ -8,12 +10,25 @@ import random
 import csv
 from datetime import datetime
 import os
+from torch.optim import Adam
+import numpy as np
 
 class PPOTrainer:
-    def __init__(self, model, tokenizer_name="your-model-name", save_every=100):
+    def __init__(self, model, tokenizer_name="your-model-name", save_every=100, 
+                 learning_rate=1e-5, gamma=0.99, clip_epsilon=0.2, 
+                 value_coef=0.5, entropy_coef=0.01):
         self.model = model
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.save_every = save_every
+        
+        # PPO hyperparameters
+        self.gamma = gamma
+        self.clip_epsilon = clip_epsilon
+        self.value_coef = value_coef
+        self.entropy_coef = entropy_coef
+        
+        # Optimizer
+        self.optimizer = Adam(self.model.parameters(), lr=learning_rate)
         
         # Create directories
         os.makedirs("logs", exist_ok=True)
@@ -26,6 +41,75 @@ class PPOTrainer:
             writer = csv.writer(f)
             writer.writerow(['step', 'query', 'response', 'coherence', 'helpfulness', 
                            'salience', 'detectability', 'total_reward'])
+
+    def compute_advantages(self, rewards, values, dones):
+        """Compute advantages using GAE (Generalized Advantage Estimation)"""
+        advantages = []
+        gae = 0
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0
+            else:
+                next_value = values[t + 1]
+            
+            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
+            gae = delta + self.gamma * self.gamma * gae * (1 - dones[t])
+            advantages.insert(0, gae)
+        
+        advantages = torch.tensor(advantages)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages
+
+    def step(self, query_tensor, response_tensor, reward):
+        """Perform a PPO update step"""
+        # Get model outputs
+        outputs = self.model(
+            input_ids=query_tensor,
+            labels=response_tensor,
+            return_dict=True
+        )
+        
+        # Get log probabilities of actions
+        log_probs = F.log_softmax(outputs.logits, dim=-1)
+        action_log_probs = log_probs.gather(1, response_tensor.unsqueeze(-1)).squeeze(-1)
+        
+        # Get value estimates
+        values = outputs.value
+        
+        # Compute advantages
+        advantages = self.compute_advantages(
+            reward.unsqueeze(0),
+            values.unsqueeze(0),
+            torch.zeros(1)  # Assuming no episode termination
+        )
+        
+        # Compute PPO loss
+        ratio = torch.exp(action_log_probs - action_log_probs.detach())
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+        
+        # Value loss
+        value_loss = F.mse_loss(values, reward)
+        
+        # Entropy bonus
+        entropy = -(log_probs * torch.exp(log_probs)).sum(-1).mean()
+        
+        # Total loss
+        loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+        
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+        self.optimizer.step()
+        
+        return {
+            'policy_loss': policy_loss.item(),
+            'value_loss': value_loss.item(),
+            'entropy': entropy.item(),
+            'total_loss': loss.item()
+        }
 
     def save_checkpoint(self, step):
         """Save model and tokenizer checkpoints"""
@@ -69,11 +153,6 @@ class PPOTrainer:
             "detectability": detectability
         }
 
-    def step(self, query_tensor, response_tensor, reward):
-        # Your PPO update logic here
-        # This is a placeholder - implement your actual PPO update
-        pass
-
     def train(self, training_data, num_steps, resample_interval=100):
         past_queries = []
         
@@ -88,7 +167,7 @@ class PPOTrainer:
             
             # Step 3: PPO update
             query_tensor = self.tokenizer(query, return_tensors="pt").input_ids
-            self.step(query_tensor, response_tensor, torch.tensor([reward]))
+            ppo_results = self.step(query_tensor, response_tensor, torch.tensor([reward]))
             
             # Step 4: Log results
             with open(self.log_file, 'a', newline='') as f:
