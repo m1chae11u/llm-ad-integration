@@ -15,9 +15,11 @@ def clean_response(response: str) -> str:
 
 def generate_text(prompt: str, model, tokenizer) -> str:
     """Generate text using passed-in model and tokenizer."""
-    print(f"\nGenerating with prompt length: {len(prompt)}")
+    # Get device from model parameters
+    device = next(model.parameters()).device
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    print(f"Generating with prompt length: {len(prompt)}")
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     print("Starting generation...")
     outputs = model.generate(

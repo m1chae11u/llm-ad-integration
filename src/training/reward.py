@@ -43,8 +43,29 @@ def compute_reward(query, response_with_ad, response_without_ad, ad_facts={}):
             detectability_reward  # keep weight 1 for now
         )
 
-        return reward # total reward score would be 0-8
+        # Construct the full details dictionary
+        reward_details = {
+            **coherence,
+            **helpfulness,
+            **salience,
+            **detect,
+            "Coherence Score": coherence_score,
+            "Helpfulness Score": helpfulness_score,
+            "Ad Salience Score": salience_score,
+            "Detectability Reward": detectability_reward,
+            "Total Score": reward
+        }
+
+        return reward_details
 
     except Exception as e:
         print(f"compute_reward failed: {e}")
-        return 0.0
+        # Return a dictionary with default values on failure
+        return {
+            "C1": 0, "C2": 0, "C3": 0, "C4": 0,
+            "H1": 0,
+            "S1": 0, "S2": 0, "S3": 0,
+            "detectability_cosine": 0.5, "similarity_cosine": 0.0, "detectability_bert": 0.0, "bert_f1": 0.0,
+            "Coherence Explanation": "Failed", "Helpfulness Explanation": "Failed", "Ad Salience Explanation": "Failed",
+            "Coherence Score": 0, "Helpfulness Score": 0, "Ad Salience Score": 0, "Detectability Reward": 0, "Total Score": 0.0
+        }

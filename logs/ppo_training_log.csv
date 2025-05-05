@@ -1,0 +1,1 @@
+Step,Query,Response Without Ad,Response With Ad,C1,C2,C3,C4,Coherence Explanation,Coherence Score,H1,Helpfulness Explanation,Helpfulness Score,S1,S2,S3,Ad Salience Explanation,Ad Salience Score,Detectability Cosine,Similarity Cosine,Detectability BERT,BERT F1,Total Reward
