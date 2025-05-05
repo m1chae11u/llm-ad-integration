@@ -12,6 +12,9 @@ from judge import (
 )
 from generate.generator import clean_response, generate_responses
 
+# ✅ Set memory fragmentation prevention
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 def compute_ppo_loss(old_log_probs, new_log_probs, advantages, clip_range=0.2):
     ratio = torch.exp(new_log_probs - old_log_probs)
     clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
@@ -22,6 +25,8 @@ def compute_advantages(reward, value):
 
 def run_manual_ppo(model, tokenizer):
     device = model.device
+    model.gradient_checkpointing_enable()  # ✅ Save memory by recomputing
+    model = model.half()                   # ✅ Use float16 for smaller memory
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
@@ -69,66 +74,79 @@ Description: {ad_facts['description']}"""
                 "D": round(reward_values[3], 4)
             })
         except Exception as e:
-            print(f"❌ Skipping row {idx} due to judge error: {e}")
+            print(f"❌ Skipping row {idx} due to error: {e}")
             continue
 
-        input_ids = tokenizer(query, return_tensors="pt").input_ids.to(device)
-        response_ids = tokenizer(cleaned, return_tensors="pt").input_ids.to(device)[0]
-        input_plus_response = torch.cat([input_ids[0], response_ids])
-        inputs = input_plus_response.unsqueeze(0)
-        labels = input_plus_response[1:]
+        try:
+            input_ids = tokenizer(
+                query, return_tensors="pt", padding=True, truncation=True, max_length=1024
+            ).input_ids.to(device)
+            response_ids = tokenizer(
+                cleaned, return_tensors="pt", padding=True, truncation=True, max_length=512
+            ).input_ids.to(device)[0]
+            input_plus_response = torch.cat([input_ids[0], response_ids])
+            inputs = input_plus_response.unsqueeze(0)
+            labels = input_plus_response[1:]
 
-        logits = model(inputs).logits[0, :-1]
-        log_probs = F.log_softmax(logits, dim=-1)
-        chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
-        old_logprob = chosen_log_probs.sum()
+            logits = model(inputs).logits[0, :-1]
+            log_probs = F.log_softmax(logits, dim=-1)
+            chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
+            old_logprob = chosen_log_probs.sum()
 
-        value = reward.detach()
-        advantage = compute_advantages(reward, value)
+            value = reward.detach()
+            advantage = compute_advantages(reward, value)
 
-        model.train()
-        logits = model(inputs).logits[0, :-1]
-        new_log_probs = F.log_softmax(logits, dim=-1)[torch.arange(len(labels)), labels].sum()
-        loss = compute_ppo_loss(old_logprob.detach(), new_log_probs, advantage)
+            model.train()
+            logits = model(inputs).logits[0, :-1]
+            new_log_probs = F.log_softmax(logits, dim=-1)[torch.arange(len(labels)), labels].sum()
+            loss = compute_ppo_loss(old_logprob.detach(), new_log_probs, advantage)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        model.eval()
-        torch.cuda.empty_cache()  # ⬅️ clear memory after each step
-        torch.cuda.ipc_collect()  # ⬅️ clear memory after each step  
-        pbar.set_postfix({
-            "Reward": f"{reward.item():.3f}",
-            "Loss": f"{loss.item():.4f}",
-            "C": reward_values[0],
-            "H": reward_values[1],
-            "S": reward_values[2],
-            "D": round(reward_values[3], 4)
-        })
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.eval()
 
-        logs.append({
-            "idx": idx,
-            "reward": reward.item(),
-            "loss": loss.item(),
-            "response": cleaned,
-            "C1": score_coh.get("C1", 0),
-            "C2": score_coh.get("C2", 0),
-            "C3": score_coh.get("C3", 0),
-            "C4": score_coh.get("C4", 0),
-            "H1": score_help.get("H1", 0),
-            "S1": score_sal.get("S1", 0),
-            "S2": score_sal.get("S2", 0),
-            "S3": score_sal.get("S3", 0),
-            "Detect_Cosine": score_det.get("detectability_cosine"),
-            "Detect_BERT": score_det.get("detectability_bert")
-        })
+            # ✅ Free GPU memory
+            del input_ids, response_ids, inputs, labels, logits, log_probs, new_log_probs, chosen_log_probs
+            torch.cuda.empty_cache()
 
-        if idx % 50 == 0:
-            os.makedirs("checkpoints/ppo_manual", exist_ok=True)
-            model.save_pretrained("checkpoints/ppo_manual")
-            tokenizer.save_pretrained("checkpoints/ppo_manual")
-            pd.DataFrame(logs).to_csv("logs/ppo_manual_log.csv", index=False)
-            print(f"💾 Saved checkpoint & logs at step {idx}")
+            pbar.set_postfix({
+                "Reward": f"{reward.item():.3f}",
+                "Loss": f"{loss.item():.4f}",
+                "C": reward_values[0],
+                "H": reward_values[1],
+                "S": reward_values[2],
+                "D": round(reward_values[3], 4)
+            })
+
+            logs.append({
+                "idx": idx,
+                "reward": reward.item(),
+                "loss": loss.item(),
+                "response": cleaned,
+                "C1": score_coh.get("C1", 0),
+                "C2": score_coh.get("C2", 0),
+                "C3": score_coh.get("C3", 0),
+                "C4": score_coh.get("C4", 0),
+                "H1": score_help.get("H1", 0),
+                "S1": score_sal.get("S1", 0),
+                "S2": score_sal.get("S2", 0),
+                "S3": score_sal.get("S3", 0),
+                "Detect_Cosine": score_det.get("detectability_cosine"),
+                "Detect_BERT": score_det.get("detectability_bert")
+            })
+
+            if idx % 50 == 0:
+                os.makedirs("checkpoints/ppo_manual", exist_ok=True)
+                model.save_pretrained("checkpoints/ppo_manual")
+                tokenizer.save_pretrained("checkpoints/ppo_manual")
+                pd.DataFrame(logs).to_csv("logs/ppo_manual_log.csv", index=False)
+                print(f"💾 Saved checkpoint & logs at step {idx}")
+
+        except torch.cuda.OutOfMemoryError as oom:
+            print(f"🔥 CUDA OOM at row {idx}: {oom}")
+            torch.cuda.empty_cache()
+            continue
 
     pd.DataFrame(logs).to_csv("logs/ppo_manual_log.csv", index=False)
     print("✅ PPO training complete. Final log saved to logs/ppo_manual_log.csv")
