@@ -11,7 +11,7 @@ from judge import (
     judge_ad_salience,
     judge_detectability
 )
-from generate.generator import clean_response, generate_responses
+from generate.generator import generate_responses
 
 # ✅ Prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -30,13 +30,13 @@ def run_manual_ppo(model, tokenizer):
 
     df = pd.read_csv("data/merged_queries_ads.csv")
     df = df.iloc[:3]
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-6)
 
     log_path = "logs/ppo_manual_log.csv"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     if not os.path.exists(log_path):
-        pd.DataFrame(columns=["idx", "reward", "loss", "response", "C1", "C2", "C3", "C4",
-                              "H1", "S1", "S2", "S3", "Detect_Cosine"]).to_csv(log_path, index=False)
+        pd.DataFrame(columns=["idx", "query", "reward", "loss", "response", "C1", "C2", "C3", "C4",
+                              "H1", "S1", "S2", "S3", "Detect_Cosine", "Detect_BERT"]).to_csv(log_path, index=False)
 
     pbar = tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)
     for idx, row in enumerate(pbar):
@@ -51,6 +51,8 @@ def run_manual_ppo(model, tokenizer):
         try:
             with torch.no_grad():
                 response_without_ad, response_with_ad = generate_responses(query, ad_facts, model, tokenizer)
+                print(f"\n🟦 [Row {idx}] Response WITHOUT ad:\n{response_without_ad}\n")
+                print(f"🟨 [Row {idx}] Response WITH ad:\n{response_with_ad}\n")
 
             ad_text = f"""Product: {ad_facts['ad_product']}
                         Brand: {ad_facts['brand']}
@@ -125,13 +127,11 @@ def run_manual_ppo(model, tokenizer):
             inputs = input_plus_response.unsqueeze(0)
             labels = input_plus_response[1:]
 
-            with torch.no_grad():
-                logits = model(inputs).logits[0, :-1]
-                logits = torch.clamp(logits, -50, 50)  # Stability fix
-                log_probs = F.log_softmax(logits, dim=-1)
-                chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
-                old_logprob = chosen_log_probs.sum()
-
+            logits = model(inputs).logits[0, :-1]
+            logits = torch.clamp(logits, -50, 50)
+            log_probs = F.log_softmax(logits, dim=-1)
+            chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
+            old_logprob = chosen_log_probs.sum()
             value = reward.detach()
             advantage = compute_advantages(reward, value)
 
@@ -161,6 +161,7 @@ def run_manual_ppo(model, tokenizer):
 
             pd.DataFrame([{
                 "idx": idx,
+                "query": query,
                 "reward": reward.item(),
                 "loss": loss.item(),
                 "response": response_with_ad,
@@ -172,7 +173,8 @@ def run_manual_ppo(model, tokenizer):
                 "S1": score_sal.get("S1", 0),
                 "S2": score_sal.get("S2", 0),
                 "S3": score_sal.get("S3", 0),
-                "Detect_Cosine": score_det.get("detectability_cosine")
+                "Detect_Cosine": score_det.get("detectability_cosine"),
+                "Detect_BERT": score_det.get("detectability_bert")
             }]).to_csv(log_path, mode="a", header=False, index=False)
             if idx % 50 == 0:
                 os.makedirs("checkpoints/ppo_manual", exist_ok=True)

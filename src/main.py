@@ -1,4 +1,6 @@
 import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -12,7 +14,7 @@ def load_model_and_tokenizer():
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        torch_dtype=torch.float32,
         device_map="auto",
         trust_remote_code=True
     )
@@ -23,4 +25,8 @@ def load_model_and_tokenizer():
 if __name__ == "__main__":
     model, tokenizer = load_model_and_tokenizer()
     run_manual_ppo(model, tokenizer)
-    evaluate_logged_responses("logs/ppo_training_log.csv")  # optional
+    # Optionally evaluate logged responses
+    try:
+        evaluate_logged_responses("logs/ppo_manual_log.csv")
+    except FileNotFoundError:
+        print("Log file not found, skipping evaluation.")  
