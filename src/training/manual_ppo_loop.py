@@ -1,6 +1,7 @@
 import os
 import torch
 import pandas as pd
+import gc
 from tqdm import tqdm
 from torch.nn import functional as F
 
@@ -12,31 +13,39 @@ from judge import (
 )
 from generate.generator import clean_response, generate_responses
 
-# ✅ Set memory fragmentation prevention
+# ✅ Prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 
 def compute_ppo_loss(old_log_probs, new_log_probs, advantages, clip_range=0.2):
     ratio = torch.exp(new_log_probs - old_log_probs)
     clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
     return -torch.min(ratio * advantages, clipped * advantages).mean()
 
+
 def compute_advantages(reward, value):
     return reward - value
 
+
 def run_manual_ppo(model, tokenizer):
     device = model.device
-    model.gradient_checkpointing_enable()  # ✅ Save memory by recomputing
-    model = model.half()                   # ✅ Use float16 for smaller memory
+    model.gradient_checkpointing_enable()
+    model = model.half()  # ✅ Use FP16
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
-    df = df.iloc[:3]  # For test
+    df = df.iloc[:3]  # Start with small batch for testing
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-5)
-    logs = []
+
+    log_path = "logs/ppo_manual_log.csv"
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    if not os.path.exists(log_path):
+        pd.DataFrame(columns=["idx", "reward", "loss", "response", "C1", "C2", "C3", "C4",
+                              "H1", "S1", "S2", "S3", "Detect_Cosine", "Detect_BERT"]).to_csv(log_path, index=False)
 
     pbar = tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)
     for idx, row in enumerate(pbar):
-        query = row.vague_query
+        query = str(row.vague_query)
         ad_facts = {
             "ad_product": str(row.ad_product),
             "brand": str(row.brand),
@@ -53,10 +62,11 @@ Brand: {ad_facts['brand']}
 URL: {ad_facts['url']}
 Description: {ad_facts['description']}"""
 
-            score_coh = judge_coherence(query, cleaned)
-            score_help = judge_helpfulness(query, cleaned)
-            score_sal = judge_ad_salience(query, cleaned, ad_text)
-            score_det = judge_detectability(response_with_ad, response_without_ad)
+            with torch.no_grad():
+                score_coh = judge_coherence(query, cleaned)
+                score_help = judge_helpfulness(query, cleaned)
+                score_sal = judge_ad_salience(query, cleaned, ad_text)
+                score_det = judge_detectability(response_with_ad, response_without_ad)
 
             reward_values = [
                 score_coh.get("Coherence Score", 0),
@@ -74,13 +84,21 @@ Description: {ad_facts['description']}"""
                 "S": reward_values[2],
                 "D": round(reward_values[3], 4)
             })
+
         except Exception as e:
             print(f"❌ Skipping row {idx} due to error: {e}")
+            torch.cuda.empty_cache()
+            gc.collect()
             continue
 
         try:
-            input_ids = tokenizer(query, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
-response_ids = tokenizer(cleaned, return_tensors="pt", truncation=True, max_length=256).input_ids.to(device)[0]
+            input_ids = tokenizer(query, return_tensors="pt", truncation=True, max_length=384).input_ids.to(device)
+            response_ids = tokenizer(cleaned, return_tensors="pt", truncation=True, max_length=128).input_ids.to(device)[0]
+
+            if input_ids.shape[1] + response_ids.shape[0] > 512:
+                print(f"⚠️ Skipping row {idx}: combined input too long")
+                continue
+
             input_plus_response = torch.cat([input_ids[0], response_ids])
             inputs = input_plus_response.unsqueeze(0)
             labels = input_plus_response[1:]
@@ -103,9 +121,9 @@ response_ids = tokenizer(cleaned, return_tensors="pt", truncation=True, max_leng
             optimizer.step()
             model.eval()
 
-            # ✅ Free GPU memory
             del input_ids, response_ids, inputs, labels, logits, log_probs, new_log_probs, chosen_log_probs
             torch.cuda.empty_cache()
+            gc.collect()
 
             pbar.set_postfix({
                 "Reward": f"{reward.item():.3f}",
@@ -116,7 +134,7 @@ response_ids = tokenizer(cleaned, return_tensors="pt", truncation=True, max_leng
                 "D": round(reward_values[3], 4)
             })
 
-            logs.append({
+            pd.DataFrame([{
                 "idx": idx,
                 "reward": reward.item(),
                 "loss": loss.item(),
@@ -131,19 +149,18 @@ response_ids = tokenizer(cleaned, return_tensors="pt", truncation=True, max_leng
                 "S3": score_sal.get("S3", 0),
                 "Detect_Cosine": score_det.get("detectability_cosine"),
                 "Detect_BERT": score_det.get("detectability_bert")
-            })
+            }]).to_csv(log_path, mode="a", header=False, index=False)
 
             if idx % 50 == 0:
                 os.makedirs("checkpoints/ppo_manual", exist_ok=True)
                 model.save_pretrained("checkpoints/ppo_manual")
                 tokenizer.save_pretrained("checkpoints/ppo_manual")
-                pd.DataFrame(logs).to_csv("logs/ppo_manual_log.csv", index=False)
                 print(f"💾 Saved checkpoint & logs at step {idx}")
 
         except torch.cuda.OutOfMemoryError as oom:
             print(f"🔥 CUDA OOM at row {idx}: {oom}")
             torch.cuda.empty_cache()
+            gc.collect()
             continue
 
-    pd.DataFrame(logs).to_csv("logs/ppo_manual_log.csv", index=False)
-    print("✅ PPO training complete. Final log saved to logs/ppo_manual_log.csv")
+    print("✅ PPO training complete. Log saved to logs/ppo_manual_log.csv")
