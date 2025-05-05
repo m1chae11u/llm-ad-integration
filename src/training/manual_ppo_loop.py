@@ -30,6 +30,7 @@ def run_manual_ppo(model, tokenizer):
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
+    df = df.iloc[:3]  # For test
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-5)
     logs = []
 
@@ -78,12 +79,8 @@ Description: {ad_facts['description']}"""
             continue
 
         try:
-            input_ids = tokenizer(
-                query, return_tensors="pt", padding=True, truncation=True, max_length=1024
-            ).input_ids.to(device)
-            response_ids = tokenizer(
-                cleaned, return_tensors="pt", padding=True, truncation=True, max_length=512
-            ).input_ids.to(device)[0]
+            input_ids = tokenizer(query, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
+response_ids = tokenizer(cleaned, return_tensors="pt", truncation=True, max_length=256).input_ids.to(device)[0]
             input_plus_response = torch.cat([input_ids[0], response_ids])
             inputs = input_plus_response.unsqueeze(0)
             labels = input_plus_response[1:]
