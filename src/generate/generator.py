@@ -1,6 +1,7 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import re
+import gc
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
 
 def clean_response(response: str) -> str:
@@ -14,31 +15,40 @@ def clean_response(response: str) -> str:
     return response.strip()
 
 def generate_text(prompt: str, model, tokenizer) -> str:
-    """Generate text using passed-in model and tokenizer."""
-    # Get device from model parameters
-    device = next(model.parameters()).device
+    """Generate response safely and skip any bad prompts that trigger CUDA asserts."""
+    try:
+        device = next(model.parameters()).device
+        print(f"Generating with prompt length: {len(prompt)}")
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
 
-    print(f"Generating with prompt length: {len(prompt)}")
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        # Additional safety checks
+        if torch.isnan(inputs.input_ids).any() or (inputs.input_ids < 0).any():
+            print("⚠️ Invalid input_ids detected — skipping.")
+            return ""
 
-    print("Starting generation...")
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=512,
-        temperature=0.7,
-        top_p=0.95,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-        num_beams=1,
-        repetition_penalty=1.1,
-        length_penalty=1.0,
-        use_cache=False,     
-    )
-    print("Generation complete!")
+        with torch.no_grad():
+            try:
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.eos_token_id,
+                    use_cache=False,
+                )
+            except RuntimeError as gen_err:
+                if "probability tensor contains" in str(gen_err):
+                    print("🔥 Skipping bad generation: probability tensor contained inf/nan/negative values.")
+                    return ""
+                else:
+                    raise gen_err
 
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = response[len(prompt):].strip()
-    return clean_response(response)
+        print("Generation complete!")
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    except RuntimeError as e:
+        print(f"🔥 Generation RuntimeError: {e}")
+        return ""
+    
 
 def generate_response_without_ad(user_query: str, model, tokenizer) -> str:
     print("\nGenerating response without ad...")
@@ -55,7 +65,7 @@ def generate_response_with_ad(user_query: str, ad_text: str, model, tokenizer) -
     return response
 
 def generate_responses(user_query: str, ad_facts: dict, model, tokenizer) -> tuple[str, str]:
-    """Generate both responses - with and without ad."""
+    """Generate both responses - with and without ad, and clean them."""
 
     ad_product = ad_facts.get('ad_product', '').strip()
     brand = ad_facts.get('brand', '').strip()
@@ -70,7 +80,10 @@ def generate_responses(user_query: str, ad_facts: dict, model, tokenizer) -> tup
                 URL: {url}
                 Description: {description}"""
 
-    response_without_ad = generate_response_without_ad(user_query, model, tokenizer)
-    response_with_ad = generate_response_with_ad(user_query, ad_text, model, tokenizer)
+    raw_response_without_ad = generate_response_without_ad(user_query, model, tokenizer)
+    raw_response_with_ad = generate_response_with_ad(user_query, ad_text, model, tokenizer)
 
-    return response_without_ad, response_with_ad
+    cleaned_without_ad = clean_response(raw_response_without_ad)
+    cleaned_with_ad = clean_response(raw_response_with_ad)
+
+    return cleaned_without_ad, cleaned_with_ad

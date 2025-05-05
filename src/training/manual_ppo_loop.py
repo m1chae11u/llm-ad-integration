@@ -26,8 +26,6 @@ def compute_advantages(reward, value):
 
 def run_manual_ppo(model, tokenizer):
     device = model.device
-    model.gradient_checkpointing_enable()
-    model = model.half()
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
@@ -38,7 +36,7 @@ def run_manual_ppo(model, tokenizer):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     if not os.path.exists(log_path):
         pd.DataFrame(columns=["idx", "reward", "loss", "response", "C1", "C2", "C3", "C4",
-                              "H1", "S1", "S2", "S3", "Detect_Cosine", "Detect_BERT"]).to_csv(log_path, index=False)
+                              "H1", "S1", "S2", "S3", "Detect_Cosine"]).to_csv(log_path, index=False)
 
     pbar = tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)
     for idx, row in enumerate(pbar):
@@ -53,27 +51,53 @@ def run_manual_ppo(model, tokenizer):
         try:
             with torch.no_grad():
                 response_without_ad, response_with_ad = generate_responses(query, ad_facts, model, tokenizer)
-                cleaned = clean_response(response_with_ad)
 
             ad_text = f"""Product: {ad_facts['ad_product']}
-Brand: {ad_facts['brand']}
-URL: {ad_facts['url']}
-Description: {ad_facts['description']}"""
+                        Brand: {ad_facts['brand']}
+                        URL: {ad_facts['url']}
+                        Description: {ad_facts['description']}"""
 
+            # Evaluate with judges
             with torch.no_grad():
-                score_coh = judge_coherence(query, cleaned)
-                score_help = judge_helpfulness(query, cleaned)
-                score_sal = judge_ad_salience(query, cleaned, ad_text)
+                score_coh = judge_coherence(query, response_with_ad)
+                score_help = judge_helpfulness(query, response_with_ad)
+                score_sal = judge_ad_salience(query, response_with_ad, ad_text)
                 score_det = judge_detectability(response_with_ad, response_without_ad)
 
+            # Compute reward
             reward_values = [
                 score_coh.get("Coherence Score", 0),
                 score_help.get("Helpfulness Score", 0),
                 score_sal.get("Ad Salience Score", 0),
-                score_det.get("detectability_bert", 0) or 0
+                score_det.get("detectability_cosine", 0) or 0
             ]
             reward = torch.tensor(sum(reward_values) / len(reward_values), dtype=torch.float32).to(device)
 
+            # Debug output
+            debug_log = f"""
+            ===============================
+            📝 Query: {query}
+            📦 Ad Facts: {ad_facts}
+            📤 Response WITHOUT ad:
+            {response_without_ad}
+
+            📥 Response WITH ad:
+            {response_with_ad}
+
+            📊 Judge Scores:
+            - Coherence Score: {score_coh}
+            - Helpfulness Score: {score_help}
+            - Ad Salience Score: {score_sal}
+            - Detectability Score: {score_det}
+            🎯 Final Reward: {reward.item():.4f}
+            ===============================
+            """
+
+            print(debug_log)
+
+            # 🔽 Optional: save debug output to file
+            with open("logs/ppo_debug_log.txt", "a") as f:
+                f.write(debug_log)
             pbar.set_postfix({
                 "Reward": f"{reward.item():.3f}",
                 "Loss": "---",
@@ -91,7 +115,7 @@ Description: {ad_facts['description']}"""
 
         try:
             input_ids = tokenizer(query, return_tensors="pt", truncation=True, max_length=384).input_ids.to(device)
-            response_ids = tokenizer(cleaned, return_tensors="pt", truncation=True, max_length=128).input_ids.to(device)[0]
+            response_ids = tokenizer(response_with_ad, return_tensors="pt", truncation=True, max_length=128).input_ids.to(device)[0]
 
             if input_ids.shape[1] + response_ids.shape[0] > 512:
                 print(f"⚠️ Skipping row {idx}: combined input too long")
@@ -103,6 +127,7 @@ Description: {ad_facts['description']}"""
 
             with torch.no_grad():
                 logits = model(inputs).logits[0, :-1]
+                logits = torch.clamp(logits, -50, 50)  # Stability fix
                 log_probs = F.log_softmax(logits, dim=-1)
                 chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
                 old_logprob = chosen_log_probs.sum()
@@ -117,6 +142,7 @@ Description: {ad_facts['description']}"""
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             model.eval()
 
@@ -137,7 +163,7 @@ Description: {ad_facts['description']}"""
                 "idx": idx,
                 "reward": reward.item(),
                 "loss": loss.item(),
-                "response": cleaned,
+                "response": response_with_ad,
                 "C1": score_coh.get("C1", 0),
                 "C2": score_coh.get("C2", 0),
                 "C3": score_coh.get("C3", 0),
@@ -146,10 +172,8 @@ Description: {ad_facts['description']}"""
                 "S1": score_sal.get("S1", 0),
                 "S2": score_sal.get("S2", 0),
                 "S3": score_sal.get("S3", 0),
-                "Detect_Cosine": score_det.get("detectability_cosine"),
-                "Detect_BERT": score_det.get("detectability_bert")
+                "Detect_Cosine": score_det.get("detectability_cosine")
             }]).to_csv(log_path, mode="a", header=False, index=False)
-
             if idx % 50 == 0:
                 os.makedirs("checkpoints/ppo_manual", exist_ok=True)
                 model.save_pretrained("checkpoints/ppo_manual")
