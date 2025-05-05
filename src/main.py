@@ -1,3 +1,5 @@
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from training.evaluation import evaluate_logged_responses

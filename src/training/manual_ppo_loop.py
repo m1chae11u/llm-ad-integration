@@ -12,14 +12,13 @@ from judge import (
 )
 from generate.generator import clean_response, generate_responses
 
-# PPO Helper (simplified)
 def compute_ppo_loss(old_log_probs, new_log_probs, advantages, clip_range=0.2):
     ratio = torch.exp(new_log_probs - old_log_probs)
     clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
     return -torch.min(ratio * advantages, clipped * advantages).mean()
 
 def compute_advantages(reward, value):
-    return reward - value  # Simple baseline
+    return reward - value
 
 def run_manual_ppo(model, tokenizer):
     device = model.device
@@ -27,10 +26,10 @@ def run_manual_ppo(model, tokenizer):
 
     df = pd.read_csv("data/merged_queries_ads.csv")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-5)
-
     logs = []
 
-    for idx, row in enumerate(tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)):
+    pbar = tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)
+    for idx, row in enumerate(pbar):
         query = row.vague_query
         ad_facts = {
             "ad_product": str(row.ad_product),
@@ -40,7 +39,6 @@ def run_manual_ppo(model, tokenizer):
         }
 
         try:
-            print(f"\n[{idx}] Generating responses for query: {query[:60]}...")
             response_without_ad, response_with_ad = generate_responses(query, ad_facts, model, tokenizer)
             cleaned = clean_response(response_with_ad)
 
@@ -49,7 +47,6 @@ Brand: {ad_facts['brand']}
 URL: {ad_facts['url']}
 Description: {ad_facts['description']}"""
 
-            print("Judging response quality...")
             score_coh = judge_coherence(query, cleaned)
             score_help = judge_helpfulness(query, cleaned)
             score_sal = judge_ad_salience(query, cleaned, ad_text)
@@ -63,12 +60,18 @@ Description: {ad_facts['description']}"""
             ]
             reward = torch.tensor(sum(reward_values) / len(reward_values), dtype=torch.float32).to(device)
 
-            print(f"Subscores → C: {reward_values[0]} | H: {reward_values[1]} | S: {reward_values[2]} | D: {reward_values[3]}")
+            pbar.set_postfix({
+                "Reward": f"{reward.item():.3f}",
+                "Loss": "---",
+                "C": reward_values[0],
+                "H": reward_values[1],
+                "S": reward_values[2],
+                "D": round(reward_values[3], 4)
+            })
         except Exception as e:
-            print(f"Skipping row {idx} due to judge error: {e}")
+            print(f"❌ Skipping row {idx} due to judge error: {e}")
             continue
 
-        # Tokenization and log probs
         input_ids = tokenizer(query, return_tensors="pt").input_ids.to(device)
         response_ids = tokenizer(cleaned, return_tensors="pt").input_ids.to(device)[0]
         input_plus_response = torch.cat([input_ids[0], response_ids])
@@ -80,7 +83,6 @@ Description: {ad_facts['description']}"""
         chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
         old_logprob = chosen_log_probs.sum()
 
-        # PPO optimization
         value = reward.detach()
         advantage = compute_advantages(reward, value)
 
@@ -93,10 +95,17 @@ Description: {ad_facts['description']}"""
         loss.backward()
         optimizer.step()
         model.eval()
+        torch.cuda.empty_cache()  # ⬅️ clear memory after each step
+        torch.cuda.ipc_collect()  # ⬅️ clear memory after each step  
+        pbar.set_postfix({
+            "Reward": f"{reward.item():.3f}",
+            "Loss": f"{loss.item():.4f}",
+            "C": reward_values[0],
+            "H": reward_values[1],
+            "S": reward_values[2],
+            "D": round(reward_values[3], 4)
+        })
 
-        print(f"🔧 PPO Update → Reward: {reward.item():.3f} | Loss: {loss.item():.4f} | Adv: {advantage.item():.4f}")
-
-        # Store training log
         logs.append({
             "idx": idx,
             "reward": reward.item(),
@@ -119,8 +128,7 @@ Description: {ad_facts['description']}"""
             model.save_pretrained("checkpoints/ppo_manual")
             tokenizer.save_pretrained("checkpoints/ppo_manual")
             pd.DataFrame(logs).to_csv("logs/ppo_manual_log.csv", index=False)
-            print(f"Saved model & log checkpoint at step {idx}")
+            print(f"💾 Saved checkpoint & logs at step {idx}")
 
-    # Final save
     pd.DataFrame(logs).to_csv("logs/ppo_manual_log.csv", index=False)
-    print("PPO training complete. Final log saved to logs/ppo_manual_log.csv")
+    print("✅ PPO training complete. Final log saved to logs/ppo_manual_log.csv")
