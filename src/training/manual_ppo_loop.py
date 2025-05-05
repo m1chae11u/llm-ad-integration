@@ -16,25 +16,22 @@ from generate.generator import clean_response, generate_responses
 # ✅ Prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-
 def compute_ppo_loss(old_log_probs, new_log_probs, advantages, clip_range=0.2):
     ratio = torch.exp(new_log_probs - old_log_probs)
     clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
     return -torch.min(ratio * advantages, clipped * advantages).mean()
 
-
 def compute_advantages(reward, value):
     return reward - value
-
 
 def run_manual_ppo(model, tokenizer):
     device = model.device
     model.gradient_checkpointing_enable()
-    model = model.half()  # ✅ Use FP16
+    model = model.half()
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
-    df = df.iloc[:3]  # Start with small batch for testing
+    df = df.iloc[:3]
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-5)
 
     log_path = "logs/ppo_manual_log.csv"
@@ -54,8 +51,9 @@ def run_manual_ppo(model, tokenizer):
         }
 
         try:
-            response_without_ad, response_with_ad = generate_responses(query, ad_facts, model, tokenizer)
-            cleaned = clean_response(response_with_ad)
+            with torch.no_grad():
+                response_without_ad, response_with_ad = generate_responses(query, ad_facts, model, tokenizer)
+                cleaned = clean_response(response_with_ad)
 
             ad_text = f"""Product: {ad_facts['ad_product']}
 Brand: {ad_facts['brand']}
@@ -103,10 +101,11 @@ Description: {ad_facts['description']}"""
             inputs = input_plus_response.unsqueeze(0)
             labels = input_plus_response[1:]
 
-            logits = model(inputs).logits[0, :-1]
-            log_probs = F.log_softmax(logits, dim=-1)
-            chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
-            old_logprob = chosen_log_probs.sum()
+            with torch.no_grad():
+                logits = model(inputs).logits[0, :-1]
+                log_probs = F.log_softmax(logits, dim=-1)
+                chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
+                old_logprob = chosen_log_probs.sum()
 
             value = reward.detach()
             advantage = compute_advantages(reward, value)
