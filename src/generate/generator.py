@@ -31,7 +31,8 @@ def generate_text(prompt: str, model, tokenizer) -> str:
         pad_token_id=tokenizer.eos_token_id,
         num_beams=1,
         repetition_penalty=1.1,
-        length_penalty=1.0
+        length_penalty=1.0,
+        use_cache=False,     
     )
     print("Generation complete!")
 
