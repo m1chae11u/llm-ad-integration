@@ -32,14 +32,33 @@ def run_manual_ppo(model, tokenizer):
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
-    df = df.iloc[:3]
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-7)
+    df = df.iloc[:100]
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-7) # Switched optimizer
+    optimizer = torch.optim.SGD(model.parameters(), lr=1.4e-7)
 
-    log_path = "logs/ppo_manual_log.csv"
+    log_path = "logs/ppo_manual_log.csv" # Main training log
+    periodic_eval_log_path = "logs/periodic_eval_log.csv" # Log for periodic evals
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    os.makedirs(os.path.dirname(periodic_eval_log_path), exist_ok=True)
+
+    # Header for main training log (including sub-scores)
     if not os.path.exists(log_path):
-        pd.DataFrame(columns=["idx", "query", "reward", "loss", "response", "C1", "C2", "C3", "C4",
-                              "H1", "S1", "S2", "S3", "Detect_Cosine"]).to_csv(log_path, index=False)
+        pd.DataFrame(columns=["idx", "query", "response_trained", "reward", "loss",
+                              "C1", "C2", "C3", "C4", "Coherence Score",
+                              "H1", "Helpfulness Score",
+                              "S1", "S2", "S3", "Ad Salience Score",
+                              "Detect_Cosine"])\
+            .to_csv(log_path, index=False)
+            
+    # Header for periodic evaluation log
+    if not os.path.exists(periodic_eval_log_path):
+        pd.DataFrame(columns=["step_idx", "query", "eval_base_response", "eval_ppo_response",
+                              "ad_product", "brand", "url", "ad_description",
+                              "C1", "C2", "C3", "C4", "Coherence Score",
+                              "H1", "Helpfulness Score",
+                              "S1", "S2", "S3", "Ad Salience Score",
+                              "Detect_Cosine"])\
+            .to_csv(periodic_eval_log_path, index=False)
 
     pbar = tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)
     for idx, row in enumerate(pbar):
@@ -146,27 +165,92 @@ def run_manual_ppo(model, tokenizer):
                 "D": round(reward_values[3], 4)
             })
 
+            # Log training step data including sub-scores
             pd.DataFrame([{
                 "idx": idx,
                 "query": query,
+                "response_trained": response_with_ad, # The response used for this step's update
                 "reward": reward.item(),
                 "loss": loss.item(),
-                "response": response_with_ad,
                 "C1": score_coh.get("C1", 0),
                 "C2": score_coh.get("C2", 0),
                 "C3": score_coh.get("C3", 0),
                 "C4": score_coh.get("C4", 0),
+                "Coherence Score": score_coh.get("Coherence Score", 0),
                 "H1": score_help.get("H1", 0),
+                "Helpfulness Score": score_help.get("Helpfulness Score", 0),
                 "S1": score_sal.get("S1", 0),
                 "S2": score_sal.get("S2", 0),
                 "S3": score_sal.get("S3", 0),
+                "Ad Salience Score": score_sal.get("Ad Salience Score", 0),
                 "Detect_Cosine": score_det.get("detectability_cosine"),
             }]).to_csv(log_path, mode="a", header=False, index=False)
-            # if idx % 50 == 0:
-            os.makedirs("checkpoints/ppo_manual", exist_ok=True)
-            model.save_pretrained("checkpoints/ppo_manual")
-            tokenizer.save_pretrained("checkpoints/ppo_manual")
-            print(f"💾 Saved checkpoint & logs at step {idx}")
+
+            # Periodic Evaluation & Checkpoint Saving
+            if idx % 50 == 0:
+                print(f"\n🔄 Running Periodic Evaluation at step {idx}...")
+                os.makedirs("checkpoints/ppo_manual", exist_ok=True)
+                model.save_pretrained("checkpoints/ppo_manual")
+                tokenizer.save_pretrained("checkpoints/ppo_manual")
+                print(f"💾 Saved checkpoint at step {idx}")
+                
+                # Store current eval results
+                periodic_eval_results = []
+                model.eval() # Ensure model is in eval mode
+                # Use a smaller subset or dedicated eval set if available
+                # Here, reusing the first 3 training samples for demonstration
+                for eval_idx, eval_row in enumerate(df.itertuples()): 
+                    eval_query = str(eval_row.vague_query)
+                    eval_ad_facts = {
+                        "ad_product": str(eval_row.ad_product),
+                        "brand": str(eval_row.brand),
+                        "url": str(eval_row.url),
+                        "description": str(eval_row.ad_description),
+                    }
+                    eval_ad_text = f"""Product: {eval_ad_facts['ad_product']}
+                                    Brand: {eval_ad_facts['brand']}
+                                    URL: {eval_ad_facts['url']}
+                                    Description: {eval_ad_facts['description']}"""
+
+                    try:
+                        with torch.no_grad():
+                            # Generate NEW responses with the current model state
+                            eval_response_without_ad, eval_response_with_ad = generate_responses(eval_query, eval_ad_facts, model, tokenizer)
+                            
+                            # Run all judges
+                            eval_score_coh = judge_coherence(eval_query, eval_response_with_ad)
+                            eval_score_help = judge_helpfulness(eval_query, eval_response_with_ad)
+                            eval_score_sal = judge_ad_salience(eval_query, eval_response_with_ad, eval_ad_text)
+                            eval_score_det = judge_detectability(eval_response_with_ad, eval_response_without_ad)
+                            
+                        periodic_eval_results.append({
+                            "step_idx": idx,
+                            "query": eval_query,
+                            "eval_base_response": eval_response_without_ad,
+                            "eval_ppo_response": eval_response_with_ad,
+                            "ad_product": eval_ad_facts.get("ad_product", ""),
+                            "brand": eval_ad_facts.get("brand", ""),
+                            "url": eval_ad_facts.get("url", ""),
+                            "ad_description": eval_ad_facts.get("description", ""),
+                            "C1": eval_score_coh.get("C1", 0), "C2": eval_score_coh.get("C2", 0), "C3": eval_score_coh.get("C3", 0), "C4": eval_score_coh.get("C4", 0),
+                            "Coherence Score": eval_score_coh.get("Coherence Score", 0),
+                            "H1": eval_score_help.get("H1", 0),
+                            "Helpfulness Score": eval_score_help.get("Helpfulness Score", 0),
+                            "S1": eval_score_sal.get("S1", 0), "S2": eval_score_sal.get("S2", 0), "S3": eval_score_sal.get("S3", 0),
+                            "Ad Salience Score": eval_score_sal.get("Ad Salience Score", 0),
+                            "Detect_Cosine": eval_score_det.get("detectability_cosine"),
+                        
+                        })
+                    except Exception as eval_e:
+                        print(f"❌ Error during periodic evaluation for query {eval_idx}: {eval_e}")
+                        continue # Skip this row on error
+                
+                # Append evaluation results to the specific log file
+                if periodic_eval_results:
+                    pd.DataFrame(periodic_eval_results).to_csv(periodic_eval_log_path, mode="a", header=False, index=False)
+                    print(f"💾 Periodic evaluation results appended to {periodic_eval_log_path}")
+                else:
+                    print("⚠️ No results to save from periodic evaluation.")
 
         except torch.cuda.OutOfMemoryError as oom:
             print(f"🔥 CUDA OOM at row {idx}: {oom}")

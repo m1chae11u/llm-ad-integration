@@ -1,0 +1,1 @@
+step_idx,query,eval_base_response,eval_ppo_response,ad_product,brand,url,ad_description,C1,C2,C3,C4,Coherence Score,H1,Helpfulness Score,S1,S2,S3,Ad Salience Score,Detect_Cosine,Detect_BERT

@@ -29,8 +29,8 @@ def load_model_and_tokenizer():
 if __name__ == "__main__":
     model, tokenizer = load_model_and_tokenizer()
     run_manual_ppo(model, tokenizer)
-    # Optionally evaluate logged responses
-    try:
-        evaluate_logged_responses("logs/ppo_manual_log.csv")
-    except FileNotFoundError:
-        print("Log file not found, skipping evaluation.")  
+    # Optionally evaluate logged responses (Now handled periodically within the loop)
+    # try:
+    #     evaluate_logged_responses("logs/ppo_manual_log.csv") 
+    # except FileNotFoundError:
+    #     print("Log file not found, skipping evaluation.")  
