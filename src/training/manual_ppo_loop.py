@@ -32,7 +32,7 @@ def run_manual_ppo(model, tokenizer):
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
-    df = df.iloc[:100] # Keep the 100 limit for testing
+    # df = df.iloc[:100] # Keep the 100 limit for testing
     # optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-7) # Switched optimizer
     optimizer = torch.optim.SGD(model.parameters(), lr=1.4e-7)
 
@@ -229,7 +229,7 @@ def run_manual_ppo(model, tokenizer):
             }]).to_csv(log_path, mode="a", header=False, index=False)
 
             # Periodic Evaluation & Checkpoint Saving (now every 25 steps)
-            if idx > 0 and idx % 2 == 0: # Also ensure idx > 0 to avoid double save at start if resuming
+            if idx > 0 and idx % 25 == 0: # Also ensure idx > 0 to avoid double save at start if resuming
                 print(f"\n🔄 Running Periodic Evaluation at step {idx}...")
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 model.save_pretrained(checkpoint_dir)
