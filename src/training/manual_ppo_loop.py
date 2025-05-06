@@ -36,7 +36,7 @@ def run_manual_ppo(model, tokenizer):
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     if not os.path.exists(log_path):
         pd.DataFrame(columns=["idx", "query", "reward", "loss", "response", "C1", "C2", "C3", "C4",
-                              "H1", "S1", "S2", "S3", "Detect_Cosine", "Detect_BERT"]).to_csv(log_path, index=False)
+                              "H1", "S1", "S2", "S3", "Detect_Cosine"]).to_csv(log_path, index=False)
 
     pbar = tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)
     for idx, row in enumerate(pbar):
@@ -96,18 +96,6 @@ def run_manual_ppo(model, tokenizer):
             """
 
             print(debug_log)
-
-            # 🔽 Optional: save debug output to file
-            with open("logs/ppo_debug_log.txt", "a") as f:
-                f.write(debug_log)
-            pbar.set_postfix({
-                "Reward": f"{reward.item():.3f}",
-                "Loss": "---",
-                "C": reward_values[0],
-                "H": reward_values[1],
-                "S": reward_values[2],
-                "D": round(reward_values[3], 4)
-            })
 
         except Exception as e:
             print(f"❌ Skipping row {idx} due to error: {e}")
@@ -174,13 +162,12 @@ def run_manual_ppo(model, tokenizer):
                 "S2": score_sal.get("S2", 0),
                 "S3": score_sal.get("S3", 0),
                 "Detect_Cosine": score_det.get("detectability_cosine"),
-                "Detect_BERT": score_det.get("detectability_bert")
             }]).to_csv(log_path, mode="a", header=False, index=False)
-            if idx % 50 == 0:
-                os.makedirs("checkpoints/ppo_manual", exist_ok=True)
-                model.save_pretrained("checkpoints/ppo_manual")
-                tokenizer.save_pretrained("checkpoints/ppo_manual")
-                print(f"💾 Saved checkpoint & logs at step {idx}")
+            # if idx % 50 == 0:
+            os.makedirs("checkpoints/ppo_manual", exist_ok=True)
+            model.save_pretrained("checkpoints/ppo_manual")
+            tokenizer.save_pretrained("checkpoints/ppo_manual")
+            print(f"💾 Saved checkpoint & logs at step {idx}")
 
         except torch.cuda.OutOfMemoryError as oom:
             print(f"🔥 CUDA OOM at row {idx}: {oom}")
