@@ -28,11 +28,12 @@ def compute_advantages(reward, value):
 
 def run_manual_ppo(model, tokenizer):
     device = model.device
+    # model.gradient_checkpointing_enable() # Disabled for debugging stability
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
     df = df.iloc[:3]
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-7)
 
     log_path = "logs/ppo_manual_log.csv"
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -115,17 +116,16 @@ def run_manual_ppo(model, tokenizer):
             labels = input_plus_response[1:]
 
             logits = model(inputs).logits[0, :-1]
-            logits = torch.clamp(logits, -50, 50)
             log_probs = F.log_softmax(logits, dim=-1)
             chosen_log_probs = log_probs[torch.arange(len(labels)), labels]
             old_logprob = chosen_log_probs.sum()
-            value = reward.detach()
-            advantage = compute_advantages(reward, value)
 
             model.train()
             logits = model(inputs).logits[0, :-1]
             new_log_probs = F.log_softmax(logits, dim=-1)[torch.arange(len(labels)), labels].sum()
-            loss = compute_ppo_loss(old_logprob.detach(), new_log_probs, advantage)
+            
+            # Simple REINFORCE-like loss
+            loss = -new_log_probs * reward.detach()
 
             optimizer.zero_grad()
             loss.backward()

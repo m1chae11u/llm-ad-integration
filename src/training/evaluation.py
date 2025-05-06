@@ -10,7 +10,7 @@ def evaluate_logged_responses(logged_csv_path, output_path="checkpoints/eval_log
     comparisons = []
 
     for idx, row in df.iterrows():
-        user_query = row["Query"]
+        user_query = row["query"]
         base_resp = row["Base Response"]
         ppo_resp = row["PPO Response"]
 

@@ -1,7 +1,6 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import re
-import gc
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
 
 def clean_response(response: str) -> str:
@@ -14,22 +13,32 @@ def clean_response(response: str) -> str:
         response = response.split("FINAL ANSWER:")[-1]
     return response.strip()
 
+def get_token_count(text: str, tokenizer) -> int:
+    return len(tokenizer.encode(text, truncation=False))
+
+def truncate_ad_text(ad_text: str, tokenizer, max_tokens: int = 512) -> str:
+    tokens = tokenizer.encode(ad_text, truncation=False)
+    if len(tokens) > max_tokens:
+        return tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True)
+    return ad_text
+
 def generate_text(prompt: str, model, tokenizer) -> str:
     """Generate response safely and skip any bad prompts that trigger CUDA asserts."""
     try:
         device = next(model.parameters()).device
-        print(f"Generating with prompt length: {len(prompt)}")
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+        tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
 
-        # Additional safety checks
-        if torch.isnan(inputs.input_ids).any() or (inputs.input_ids < 0).any():
+        prompt_len = tokenized.input_ids.shape[1]
+        print(f"📏 Prompt length: {prompt_len} tokens")
+
+        if torch.isnan(tokenized.input_ids).any() or (tokenized.input_ids < 0).any():
             print("⚠️ Invalid input_ids detected — skipping.")
             return ""
 
         with torch.no_grad():
             try:
                 outputs = model.generate(
-                    **inputs,
+                    **tokenized,
                     max_new_tokens=256,
                     top_p=0.9,
                     pad_token_id=tokenizer.eos_token_id,
@@ -39,34 +48,43 @@ def generate_text(prompt: str, model, tokenizer) -> str:
                 if "probability tensor contains" in str(gen_err):
                     print("🔥 Skipping bad generation: probability tensor contained inf/nan/negative values.")
                     return ""
-                else:
-                    raise gen_err
+                raise gen_err
 
-        print("Generation complete!")
-        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print("✅ Generation complete.")
+        return decoded
 
     except RuntimeError as e:
         print(f"🔥 Generation RuntimeError: {e}")
         return ""
-    
 
 def generate_response_without_ad(user_query: str, model, tokenizer) -> str:
-    print("\nGenerating response without ad...")
+    print("\n🟦 Generating response without ad...")
     prompt = get_prompt_without_ad(user_query)
+    if get_token_count(prompt, tokenizer) > 2048:
+        print("⚠️ Skipping: prompt too long (without ad)")
+        return ""
     response = generate_text(prompt, model, tokenizer)
-    print("Response without ad generated successfully!")
     return response
 
 def generate_response_with_ad(user_query: str, ad_text: str, model, tokenizer) -> str:
-    print("\nGenerating response with ad...")
-    prompt = get_prompt_with_ad(user_query, ad_text)
-    response = generate_text(prompt, model, tokenizer)
-    print("Response with ad generated successfully!")
+    print("\n🟨 Generating response with ad...")
+    base_prompt = get_prompt_without_ad(user_query)
+    max_total_tokens = 2048
+    max_ad_tokens = max_total_tokens - get_token_count(base_prompt, tokenizer)
+    if max_ad_tokens <= 0:
+        print("⚠️ Not enough space for ad content.")
+        return ""
+    safe_ad_text = truncate_ad_text(ad_text, tokenizer, max_ad_tokens)
+    full_prompt = get_prompt_with_ad(user_query, safe_ad_text)
+    if get_token_count(full_prompt, tokenizer) > max_total_tokens:
+        print("⚠️ Skipping: full prompt too long (with ad)")
+        return ""
+    response = generate_text(full_prompt, model, tokenizer)
     return response
 
 def generate_responses(user_query: str, ad_facts: dict, model, tokenizer) -> tuple[str, str]:
     """Generate both responses - with and without ad, and clean them."""
-
     ad_product = ad_facts.get('ad_product', '').strip()
     brand = ad_facts.get('brand', '').strip()
     url = ad_facts.get('url', '').strip()
@@ -76,14 +94,18 @@ def generate_responses(user_query: str, ad_facts: dict, model, tokenizer) -> tup
         description = f"{brand} offers {description}"
 
     ad_text = f"""Product: {ad_product}
-                Brand: {brand}
-                URL: {url}
-                Description: {description}"""
+Brand: {brand}
+URL: {url}
+Description: {description}"""
 
-    raw_response_without_ad = generate_response_without_ad(user_query, model, tokenizer)
-    raw_response_with_ad = generate_response_with_ad(user_query, ad_text, model, tokenizer)
+    raw_no_ad = generate_response_without_ad(user_query, model, tokenizer)
+    raw_with_ad = generate_response_with_ad(user_query, ad_text, model, tokenizer)
 
-    cleaned_without_ad = clean_response(raw_response_without_ad)
-    cleaned_with_ad = clean_response(raw_response_with_ad)
+    print(f"\n🧾 Raw response WITHOUT ad: {repr(raw_no_ad)}")
+    print(f"🧾 Raw response WITH ad: {repr(raw_with_ad)}")
 
-    return cleaned_without_ad, cleaned_with_ad
+    if not raw_no_ad.strip() or not raw_with_ad.strip():
+        print("⚠️ Skipping: One or both responses were empty.")
+        return "", ""
+
+    return clean_response(raw_no_ad), clean_response(raw_with_ad)
