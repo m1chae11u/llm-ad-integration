@@ -12,6 +12,8 @@ from judge import (
     judge_detectability
 )
 from generate.generator import generate_responses
+from concurrent.futures import ThreadPoolExecutor
+
 
 # ✅ Prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -60,11 +62,16 @@ def run_manual_ppo(model, tokenizer):
                         Description: {ad_facts['description']}"""
 
             # Evaluate with judges
-            with torch.no_grad():
-                score_coh = judge_coherence(query, response_with_ad)
-                score_help = judge_helpfulness(query, response_with_ad)
-                score_sal = judge_ad_salience(query, response_with_ad, ad_text)
-                score_det = judge_detectability(response_with_ad, response_without_ad)
+            with torch.no_grad(), ThreadPoolExecutor(max_workers=4) as executor:
+                future_coh = executor.submit(judge_coherence, query, response_with_ad)
+                future_help = executor.submit(judge_helpfulness, query, response_with_ad)
+                future_sal = executor.submit(judge_ad_salience, query, response_with_ad, ad_text)
+                future_det = executor.submit(judge_detectability, response_with_ad, response_without_ad)
+
+                score_coh = future_coh.result()
+                score_help = future_help.result()
+                score_sal = future_sal.result()
+                score_det = future_det.result()
 
             # Compute reward
             reward_values = [
