@@ -15,7 +15,7 @@ from generate.generator import generate_responses
 from concurrent.futures import ThreadPoolExecutor
 
 
-# ✅ Prevent fragmentation
+# Prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def compute_ppo_loss(old_log_probs, new_log_probs, advantages, clip_range=0.2):
@@ -32,7 +32,6 @@ def run_manual_ppo(model, tokenizer):
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
-    df = df.iloc[:100]
     # optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-7) # Switched optimizer
     optimizer = torch.optim.SGD(model.parameters(), lr=1.4e-7)
 
@@ -186,8 +185,8 @@ def run_manual_ppo(model, tokenizer):
                 "Detect_Cosine": score_det.get("detectability_cosine"),
             }]).to_csv(log_path, mode="a", header=False, index=False)
 
-            # Periodic Evaluation & Checkpoint Saving
-            if idx % 50 == 0:
+            # Periodic Evaluation & Checkpoint Saving (every 25 steps)
+            if idx % 25 == 0:
                 print(f"\n🔄 Running Periodic Evaluation at step {idx}...")
                 os.makedirs("checkpoints/ppo_manual", exist_ok=True)
                 model.save_pretrained("checkpoints/ppo_manual")
@@ -197,8 +196,7 @@ def run_manual_ppo(model, tokenizer):
                 # Store current eval results
                 periodic_eval_results = []
                 model.eval() # Ensure model is in eval mode
-                # Use a smaller subset or dedicated eval set if available
-                # Here, reusing the first 3 training samples for demonstration
+            
                 for eval_idx, eval_row in enumerate(df.itertuples()): 
                     eval_query = str(eval_row.vague_query)
                     eval_ad_facts = {
