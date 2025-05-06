@@ -7,22 +7,35 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from training.evaluation import evaluate_logged_responses
 from training.manual_ppo_loop import run_manual_ppo
 
-def load_model_and_tokenizer():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-    import gc
-    gc.collect()
-    print("Loading DeepSeek model...")
-    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+CHECKPOINT_DIR = "checkpoints/ppo_manual"
 
+def load_model_and_tokenizer():
+    model_path = CHECKPOINT_DIR
+    # Check if a local checkpoint exists and seems valid (e.g., contains config.json)
+    if os.path.exists(os.path.join(model_path, "config.json")):
+        print(f"✅ Found local checkpoint. Loading model from: {model_path}")
+    else:
+        print(f"ℹ️ No local checkpoint found at {model_path}. Loading base model...")
+        model_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" # Original base model
+
+    print(f"Loading tokenizer from: {model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    print(f"Loading model from: {model_path}...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float16,
+        model_path,
+        torch_dtype=torch.float32, # Use FP32 for stability
         device_map="auto",
         trust_remote_code=True
     )
-    model.generation_config = GenerationConfig.from_pretrained(MODEL_NAME)
+    try:
+        model.generation_config = GenerationConfig.from_pretrained(model_path)
+    except Exception: # Handle cases where generation_config might be missing from older checkpoints
+         print("⚠️ Could not load generation_config from checkpoint. Using default.")
+         # Use generation_config from the original base model name as a fallback
+         base_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+         model.generation_config = GenerationConfig.from_pretrained(base_model_name)
+
     print("✅ Models loaded\n")
     return model, tokenizer
 

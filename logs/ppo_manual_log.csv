@@ -1,1 +1,1 @@
-idx,query,response_trained,reward,loss,C1,C2,C3,C4,Coherence Score,H1,Helpfulness Score,S1,S2,S3,Ad Salience Score,Detect_Cosine,Detect_BERT
+idx,query,response_trained,reward,loss,C1,C2,C3,C4,Coherence Score,H1,Helpfulness Score,S1,S2,S3,Ad Salience Score,Detect_Cosine

@@ -32,16 +32,35 @@ def run_manual_ppo(model, tokenizer):
     model.eval()
 
     df = pd.read_csv("data/merged_queries_ads.csv")
+    df = df.iloc[:100] # Keep the 100 limit for testing
     # optimizer = torch.optim.AdamW(model.parameters(), lr=1.4e-7) # Switched optimizer
     optimizer = torch.optim.SGD(model.parameters(), lr=1.4e-7)
 
     log_path = "logs/ppo_manual_log.csv" # Main training log
     periodic_eval_log_path = "logs/periodic_eval_log.csv" # Log for periodic evals
+    checkpoint_dir = "checkpoints/ppo_manual" # Checkpoint directory
+    optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt") # Optimizer state path
+
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     os.makedirs(os.path.dirname(periodic_eval_log_path), exist_ok=True)
+    # Note: Checkpoint dir creation is handled later
 
-    # Header for main training log (including sub-scores)
-    if not os.path.exists(log_path):
+    # --- Check for resuming --- 
+    start_idx = 0
+    if os.path.exists(log_path):
+        try:
+            log_df = pd.read_csv(log_path)
+            if not log_df.empty:
+                last_idx = log_df['idx'].iloc[-1]
+                start_idx = int(last_idx) + 1 
+                print(f"✅ Found previous log. Resuming training from index {start_idx}")
+        except Exception as e:
+            print(f"⚠️ Error reading log file {log_path}: {e}. Starting from index 0.")
+            # Consider deleting or renaming corrupted log file
+    else:
+        print(f"ℹ️ No previous log file found. Starting from index 0.")
+        # Create headers only if starting fresh
+        # Header for main training log (including sub-scores)
         pd.DataFrame(columns=["idx", "query", "response_trained", "reward", "loss",
                               "C1", "C2", "C3", "C4", "Coherence Score",
                               "H1", "Helpfulness Score",
@@ -49,18 +68,42 @@ def run_manual_ppo(model, tokenizer):
                               "Detect_Cosine"])\
             .to_csv(log_path, index=False)
             
-    # Header for periodic evaluation log
-    if not os.path.exists(periodic_eval_log_path):
-        pd.DataFrame(columns=["step_idx", "query", "eval_base_response", "eval_ppo_response",
-                              "ad_product", "brand", "url", "ad_description",
-                              "C1", "C2", "C3", "C4", "Coherence Score",
-                              "H1", "Helpfulness Score",
-                              "S1", "S2", "S3", "Ad Salience Score",
-                              "Detect_Cosine"])\
-            .to_csv(periodic_eval_log_path, index=False)
+        # Header for periodic evaluation log
+        if not os.path.exists(periodic_eval_log_path):
+            pd.DataFrame(columns=["step_idx", "query", "eval_base_response", "eval_ppo_response",
+                                  "ad_product", "brand", "url", "ad_description",
+                                  "C1", "C2", "C3", "C4", "Coherence Score",
+                                  "H1", "Helpfulness Score",
+                                  "S1", "S2", "S3", "Ad Salience Score",
+                                  "Detect_Cosine"])\
+                .to_csv(periodic_eval_log_path, index=False)
 
-    pbar = tqdm(df.itertuples(), total=len(df), desc="Manual PPO Training", dynamic_ncols=True)
-    for idx, row in enumerate(pbar):
+    # Load optimizer state if resuming and state file exists
+    if start_idx > 0 and os.path.exists(optimizer_path):
+        try:
+            optimizer.load_state_dict(torch.load(optimizer_path))
+            print(f"✅ Loaded optimizer state from {optimizer_path}")
+        except Exception as e:
+             print(f"⚠️ Could not load optimizer state: {e}. Using fresh state.")
+    elif start_idx > 0:
+        print(f"⚠️ Resuming run, but optimizer state file not found at {optimizer_path}. Using fresh state.")
+
+    # Prepare data slice and progress bar for current run
+    total_rows = len(df)
+    if start_idx >= total_rows:
+         print("✅ Training already completed!")
+         return # Exit if already done
+         
+    df_to_process = df.iloc[start_idx:]
+    pbar = tqdm(enumerate(df_to_process.itertuples(index=False), start=start_idx), 
+                total=total_rows, initial=start_idx, 
+                desc="Manual PPO Training", dynamic_ncols=True)
+
+    # Main loop starting from resume point
+    for idx, row in pbar:
+        # query = str(row.vague_query) # Adapt if itertuples(index=False) is used
+        # Assuming standard itertuples which includes Index as first element
+        # Correct access depends on how df.itertuples is called, adjust if needed
         query = str(row.vague_query)
         ad_facts = {
             "ad_product": str(row.ad_product),
@@ -185,19 +228,21 @@ def run_manual_ppo(model, tokenizer):
                 "Detect_Cosine": score_det.get("detectability_cosine"),
             }]).to_csv(log_path, mode="a", header=False, index=False)
 
-            # Periodic Evaluation & Checkpoint Saving (every 25 steps)
-            if idx % 25 == 0:
+            # Periodic Evaluation & Checkpoint Saving (now every 25 steps)
+            if idx > 0 and idx % 2 == 0: # Also ensure idx > 0 to avoid double save at start if resuming
                 print(f"\n🔄 Running Periodic Evaluation at step {idx}...")
-                os.makedirs("checkpoints/ppo_manual", exist_ok=True)
-                model.save_pretrained("checkpoints/ppo_manual")
-                tokenizer.save_pretrained("checkpoints/ppo_manual")
-                print(f"💾 Saved checkpoint at step {idx}")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                model.save_pretrained(checkpoint_dir)
+                tokenizer.save_pretrained(checkpoint_dir)
+                torch.save(optimizer.state_dict(), optimizer_path) # <-- Save optimizer state
+                print(f"💾 Saved checkpoint and optimizer state at step {idx}")
                 
                 # Store current eval results
                 periodic_eval_results = []
                 model.eval() # Ensure model is in eval mode
             
-                for eval_idx, eval_row in enumerate(df.itertuples()): 
+                eval_data_slice = df.iloc[:10] # Example: Use first 10 rows for eval
+                for eval_idx, eval_row in enumerate(eval_data_slice.itertuples()): 
                     eval_query = str(eval_row.vague_query)
                     eval_ad_facts = {
                         "ad_product": str(eval_row.ad_product),
