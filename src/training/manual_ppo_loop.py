@@ -78,14 +78,6 @@ def run_manual_ppo(model, tokenizer):
             # Debug output
             debug_log = f"""
             ===============================
-            📝 Query: {query}
-            📦 Ad Facts: {ad_facts}
-            📤 Response WITHOUT ad:
-            {response_without_ad}
-
-            📥 Response WITH ad:
-            {response_with_ad}
-
             📊 Judge Scores:
             - Coherence Score: {score_coh}
             - Helpfulness Score: {score_help}

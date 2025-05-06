@@ -8,13 +8,17 @@ from training.evaluation import evaluate_logged_responses
 from training.manual_ppo_loop import run_manual_ppo
 
 def load_model_and_tokenizer():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    import gc
+    gc.collect()
     print("Loading DeepSeek model...")
     MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True
     )
