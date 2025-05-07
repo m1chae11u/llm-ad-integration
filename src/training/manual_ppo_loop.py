@@ -229,7 +229,7 @@ def run_manual_ppo(model, tokenizer):
             }]).to_csv(log_path, mode="a", header=False, index=False)
 
             # Periodic Evaluation & Checkpoint Saving (now every 25 steps)
-            if idx > 0 and idx % 25 == 0: # Also ensure idx > 0 to avoid double save at start if resuming
+            if idx > 0 and idx % 2 == 0: # Also ensure idx > 0 to avoid double save at start if resuming
                 print(f"\n🔄 Running Periodic Evaluation at step {idx}...")
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 model.save_pretrained(checkpoint_dir)
