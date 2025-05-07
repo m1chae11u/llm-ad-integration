@@ -48,7 +48,8 @@ llm-ad-integration/
    ```bash
    ssh -i ~/.ssh/id_ed25519 your_pod_user@ssh.runpod.io
    ```
-4. Alternatively, open VSCode or Cursor → `Remote SSH` → use same credentials to connect.
+4. Alternatively, open VSCode or Cursor → `Remote SSH` → use same credentials to connect. (You can click the '><' button on the bottom left of the screen -> Connect to Host - Remote SSH -> + Add New SSH Host -> Copy the 2nd SSH Key in the Runpod -> Paste -> Enter until you are able to clone the git repo)
+
 
 ### Reconnect After Restart
 Your pod’s IP may change after restarting.
@@ -123,49 +124,12 @@ huggingface-cli cache purge
 - `.venv`, `__pycache__`, and `.env` should be excluded via `.gitignore`.
 - Do not hardcode RunPod IPs — update your SSH config instead.
 
-+-----------------------------------------------------+
-|        Step 1: Load Data (merged_queries_ads.csv)   |
-+-------------------------------+---------------------+
-                                |
-                                v
-+-----------------------------------------------------+
-|  Step 2: generate_responses(query, ad_facts, model) |
-|        → Response Without Ad (A)                    |
-|        → Response With Ad (B)                       |
-+-----------------------------------------------------+
-                                |
-                                v
-+-----------------------------------------------------+
-|  Step 3: Judging                                     |
-|   ├─ judge_detectability(A, B)                       |
-|   ├─ judge_coherence(B, query)                       |
-|   ├─ judge_helpfulness(query, B)                     |
-|   └─ judge_salience(query, B, ad_facts)              |
-+-----------------------------------------------------+
-                                |
-                                v
-+-----------------------------------------------------+
-| Step 4: compute_reward()                             |
-|   = Sum of judge scores + (1 - detectability)        |
-+-----------------------------------------------------+
-                                |
-                                v
-+-----------------------------------------------------+
-| Step 5: PPOTrainer.step(query_tensor, B, reward)     |
-|   (Fine-tune policy model)                           |
-+-----------------------------------------------------+
-                                |
-                                v
-+-----------------------------------------------------+
-| 🔁 Step 5.5: Resample Past Query (every N steps)     |
-|   • Pick a past query                                |
-|   • Generate response with *updated* model           |
-|   • Compute new reward & log                         |
-+-----------------------------------------------------+
-                                |
-                                v
-+-----------------------------------------------------+
-| Step 6: Logging & Model Saving                       |
-|   • Save reward + breakdown to CSV                   |
-|   • Periodically save model + tokenizer              |
-+-----------------------------------------------------+
+------
+## ATTENTION 
+If you have to stop running, please save the following folders:
+- checkpoints/ppo_manual
+- logs
+
+When you start a new runtime, remember to delete the old ppo_manual folder (which was saved in git) and drop the new version in the checkpoints folder. 
+
+
