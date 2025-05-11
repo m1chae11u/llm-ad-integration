@@ -1,7 +1,7 @@
 import json
 import re
 from openai import OpenAI
-from config import DEEPSEEK_API_KEY  # config.py is in the same directory as judge/
+from src.config import DEEPSEEK_API_KEY  # Updated import path
 import functools
 import time
 from concurrent.futures import ThreadPoolExecutor
