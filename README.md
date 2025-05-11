@@ -48,7 +48,8 @@ llm-ad-integration/
    ```bash
    ssh -i ~/.ssh/id_ed25519 your_pod_user@ssh.runpod.io
    ```
-4. Alternatively, open VSCode or Cursor → `Remote SSH` → use same credentials to connect.
+4. Alternatively, open VSCode or Cursor → `Remote SSH` → use same credentials to connect. (You can click the '><' button on the bottom left of the screen -> Connect to Host - Remote SSH -> + Add New SSH Host -> Copy the 2nd SSH Key in the Runpod -> Paste -> Enter until you are able to clone the git repo)
+
 
 ### Reconnect After Restart
 Your pod’s IP may change after restarting.
@@ -122,4 +123,13 @@ huggingface-cli cache purge
 - Always store secrets in `.env` and **never push them to GitHub**.
 - `.venv`, `__pycache__`, and `.env` should be excluded via `.gitignore`.
 - Do not hardcode RunPod IPs — update your SSH config instead.
+
+------
+## ATTENTION 
+If you have to stop running, please save the following folders:
+- checkpoints/ppo_manual
+- logs
+
+When you start a new runtime, remember to delete the old ppo_manual folder (which was saved in git) and drop the new version in the checkpoints folder. 
+
 
