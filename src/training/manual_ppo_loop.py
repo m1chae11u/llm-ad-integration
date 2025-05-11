@@ -287,7 +287,7 @@ class CheckpointManager:
             print(f"❌ Error cleaning up checkpoints: {e}")
 
 class DataProcessor:
-    def __init__(self, model, tokenizer, device, batch_size=2, checkpoint_manager=None, optimizer=None):
+    def __init__(self, model, tokenizer, device, batch_size=4, checkpoint_manager=None, optimizer=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -694,16 +694,16 @@ def run_manual_ppo(model, tokenizer):
             if batch_idx % 10 == 0:
                 validation_results = processor.validate_model(validation_data, batch_idx)
             
-            # Save checkpoint periodically
+            # Save checkpoint periodically (every 10 batches)
             if checkpoint_manager and batch_idx % 10 == 0:
                 checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results)
-                checkpoint_manager.cleanup_old_checkpoints()
+                checkpoint_manager.cleanup_old_checkpoints(keep_last_n=2)  # Keep only last 2 checkpoints
                 
                 # Log checkpoint info
                 logger.info(f"Checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
                 logger.info(f"Metrics saved in: {checkpoint_dir / 'training_metrics.json'}")
             
-            # Clear caches periodically
+            # Clear caches periodically (every 10 batches)
             if batch_idx % 10 == 0:
                 clear_caches()
                 clear_response_cache()
