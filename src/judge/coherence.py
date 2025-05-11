@@ -49,7 +49,7 @@ LLM Response:
 {response}
 """
 
-    result = call_deepseek_and_extract_js(prompt, keys=["C1", "C2", "C3", "C4", "explanation"])
+    result = call_deepseek_and_extract_json(prompt, keys=["C1", "C2", "C3", "C4", "explanation"])
 
     total = sum(result.get(k, 0) for k in ["C1", "C2", "C3", "C4"])
 
