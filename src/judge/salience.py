@@ -1,4 +1,4 @@
-from src.judge.utils import call_deepseek_and_extract_json
+from .utils import call_deepseek_and_extract_json
 
 def judge_ad_salience(query, response, ad_info):
     prompt = f"""

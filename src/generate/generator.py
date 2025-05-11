@@ -4,6 +4,7 @@ import re
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
 from tqdm import tqdm
 from .baseline import generate_baseline_response
+from judge.utils import cache_result
 
 _model = None
 _tokenizer = None
@@ -128,3 +129,9 @@ Description: {description}"""
         return "", ""
 
     return clean_response(raw_no_ad), clean_response(raw_with_ad)
+
+def clear_response_cache():
+    """Clear the response cache used by generate_responses."""
+    # The cache is stored in judge.utils._judge_cache
+    from judge.utils import _judge_cache
+    _judge_cache.clear()

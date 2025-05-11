@@ -2,7 +2,6 @@ import os
 import json
 import re
 from openai import OpenAI
-from src.config import DEEPSEEK_API_KEY  # Updated import path
 import functools
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,10 +12,10 @@ import hashlib
 from typing import Dict, Any, List, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from openai import OpenAI
-
-
 import dotenv
+
+
+# Load environment variables
 dotenv.load_dotenv()
 
 # Get API keys from environment variables
@@ -115,6 +114,7 @@ def clear_caches():
     _judge_cache.clear()
 
 def call_deepseek_and_extract_json(prompt, keys):
+    """Call DeepSeek API and extract JSON response."""
     try:
         response = chat_client.chat.completions.create(
             model="deepseek-chat",
