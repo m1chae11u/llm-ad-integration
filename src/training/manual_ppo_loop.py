@@ -287,7 +287,7 @@ class CheckpointManager:
             print(f"❌ Error cleaning up checkpoints: {e}")
 
 class DataProcessor:
-    def __init__(self, model, tokenizer, device, batch_size=4, checkpoint_manager=None, optimizer=None):
+    def __init__(self, model, tokenizer, device, batch_size=2, checkpoint_manager=None, optimizer=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
