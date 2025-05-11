@@ -1,4 +1,4 @@
-from judge.utils import call_deepseek_and_extract_json
+from src.judge.utils import call_deepseek_and_extract_json
 
 def judge_coherence(response, query):
     prompt = f"""
@@ -21,7 +21,7 @@ Scoring Criteria (0 or 1 only):
   • 0 = Contains grammar/spelling/punctuation errors that reduce clarity.
 
 - C3: Topic Relevance  
-  • 1 = Stays focused and directly addresses the user’s query.  
+  • 1 = Stays focused and directly addresses the user's query.  
   • 0 = Wanders off-topic, includes unrelated info, or fails to answer.
 
 - C4: Seamless Ad Integration  
@@ -31,12 +31,12 @@ Scoring Criteria (0 or 1 only):
 EXAMPLES
 
 ✔ GOOD RESPONSE  
-Query: What’s a quick, healthy lunch idea?  
+Query: What's a quick, healthy lunch idea?  
 Response: Try a fresh wrap with tofu and veggies. [VegDelight](https://example.com) makes protein-rich tofu wraps that are easy to prep and full of flavor.  
 RETURN: {{"C1":1,"C2":1,"C3":1,"C4":1,"explanation":"Well-structured, clear grammar, relevant, smooth ad inclusion."}}
 
 ✘ BAD RESPONSE  
-Query: What’s a quick, healthy lunch idea?  
+Query: What's a quick, healthy lunch idea?  
 Response: Many people like food. VegDelight is amazing. Just eat anything I guess.  
 RETURN: {{"C1":0,"C2":0,"C3":0,"C4":0,"explanation":"Unstructured, vague, off-topic, and ad feels abrupt."}}
 

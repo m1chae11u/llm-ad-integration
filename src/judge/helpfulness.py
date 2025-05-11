@@ -1,9 +1,9 @@
-from judge.utils import call_deepseek_and_extract_json
+from src.judge.utils import call_deepseek_and_extract_json
 
 def judge_helpfulness(query, response):
     prompt = f"""
 SYSTEM
-You are an impartial evaluator tasked with judging whether the assistant’s response fully answers the user’s question.
+You are an impartial evaluator tasked with judging whether the assistant's response fully answers the user's question.
 
 You MUST return valid JSON on one line and nothing else.
 
@@ -11,7 +11,7 @@ Scoring rules:
 - "H1": 1 → The response directly, completely, and clearly answers the user's query.
 - "H1": 0 → The response is incomplete, vague, off-topic, or leaves part of the question unaddressed.
 
-Justification should be concise, specific, and explain why the answer is or isn’t fully helpful.
+Justification should be concise, specific, and explain why the answer is or isn't fully helpful.
 
 FORMAT:
 {{"H1": 0 or 1, "explanation": "<brief reason for score>"}}

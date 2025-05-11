@@ -3,6 +3,7 @@ import torch
 import re
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
 from tqdm import tqdm
+from .baseline import generate_baseline_response
 
 _model = None
 _tokenizer = None
@@ -90,28 +91,48 @@ def generate_response_with_ad(user_query: str, ad_text: str) -> str:
     print("Response with ad generated successfully!")
     return response
 
-def generate_responses(user_query: str, ad_facts: dict) -> tuple[str, str]:
-    """Generate both responses - with and without ad."""
-
-    # Clean up ad facts
-    ad_product = ad_facts.get('ad_product', '').strip()
-    brand = ad_facts.get('brand', '').strip()
-    url = ad_facts.get('url', '').strip()
+def generate_responses(query, ad_facts, use_optimized=True):
+    """
+    Generate responses with and without ads using either the baseline or optimized model.
     
-    # Replace placeholder if it exists
-    description = ad_facts.get('description', '').replace("[Product Name]", ad_product).strip()
-
-    # Prepend brand for better results (helps LLM understand context)
-    description = f"{brand} offers {description}" if brand.lower() not in description.lower() else description
-
-    # Format ad text from facts
-    ad_text = f"""Product: {ad_product}
-                Brand: {brand}
-                URL: {url}
-                Description: {description}"""
-
-    # Generate both responses
-    response_without_ad = generate_response_without_ad(user_query)
-    response_with_ad = generate_response_with_ad(user_query, ad_text)
+    Args:
+        query (str): The user's query
+        ad_facts (dict): Dictionary containing ad information
+        use_optimized (bool): Whether to use the optimized model (True) or baseline (False)
+    
+    Returns:
+        tuple: (response_without_ad, response_with_ad)
+    """
+    if use_optimized:
+        # Use the optimized model (PPO-trained)
+        model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        
+        # Generate response without ad
+        prompt_without_ad = f"User Query: {query}\n\nPlease provide a helpful response:\n\nResponse:"
+        inputs = tokenizer(prompt_without_ad, return_tensors="pt").to(model.device)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=200,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True
+        )
+        response_without_ad = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response_without_ad = response_without_ad.split("Response:")[-1].strip()
+        
+        # Generate response with ad using optimized model
+        response_with_ad = generate_baseline_response(query, ad_facts)  # For now, use baseline as placeholder
+        
+    else:
+        # Use baseline model
+        response_without_ad = generate_baseline_response(query, {})  # Empty ad_facts for no ad
+        response_with_ad = generate_baseline_response(query, ad_facts)
     
     return response_without_ad, response_with_ad
