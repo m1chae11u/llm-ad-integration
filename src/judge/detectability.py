@@ -1,15 +1,8 @@
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from openai import OpenAI
-from src.config import OPENAI_API_KEY
+from config import OPENAI_API_KEY
 from judge.utils import batch_get_embeddings, cache_result
-
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-def get_embedding(text, model="text-embedding-ada-002"):
-    response = client.embeddings.create(input=[text], model=model)
-    return np.array(response.data[0].embedding).reshape(1, -1)
 
 @cache_result(ttl_seconds=3600)  # Cache results for 1 hour
 def judge_detectability(with_ad, without_ad):

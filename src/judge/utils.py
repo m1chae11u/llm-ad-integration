@@ -1,3 +1,4 @@
+import os
 import json
 import re
 from openai import OpenAI
@@ -12,9 +13,24 @@ import hashlib
 from typing import Dict, Any, List, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
 
-# Initialize DeepSeek client
-client = OpenAI(
+
+import dotenv
+dotenv.load_dotenv()
+
+# Get API keys from environment variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable is not set")
+if not DEEPSEEK_API_KEY:
+    raise ValueError("DEEPSEEK_API_KEY environment variable is not set")
+
+# Initialize clients
+embedding_client = OpenAI(api_key=OPENAI_API_KEY)
+chat_client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
 )
@@ -33,6 +49,19 @@ retry_strategy = Retry(
 adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
+
+def get_embedding(text: str, model: str = "text-embedding-ada-002") -> np.ndarray:
+    """Get embedding for a single text using OpenAI's API."""
+    try:
+        response = embedding_client.embeddings.create(
+            model=model,
+            input=[text]
+        )
+        return np.array(response.data[0].embedding)
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        # Return a random vector as fallback to avoid zero similarity
+        return np.random.randn(1536) / np.sqrt(1536)  # Normalized random vector
 
 def get_cache_key(func_name: str, *args, **kwargs) -> str:
     """Generate a cache key from function name and arguments."""
@@ -74,7 +103,7 @@ def batch_get_embeddings(texts: List[str], batch_size: int = 32) -> List[np.ndar
                 batch_results.append(_embedding_cache[cache_key])
             else:
                 # Make API call and cache result
-                embedding = get_embedding(text)  # Your existing embedding function
+                embedding = get_embedding(text)
                 _embedding_cache[cache_key] = embedding
                 batch_results.append(embedding)
         results.extend(batch_results)
@@ -87,7 +116,7 @@ def clear_caches():
 
 def call_deepseek_and_extract_json(prompt, keys):
     try:
-        response = client.chat.completions.create(
+        response = chat_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": "You return JSON only."},

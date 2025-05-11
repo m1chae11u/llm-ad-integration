@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import json
 from pathlib import Path
+import logging
 
 from judge import (
     judge_coherence,
@@ -21,9 +22,15 @@ from judge import (
     judge_ad_salience,
     judge_detectability
 )
-from generate.generator import generate_responses
+from generate.generator import generate_responses, clear_response_cache
 from judge.utils import clear_caches
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -44,9 +51,20 @@ class CheckpointManager:
         self.tokenizer = tokenizer
         self.optimizer = optimizer
         self.checkpoint_info_path = self.checkpoint_dir / "checkpoint_info.json"
+        self.metrics_path = self.checkpoint_dir / "training_metrics.json"
         self.lock = threading.Lock()
         
-    def save_checkpoint(self, current_step, batch_results):
+        # Initialize metrics file if it doesn't exist
+        if not self.metrics_path.exists():
+            with open(self.metrics_path, "w") as f:
+                json.dump({
+                    "checkpoints": [],
+                    "best_reward": 0,
+                    "best_checkpoint": None,
+                    "training_history": []
+                }, f, indent=2)
+    
+    def save_checkpoint(self, current_step, batch_results, validation_results=None):
         """Save checkpoint atomically with verification."""
         with self.lock:
             try:
@@ -57,7 +75,7 @@ class CheckpointManager:
                 # Save model and tokenizer
                 self.model.save_pretrained(
                     temp_checkpoint_dir,
-                    safe_serialization=True,  # Use safetensors
+                    safe_serialization=False,  # Use pytorch_model.bin instead of safetensors
                     max_shard_size="2GB"  # Split into smaller files
                 )
                 self.tokenizer.save_pretrained(temp_checkpoint_dir)
@@ -68,14 +86,80 @@ class CheckpointManager:
                     temp_checkpoint_dir / "optimizer.pt"
                 )
                 
+                # Convert batch results to serializable format
+                serializable_results = []
+                for result in batch_results:
+                    serializable_result = {
+                        "idx": result["idx"],
+                        "query": result["query"],
+                        "ad_facts": result["ad_facts"],
+                        "response_without_ad": result["response_without_ad"],
+                        "response_with_ad": result["response_with_ad"],
+                        "reward": result["reward"].item() if isinstance(result["reward"], torch.Tensor) else result["reward"],
+                        "scores": {
+                            "coherence": result["scores"]["coherence"],
+                            "helpfulness": result["scores"]["helpfulness"],
+                            "salience": result["scores"]["salience"],
+                            "detectability": result["scores"]["detectability"]
+                        }
+                    }
+                    serializable_results.append(serializable_result)
+                
+                # Calculate metrics
+                avg_reward = sum(r["reward"] for r in serializable_results) / len(serializable_results)
+                avg_coherence = sum(r["scores"]["coherence"].get("Coherence Score", 0) for r in serializable_results) / len(serializable_results)
+                avg_helpfulness = sum(r["scores"]["helpfulness"].get("Helpfulness Score", 0) for r in serializable_results) / len(serializable_results)
+                avg_salience = sum(r["scores"]["salience"].get("Ad Salience Score", 0) for r in serializable_results) / len(serializable_results)
+                avg_detectability = sum(r["scores"]["detectability"].get("detectability_cosine", 0) for r in serializable_results) / len(serializable_results)
+                
                 # Save checkpoint info
                 checkpoint_info = {
                     "step": current_step,
                     "timestamp": time.time(),
-                    "batch_results": batch_results
+                    "batch_results": serializable_results,
+                    "metrics": {
+                        "avg_reward": avg_reward,
+                        "avg_coherence": avg_coherence,
+                        "avg_helpfulness": avg_helpfulness,
+                        "avg_salience": avg_salience,
+                        "avg_detectability": avg_detectability
+                    }
                 }
+                
+                if validation_results:
+                    val_avg_reward = sum(r["reward"] for r in validation_results) / len(validation_results)
+                    checkpoint_info["metrics"]["validation_avg_reward"] = val_avg_reward
+                
                 with open(temp_checkpoint_dir / "checkpoint_info.json", "w") as f:
-                    json.dump(checkpoint_info, f)
+                    json.dump(checkpoint_info, f, indent=2)
+                
+                # Update metrics file
+                with open(self.metrics_path, "r") as f:
+                    metrics = json.load(f)
+                
+                metrics["checkpoints"].append({
+                    "step": current_step,
+                    "path": str(temp_checkpoint_dir),
+                    "metrics": checkpoint_info["metrics"]
+                })
+                
+                # Update best checkpoint if validation reward is better
+                if validation_results:
+                    val_avg_reward = sum(r["reward"] for r in validation_results) / len(validation_results)
+                    if val_avg_reward > metrics["best_reward"]:
+                        metrics["best_reward"] = val_avg_reward
+                        metrics["best_checkpoint"] = str(temp_checkpoint_dir)
+                        logger.info(f"🎉 New best model found! Validation reward: {val_avg_reward:.4f}")
+                
+                # Add to training history
+                metrics["training_history"].append({
+                    "step": current_step,
+                    "timestamp": time.time(),
+                    "metrics": checkpoint_info["metrics"]
+                })
+                
+                with open(self.metrics_path, "w") as f:
+                    json.dump(metrics, f, indent=2)
                 
                 # Verify the saved files
                 self._verify_checkpoint(temp_checkpoint_dir)
@@ -90,10 +174,13 @@ class CheckpointManager:
                 with open(self.checkpoint_info_path, "w") as f:
                     json.dump({"latest_checkpoint": str(final_checkpoint_dir)}, f)
                 
-                print(f"✅ Checkpoint saved successfully at step {current_step}")
+                logger.info(f"✅ Checkpoint saved successfully at step {current_step}")
+                logger.info(f"📊 Metrics - Reward: {avg_reward:.4f}, Coherence: {avg_coherence:.4f}, "
+                          f"Helpfulness: {avg_helpfulness:.4f}, Salience: {avg_salience:.4f}, "
+                          f"Detectability: {avg_detectability:.4f}")
                 
             except Exception as e:
-                print(f"❌ Error saving checkpoint: {e}")
+                logger.error(f"❌ Error saving checkpoint: {e}")
                 if temp_checkpoint_dir.exists():
                     shutil.rmtree(temp_checkpoint_dir)
                 raise
@@ -102,11 +189,17 @@ class CheckpointManager:
         """Verify checkpoint integrity."""
         required_files = [
             "config.json",
-            "model.safetensors",
             "optimizer.pt",
             "checkpoint_info.json"
         ]
         
+        # Check for model files (either safetensors or pytorch_model.bin)
+        model_files = ["model.safetensors", "pytorch_model.bin"]
+        has_model_file = any((checkpoint_dir / file).exists() for file in model_files)
+        if not has_model_file:
+            raise ValueError("Missing model file (neither model.safetensors nor pytorch_model.bin found)")
+        
+        # Check other required files
         for file in required_files:
             if not (checkpoint_dir / file).exists():
                 raise ValueError(f"Missing required file: {file}")
@@ -114,6 +207,7 @@ class CheckpointManager:
     def load_latest_checkpoint(self):
         """Load the latest checkpoint if available."""
         if not self.checkpoint_info_path.exists():
+            logger.info("No checkpoint info found. Starting fresh training.")
             return None
             
         try:
@@ -122,32 +216,59 @@ class CheckpointManager:
             
             latest_checkpoint = Path(info["latest_checkpoint"])
             if not latest_checkpoint.exists():
+                logger.warning(f"Checkpoint directory {latest_checkpoint} not found. Starting fresh training.")
                 return None
             
-            # Load model and tokenizer
-            self.model = self.model.from_pretrained(
-                latest_checkpoint,
-                local_files_only=True,
-                torch_dtype=torch.float16
-            )
-            self.tokenizer = self.tokenizer.from_pretrained(
-                latest_checkpoint,
-                local_files_only=True
-            )
+            logger.info(f"Loading checkpoint from {latest_checkpoint}")
+            
+            # Load model state
+            try:
+                self.model = self.model.from_pretrained(
+                    latest_checkpoint,
+                    local_files_only=True,
+                    torch_dtype=torch.float16
+                )
+                logger.info("✅ Model state loaded successfully")
+            except Exception as e:
+                logger.error(f"❌ Error loading model state: {e}")
+                return None
+            
+            # Load tokenizer
+            try:
+                self.tokenizer = self.tokenizer.from_pretrained(
+                    latest_checkpoint,
+                    local_files_only=True
+                )
+                logger.info("✅ Tokenizer loaded successfully")
+            except Exception as e:
+                logger.error(f"❌ Error loading tokenizer: {e}")
+                return None
             
             # Load optimizer state
-            optimizer_state = torch.load(latest_checkpoint / "optimizer.pt")
-            self.optimizer.load_state_dict(optimizer_state)
+            try:
+                optimizer_path = latest_checkpoint / "optimizer.pt"
+                if optimizer_path.exists():
+                    optimizer_state = torch.load(optimizer_path)
+                    self.optimizer.load_state_dict(optimizer_state)
+                    logger.info("✅ Optimizer state loaded successfully")
+                else:
+                    logger.warning("No optimizer state found in checkpoint")
+            except Exception as e:
+                logger.error(f"❌ Error loading optimizer state: {e}")
+                return None
             
             # Load checkpoint info
-            with open(latest_checkpoint / "checkpoint_info.json", "r") as f:
-                checkpoint_info = json.load(f)
-            
-            print(f"✅ Loaded checkpoint from step {checkpoint_info['step']}")
-            return checkpoint_info
+            try:
+                with open(latest_checkpoint / "checkpoint_info.json", "r") as f:
+                    checkpoint_info = json.load(f)
+                logger.info(f"✅ Checkpoint info loaded successfully. Step: {checkpoint_info['step']}")
+                return checkpoint_info
+            except Exception as e:
+                logger.error(f"❌ Error loading checkpoint info: {e}")
+                return None
             
         except Exception as e:
-            print(f"❌ Error loading checkpoint: {e}")
+            logger.error(f"❌ Error loading checkpoint: {e}")
             return None
     
     def cleanup_old_checkpoints(self, keep_last_n=3):
@@ -166,20 +287,175 @@ class CheckpointManager:
             print(f"❌ Error cleaning up checkpoints: {e}")
 
 class DataProcessor:
-    def __init__(self, model, tokenizer, device, batch_size=4, checkpoint_manager=None):
+    def __init__(self, model, tokenizer, device, batch_size=2, checkpoint_manager=None, optimizer=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.batch_size = batch_size
-        self.result_queue = Queue(maxsize=100)
-        self.stop_event = threading.Event()
         self.checkpoint_manager = checkpoint_manager
+        self.optimizer = optimizer
         self.current_step = 0
         
-    def process_batch(self, batch_data):
-        """Process a batch of data in parallel."""
+        # Statistics tracking
+        self.stats = {
+            "total_queries": 0,
+            "successful_queries": 0,
+            "failed_queries": 0,
+            "total_generation_time": 0,
+            "total_judging_time": 0,
+            "total_training_time": 0,
+            "total_tokens": 0,
+            "avg_reward": 0,
+            "avg_loss": 0
+        }
+        
+        # Create directories for intermediate results
+        self.generation_dir = Path("logs/generations")
+        self.judging_dir = Path("logs/judgments")
+        self.training_dir = Path("logs/training")
+        self.stats_dir = Path("logs/stats")
+        
+        for dir_path in [self.generation_dir, self.judging_dir, self.training_dir, self.stats_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            
+        # Initialize log files with batch information
+        self.generation_log = self.generation_dir / "generation_log.csv"
+        self.judging_log = self.judging_dir / "judging_log.csv"
+        self.training_log = self.training_dir / "training_log.csv"
+        self.stats_log = self.stats_dir / "training_stats.csv"
+        
+        # Create headers for log files with batch information
+        pd.DataFrame(columns=[
+            "batch_idx", "query_idx", "query", "ad_facts", "response_without_ad", "response_with_ad",
+            "generation_time", "token_count"
+        ]).to_csv(self.generation_log, index=False)
+        
+        pd.DataFrame(columns=[
+            "batch_idx", "query_idx", "query", "response_with_ad", "coherence_score", "helpfulness_score",
+            "salience_score", "detectability_score", "judging_time"
+        ]).to_csv(self.judging_log, index=False)
+        
+        pd.DataFrame(columns=[
+            "batch_idx", "query_idx", "query", "response_with_ad", "reward", "loss", "training_time"
+        ]).to_csv(self.training_log, index=False)
+        
+        pd.DataFrame(columns=[
+            "batch_idx", "timestamp", "total_queries", "successful_queries", "failed_queries",
+            "avg_generation_time", "avg_judging_time", "avg_training_time", "avg_reward", "avg_loss",
+            "total_tokens", "memory_usage"
+        ]).to_csv(self.stats_log, index=False)
+
+    def update_stats(self, batch_idx, gen_time, judge_time, train_time, token_count, reward, loss, success=True):
+        """Update training statistics."""
+        self.stats["total_queries"] += 1
+        if success:
+            self.stats["successful_queries"] += 1
+        else:
+            self.stats["failed_queries"] += 1
+            
+        self.stats["total_generation_time"] += gen_time
+        self.stats["total_judging_time"] += judge_time
+        self.stats["total_training_time"] += train_time
+        self.stats["total_tokens"] += token_count
+        
+        # Update averages
+        n = self.stats["successful_queries"]
+        self.stats["avg_reward"] = (self.stats["avg_reward"] * (n-1) + reward) / n if n > 0 else 0
+        self.stats["avg_loss"] = (self.stats["avg_loss"] * (n-1) + loss) / n if n > 0 else 0
+        
+        # Log stats every 10 queries
+        if self.stats["total_queries"] % 10 == 0:
+            memory_usage = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+            pd.DataFrame([{
+                "batch_idx": batch_idx,
+                "timestamp": time.time(),
+                "total_queries": self.stats["total_queries"],
+                "successful_queries": self.stats["successful_queries"],
+                "failed_queries": self.stats["failed_queries"],
+                "avg_generation_time": self.stats["total_generation_time"] / self.stats["total_queries"],
+                "avg_judging_time": self.stats["total_judging_time"] / self.stats["total_queries"],
+                "avg_training_time": self.stats["total_training_time"] / self.stats["total_queries"],
+                "avg_reward": self.stats["avg_reward"],
+                "avg_loss": self.stats["avg_loss"],
+                "total_tokens": self.stats["total_tokens"],
+                "memory_usage": memory_usage
+            }]).to_csv(self.stats_log, mode="a", header=False, index=False)
+
+    def validate_model(self, validation_data, batch_idx):
+        """Run validation on a subset of data."""
+        logger.info(f"🔄 Starting validation for batch {batch_idx}")
+        self.model.eval()
+        validation_results = []
+        
+        with torch.no_grad():
+            for idx, row in validation_data.iterrows():
+                try:
+                    query = str(row['vague_query'])
+                    ad_facts = {
+                        "ad_product": str(row['ad_product']),
+                        "brand": str(row['brand']),
+                        "url": str(row['url']),
+                        "description": str(row['ad_description']),
+                    }
+                    
+                    # Generate response
+                    response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                    
+                    # Run judges
+                    ad_text = f"""Product: {ad_facts['ad_product']}
+                                Brand: {ad_facts['brand']}
+                                URL: {ad_facts['url']}
+                                Description: {ad_facts['description']}"""
+                    
+                    with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+                        future_coh = executor.submit(judge_coherence, query, response_with_ad)
+                        future_help = executor.submit(judge_helpfulness, query, response_with_ad)
+                        future_sal = executor.submit(judge_ad_salience, query, response_with_ad, ad_text)
+                        future_det = executor.submit(judge_detectability, response_with_ad, response_without_ad)
+                        
+                        score_coh = future_coh.result()
+                        score_help = future_help.result()
+                        score_sal = future_sal.result()
+                        score_det = future_det.result()
+                    
+                    # Compute reward
+                    reward_values = [
+                        score_coh.get("Coherence Score", 0),
+                        score_help.get("Helpfulness Score", 0),
+                        score_sal.get("Ad Salience Score", 0),
+                        score_det.get("detectability_cosine", 0) or 0
+                    ]
+                    reward = sum(reward_values) / len(reward_values)
+                    
+                    validation_results.append({
+                        "query": query,
+                        "response_with_ad": response_with_ad,
+                        "reward": reward,
+                        "scores": {
+                            "coherence": score_coh,
+                            "helpfulness": score_help,
+                            "salience": score_sal,
+                            "detectability": score_det
+                        }
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"❌ Validation error for query {idx}: {e}")
+                    continue
+        
+        # Compute validation metrics
+        avg_reward = sum(r["reward"] for r in validation_results) / len(validation_results) if validation_results else 0
+        logger.info(f"✅ Validation complete for batch {batch_idx}. Average reward: {avg_reward:.4f}")
+        
+        return validation_results
+
+    def process_batch(self, batch_data, batch_idx):
+        """Process a batch of data."""
         results = []
-        for _, row in batch_data.iterrows():
+        logger.info(f"🔄 Starting batch {batch_idx} with {len(batch_data)} queries")
+        batch_start_time = time.time()
+        
+        for idx, row in batch_data.iterrows():
             query = str(row['vague_query'])
             ad_facts = {
                 "ad_product": str(row['ad_product']),
@@ -189,27 +465,86 @@ class DataProcessor:
             }
 
             try:
+                # Stage 1: Generation
+                logger.info(f"🔄 Batch {batch_idx} - Starting generation for query {idx}")
+                gen_start_time = time.time()
+                
                 with torch.no_grad():
                     response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                
+                gen_time = time.time() - gen_start_time
+                token_count = len(self.tokenizer.encode(response_with_ad))
+                
+                # Log generation results
+                pd.DataFrame([{
+                    "batch_idx": batch_idx,
+                    "query_idx": idx,
+                    "query": query,
+                    "ad_facts": json.dumps(ad_facts),
+                    "response_without_ad": response_without_ad,
+                    "response_with_ad": response_with_ad,
+                    "generation_time": gen_time,
+                    "token_count": token_count
+                }]).to_csv(self.generation_log, mode="a", header=False, index=False)
+                
+                logger.info(f"✅ Batch {batch_idx} - Generation complete for query {idx} in {gen_time:.2f}s")
 
+                # Stage 2: Judging
+                logger.info(f"🔄 Batch {batch_idx} - Starting judging for query {idx}")
+                judge_start_time = time.time()
+                
                 ad_text = f"""Product: {ad_facts['ad_product']}
                             Brand: {ad_facts['brand']}
                             URL: {ad_facts['url']}
                             Description: {ad_facts['description']}"""
 
-                # Run judges in parallel
                 with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
                     future_coh = executor.submit(judge_coherence, query, response_with_ad)
                     future_help = executor.submit(judge_helpfulness, query, response_with_ad)
                     future_sal = executor.submit(judge_ad_salience, query, response_with_ad, ad_text)
                     future_det = executor.submit(judge_detectability, response_with_ad, response_without_ad)
 
-                    # Wait for all futures to complete
                     score_coh = future_coh.result()
                     score_help = future_help.result()
                     score_sal = future_sal.result()
                     score_det = future_det.result()
 
+                judge_time = time.time() - judge_start_time
+                
+                # Log judging results
+                pd.DataFrame([{
+                    "batch_idx": batch_idx,
+                    "query_idx": idx,
+                    "query": query,
+                    "response_with_ad": response_with_ad,
+                    "coherence_score": score_coh.get("Coherence Score", 0),
+                    "helpfulness_score": score_help.get("Helpfulness Score", 0),
+                    "salience_score": score_sal.get("Ad Salience Score", 0),
+                    "detectability_score": score_det.get("detectability_cosine", 0),
+                    "judging_time": judge_time
+                }]).to_csv(self.judging_log, mode="a", header=False, index=False)
+                
+                logger.info(f"✅ Batch {batch_idx} - Judging complete for query {idx} in {judge_time:.2f}s")
+
+                # Stage 3: Training
+                logger.info(f"🔄 Batch {batch_idx} - Starting training for query {idx}")
+                train_start_time = time.time()
+
+                input_ids = self.tokenizer(query, return_tensors="pt", truncation=True, max_length=384).input_ids.to(self.device)
+                response_ids = self.tokenizer(response_with_ad, return_tensors="pt", truncation=True, max_length=128).input_ids.to(self.device)[0]
+
+                if input_ids.shape[1] + response_ids.shape[0] > 512:
+                    logger.warning(f"⚠️ Batch {batch_idx} - Skipping: combined input too long for query {idx}")
+                    continue
+
+                input_plus_response = torch.cat([input_ids[0], response_ids])
+                inputs = input_plus_response.unsqueeze(0)
+                labels = input_plus_response[1:]
+
+                self.model.train()
+                logits = self.model(inputs).logits[0, :-1]
+                new_log_probs = F.log_softmax(logits, dim=-1)[torch.arange(len(labels)), labels].sum()
+                
                 # Compute reward
                 reward_values = [
                     score_coh.get("Coherence Score", 0),
@@ -218,9 +553,37 @@ class DataProcessor:
                     score_det.get("detectability_cosine", 0) or 0
                 ]
                 reward = torch.tensor(sum(reward_values) / len(reward_values), dtype=torch.float32).to(self.device)
+                
+                loss = -new_log_probs * reward.detach()
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.model.eval()
+
+                train_time = time.time() - train_start_time
+                
+                # Log training results
+                pd.DataFrame([{
+                    "batch_idx": batch_idx,
+                    "query_idx": idx,
+                    "query": query,
+                    "response_with_ad": response_with_ad,
+                    "reward": reward.item(),
+                    "loss": loss.item(),
+                    "training_time": train_time
+                }]).to_csv(self.training_log, mode="a", header=False, index=False)
+                
+                logger.info(f"✅ Batch {batch_idx} - Training complete for query {idx} in {train_time:.2f}s")
+
+                # Update statistics
+                self.update_stats(batch_idx, gen_time, judge_time, train_time, token_count, reward.item(), loss.item(), success=True)
 
                 results.append({
+                    "idx": idx,
                     "query": query,
+                    "ad_facts": ad_facts,
                     "response_without_ad": response_without_ad,
                     "response_with_ad": response_with_ad,
                     "reward": reward,
@@ -233,87 +596,21 @@ class DataProcessor:
                 })
 
             except Exception as e:
-                print(f"❌ Error processing query: {e}")
+                logger.error(f"❌ Batch {batch_idx} - Error processing query {idx}: {e}")
+                self.update_stats(batch_idx, 0, 0, 0, 0, 0, 0, success=False)
                 continue
 
-        return results
-
-    def producer(self, df_to_process):
-        """Producer thread that processes data and puts results in queue."""
-        for batch_start in range(0, len(df_to_process), self.batch_size):
-            if self.stop_event.is_set():
-                break
-                
-            batch_end = min(batch_start + self.batch_size, len(df_to_process))
-            batch_data = df_to_process.iloc[batch_start:batch_end]
-            
-            # Process batch
-            batch_results = self.process_batch(batch_data)
-            
-            # Put results in queue
-            for result in batch_results:
-                self.result_queue.put((batch_start, result))
-            
-            # Save checkpoint periodically
-            if self.checkpoint_manager and batch_start % (self.batch_size * 10) == 0:
-                self.checkpoint_manager.save_checkpoint(batch_start, batch_results)
-                self.checkpoint_manager.cleanup_old_checkpoints()
-            
             # Clear caches periodically
-            if batch_start % (self.batch_size * 10) == 0:
+            if len(results) % 10 == 0:
                 clear_caches()
+                clear_response_cache()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-    def consumer(self, optimizer, log_path):
-        """Consumer thread that updates model with results from queue."""
-        while not self.stop_event.is_set() or not self.result_queue.empty():
-            try:
-                batch_start, result = self.result_queue.get(timeout=1)
-                
-                try:
-                    input_ids = self.tokenizer(result["query"], return_tensors="pt", truncation=True, max_length=384).input_ids.to(self.device)
-                    response_ids = self.tokenizer(result["response_with_ad"], return_tensors="pt", truncation=True, max_length=128).input_ids.to(self.device)[0]
-
-                    if input_ids.shape[1] + response_ids.shape[0] > 512:
-                        print(f"⚠️ Skipping: combined input too long")
-                        continue
-
-                    input_plus_response = torch.cat([input_ids[0], response_ids])
-                    inputs = input_plus_response.unsqueeze(0)
-                    labels = input_plus_response[1:]
-
-                    self.model.train()
-                    logits = self.model(inputs).logits[0, :-1]
-                    new_log_probs = F.log_softmax(logits, dim=-1)[torch.arange(len(labels)), labels].sum()
-                    
-                    loss = -new_log_probs * result["reward"].detach()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    self.model.eval()
-
-                    # Log results
-                    pd.DataFrame([{
-                        "idx": batch_start,
-                        "query": result["query"],
-                        "response_trained": result["response_with_ad"],
-                        "reward": result["reward"].item(),
-                        "loss": loss.item(),
-                        **{f"{k}_{i}": v for k, v in result["scores"]["coherence"].items() for i in range(1, 5)},
-                        **{f"{k}_{i}": v for k, v in result["scores"]["helpfulness"].items() for i in range(1, 2)},
-                        **{f"{k}_{i}": v for k, v in result["scores"]["salience"].items() for i in range(1, 4)},
-                        "Detect_Cosine": result["scores"]["detectability"].get("detectability_cosine")
-                    }]).to_csv(log_path, mode="a", header=False, index=False)
-
-                except Exception as e:
-                    print(f"❌ Error updating model: {e}")
-                    continue
-
-                self.result_queue.task_done()
-                
-            except Empty:
-                continue
+        batch_time = time.time() - batch_start_time
+        logger.info(f"✅ Completed batch {batch_idx} in {batch_time:.2f}s")
+        return results
 
 def run_manual_ppo(model, tokenizer):
     device = model.device
@@ -322,71 +619,110 @@ def run_manual_ppo(model, tokenizer):
     df = pd.read_csv("data/merged_queries_ads.csv")
     optimizer = torch.optim.SGD(model.parameters(), lr=1.4e-7)
 
-    log_path = "logs/ppo_manual_log.csv"
-    periodic_eval_log_path = "logs/periodic_eval_log.csv"
-    checkpoint_dir = "checkpoints/ppo_manual"
-    optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
+    # Set up all required directories
+    base_dir = Path("checkpoints/ppo_manual")
+    log_dir = Path("logs")
+    
+    # Create directory structure
+    directories = {
+        "checkpoint_dir": base_dir,
+        "log_dir": log_dir,
+        "generation_dir": log_dir / "generations",
+        "judging_dir": log_dir / "judgments",
+        "training_dir": log_dir / "training",
+        "stats_dir": log_dir / "stats"
+    }
+    
+    for dir_name, dir_path in directories.items():
+        dir_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created directory: {dir_path}")
 
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    os.makedirs(os.path.dirname(periodic_eval_log_path), exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    # Set up file paths
+    log_path = log_dir / "ppo_manual_log.csv"
+    periodic_eval_log_path = log_dir / "periodic_eval_log.csv"
+    checkpoint_dir = base_dir
+    optimizer_path = checkpoint_dir / "optimizer.pt"
 
     # Initialize checkpoint manager
     checkpoint_manager = CheckpointManager(checkpoint_dir, model, tokenizer, optimizer)
     
     # Try to load latest checkpoint
     checkpoint_info = checkpoint_manager.load_latest_checkpoint()
-    start_idx = checkpoint_info["step"] if checkpoint_info else 0
-    
-    if start_idx > 0:
-        print(f"✅ Resuming training from step {start_idx}")
+    if checkpoint_info:
+        start_idx = checkpoint_info["step"]
+        logger.info(f"✅ Resuming training from step {start_idx}")
+        
+        # Verify model is in eval mode
+        model.eval()
+        
+        # Verify optimizer state
+        if not any(p.grad is not None for p in model.parameters()):
+            logger.info("Optimizer state verified")
+        else:
+            logger.warning("Found gradients in model parameters. Clearing gradients...")
+            optimizer.zero_grad()
     else:
-        print("ℹ️ Starting fresh training run")
+        start_idx = 0
+        logger.info("ℹ️ Starting fresh training run")
 
     # Prepare data
     total_rows = len(df)
     if start_idx >= total_rows:
-        print("✅ Training already completed!")
+        logger.info("✅ Training already completed!")
         return
 
     df_to_process = df.iloc[start_idx:]
     
-    # Initialize processor with checkpoint manager
-    processor = DataProcessor(model, tokenizer, device, checkpoint_manager=checkpoint_manager)
+    # Create validation set (10% of data)
+    validation_size = min(100, len(df_to_process) // 10)
+    validation_data = df_to_process.sample(n=validation_size, random_state=42)
+    df_to_process = df_to_process.drop(validation_data.index)
     
-    # Start producer and consumer threads
-    producer_thread = threading.Thread(target=processor.producer, args=(df_to_process,))
-    consumer_thread = threading.Thread(target=processor.consumer, args=(optimizer, log_path))
+    # Initialize processor with optimizer
+    processor = DataProcessor(model, tokenizer, device, checkpoint_manager=checkpoint_manager, optimizer=optimizer)
     
     try:
-        producer_thread.start()
-        consumer_thread.start()
-        
-        # Monitor progress
-        pbar = tqdm(total=len(df_to_process), desc="Manual PPO Training")
-        last_processed = start_idx
-        
-        while producer_thread.is_alive() or consumer_thread.is_alive():
-            current_size = processor.result_queue.qsize()
-            pbar.update(current_size - last_processed)
-            last_processed = current_size
-            time.sleep(1)
+        # Process in batches
+        for batch_idx, batch_start in enumerate(tqdm(range(0, len(df_to_process), processor.batch_size), desc="Manual PPO Training")):
+            batch_end = min(batch_start + processor.batch_size, len(df_to_process))
+            batch_data = df_to_process.iloc[batch_start:batch_end]
+            
+            # Process batch
+            batch_results = processor.process_batch(batch_data, batch_idx)
+            
+            # Run validation every 10 batches
+            if batch_idx % 10 == 0:
+                validation_results = processor.validate_model(validation_data, batch_idx)
+            
+            # Save checkpoint periodically
+            if checkpoint_manager and batch_idx % 10 == 0:
+                checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results)
+                checkpoint_manager.cleanup_old_checkpoints()
+                
+                # Log checkpoint info
+                logger.info(f"Checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
+                logger.info(f"Metrics saved in: {checkpoint_dir / 'training_metrics.json'}")
+            
+            # Clear caches periodically
+            if batch_idx % 10 == 0:
+                clear_caches()
+                clear_response_cache()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
     except KeyboardInterrupt:
-        print("\n⚠️ Stopping training...")
-        processor.stop_event.set()
+        logger.info("\n⚠️ Stopping training...")
         
         # Save final checkpoint before exiting
         if checkpoint_manager:
-            checkpoint_manager.save_checkpoint(last_processed, [])
+            checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results)
+            logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
         
     finally:
-        producer_thread.join()
-        consumer_thread.join()
-        pbar.close()
-        
         # Cleanup temporary directory
         if checkpoint_manager:
             shutil.rmtree(checkpoint_manager.temp_dir)
 
-    print("✅ PPO training complete. Log saved to logs/ppo_manual_log.csv")
+    logger.info("✅ PPO training complete. Log saved to logs/ppo_manual_log.csv")
+    logger.info(f"All checkpoints and metrics saved in: {checkpoint_dir}")

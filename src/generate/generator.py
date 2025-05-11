@@ -104,6 +104,7 @@ def generate_response_with_ad(user_query: str, ad_text: str, model, tokenizer) -
     response = generate_text(full_prompt, model, tokenizer)
     return response
 
+@cache_result(ttl_seconds=3600)  # Cache for 1 hour
 def generate_responses(user_query: str, ad_facts: dict, model, tokenizer) -> tuple[str, str]:
     """Generate both responses - with and without ad, and clean them."""
     ad_product = ad_facts.get('ad_product', '').strip()
@@ -121,9 +122,6 @@ Description: {description}"""
 
     raw_no_ad = generate_response_without_ad(user_query, model, tokenizer)
     raw_with_ad = generate_response_with_ad(user_query, ad_text, model, tokenizer)
-
-    print(f"\n🧾 Raw response WITHOUT ad: {repr(raw_no_ad)}")
-    print(f"🧾 Raw response WITH ad: {repr(raw_with_ad)}")
 
     if not raw_no_ad.strip() or not raw_with_ad.strip():
         print("⚠️ Skipping: One or both responses were empty.")
