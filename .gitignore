@@ -4,4 +4,7 @@ venv/
 
 checkpoints/ppo_manual/*.bin
 checkpoints/ppo_manual/*.safetensors
-checkpoints/ppo_manual/optimizer.pt
+checkpoints/ppo_manual/optimizer.ptcheckpoints/
+*.bin
+*.pt
+*.safetensors
