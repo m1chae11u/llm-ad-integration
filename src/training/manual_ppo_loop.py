@@ -708,6 +708,7 @@ def run_manual_ppo(model, tokenizer):
     processor = DataProcessor(model, tokenizer, device, checkpoint_manager=checkpoint_manager, optimizer=optimizer)
     
     try:
+        validation_results = None # Initialize validation_results to None
         # Process in batches
         for batch_idx, batch_start in enumerate(tqdm(range(0, len(df_to_process), processor.batch_size), desc="Manual PPO Training")):
             batch_end = min(batch_start + processor.batch_size, len(df_to_process))
@@ -743,7 +744,9 @@ def run_manual_ppo(model, tokenizer):
         
         # Save final checkpoint before exiting
         if checkpoint_manager:
-            checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results)
+            # batch_start and batch_results should exist from the loop
+            # validation_results might not exist if interrupted before validation ran
+            checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results) 
             logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
         
     finally:
