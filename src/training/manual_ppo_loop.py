@@ -287,7 +287,7 @@ class CheckpointManager:
             print(f"❌ Error cleaning up checkpoints: {e}")
 
 class DataProcessor:
-    def __init__(self, model, tokenizer, device, batch_size=4, checkpoint_manager=None, optimizer=None):
+    def __init__(self, model, tokenizer, device, batch_size=32, checkpoint_manager=None, optimizer=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -324,26 +324,52 @@ class DataProcessor:
         self.training_log = self.training_dir / "training_log.csv"
         self.stats_log = self.stats_dir / "training_stats.csv"
         
+        # Buffers for logs
+        self.generation_log_buffer = []
+        self.judging_log_buffer = []
+        self.training_log_buffer = []
+        
         # Create headers for log files with batch information
-        pd.DataFrame(columns=[
-            "batch_idx", "query_idx", "query", "ad_facts", "response_without_ad", "response_with_ad",
-            "generation_time", "token_count"
-        ]).to_csv(self.generation_log, index=False)
+        if not self.generation_log.exists() or os.path.getsize(self.generation_log) == 0:
+            pd.DataFrame(columns=[
+                "batch_idx", "query_idx", "query", "ad_facts", "response_without_ad", "response_with_ad",
+                "generation_time", "token_count"
+            ]).to_csv(self.generation_log, index=False)
         
-        pd.DataFrame(columns=[
-            "batch_idx", "query_idx", "query", "response_with_ad", "coherence_score", "helpfulness_score",
-            "salience_score", "detectability_score", "judging_time"
-        ]).to_csv(self.judging_log, index=False)
+        if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
+            pd.DataFrame(columns=[
+                "batch_idx", "query_idx", "query", "response_with_ad", "coherence_score", "helpfulness_score",
+                "salience_score", "detectability_score", "judging_time"
+            ]).to_csv(self.judging_log, index=False)
         
-        pd.DataFrame(columns=[
-            "batch_idx", "query_idx", "query", "response_with_ad", "reward", "loss", "training_time"
-        ]).to_csv(self.training_log, index=False)
+        if not self.training_log.exists() or os.path.getsize(self.training_log) == 0:
+            pd.DataFrame(columns=[
+                "batch_idx", "query_idx", "query", "response_with_ad", "reward", "loss", "training_time"
+            ]).to_csv(self.training_log, index=False)
         
-        pd.DataFrame(columns=[
-            "batch_idx", "timestamp", "total_queries", "successful_queries", "failed_queries",
-            "avg_generation_time", "avg_judging_time", "avg_training_time", "avg_reward", "avg_loss",
-            "total_tokens", "memory_usage"
-        ]).to_csv(self.stats_log, index=False)
+        if not self.stats_log.exists() or os.path.getsize(self.stats_log) == 0:
+            pd.DataFrame(columns=[
+                "batch_idx", "timestamp", "total_queries", "successful_queries", "failed_queries",
+                "avg_generation_time", "avg_judging_time", "avg_training_time", "avg_reward", "avg_loss",
+                "total_tokens", "memory_usage"
+            ]).to_csv(self.stats_log, index=False)
+
+    def _flush_logs(self):
+        """Write buffered logs to disk."""
+        if self.generation_log_buffer:
+            pd.DataFrame(self.generation_log_buffer).to_csv(self.generation_log, mode="a", header=False, index=False)
+            self.generation_log_buffer.clear()
+            logger.info(f"Flushed {len(self.generation_log_buffer)} generation log entries.")
+
+        if self.judging_log_buffer:
+            pd.DataFrame(self.judging_log_buffer).to_csv(self.judging_log, mode="a", header=False, index=False)
+            self.judging_log_buffer.clear()
+            logger.info(f"Flushed {len(self.judging_log_buffer)} judging log entries.")
+
+        if self.training_log_buffer:
+            pd.DataFrame(self.training_log_buffer).to_csv(self.training_log, mode="a", header=False, index=False)
+            self.training_log_buffer.clear()
+            logger.info(f"Flushed {len(self.training_log_buffer)} training log entries.")
 
     def update_stats(self, batch_idx, gen_time, judge_time, train_time, token_count, reward, loss, success=True):
         """Update training statistics."""
@@ -476,7 +502,7 @@ class DataProcessor:
                 token_count = len(self.tokenizer.encode(response_with_ad))
                 
                 # Log generation results
-                pd.DataFrame([{
+                self.generation_log_buffer.append({
                     "batch_idx": batch_idx,
                     "query_idx": idx,
                     "query": query,
@@ -485,7 +511,7 @@ class DataProcessor:
                     "response_with_ad": response_with_ad,
                     "generation_time": gen_time,
                     "token_count": token_count
-                }]).to_csv(self.generation_log, mode="a", header=False, index=False)
+                })
                 
                 logger.info(f"✅ Batch {batch_idx} - Generation complete for query {idx} in {gen_time:.2f}s")
 
@@ -512,7 +538,7 @@ class DataProcessor:
                 judge_time = time.time() - judge_start_time
                 
                 # Log judging results
-                pd.DataFrame([{
+                self.judging_log_buffer.append({
                     "batch_idx": batch_idx,
                     "query_idx": idx,
                     "query": query,
@@ -522,7 +548,7 @@ class DataProcessor:
                     "salience_score": score_sal.get("Ad Salience Score", 0),
                     "detectability_score": score_det.get("detectability_cosine", 0),
                     "judging_time": judge_time
-                }]).to_csv(self.judging_log, mode="a", header=False, index=False)
+                })
                 
                 logger.info(f"✅ Batch {batch_idx} - Judging complete for query {idx} in {judge_time:.2f}s")
 
@@ -565,7 +591,7 @@ class DataProcessor:
                 train_time = time.time() - train_start_time
                 
                 # Log training results
-                pd.DataFrame([{
+                self.training_log_buffer.append({
                     "batch_idx": batch_idx,
                     "query_idx": idx,
                     "query": query,
@@ -573,7 +599,7 @@ class DataProcessor:
                     "reward": reward.item(),
                     "loss": loss.item(),
                     "training_time": train_time
-                }]).to_csv(self.training_log, mode="a", header=False, index=False)
+                })
                 
                 logger.info(f"✅ Batch {batch_idx} - Training complete for query {idx} in {train_time:.2f}s")
 
@@ -694,17 +720,18 @@ def run_manual_ppo(model, tokenizer):
             if batch_idx % 10 == 0:
                 validation_results = processor.validate_model(validation_data, batch_idx)
             
-            # Save checkpoint periodically (every 10 batches)
-            if checkpoint_manager and batch_idx % 10 == 0:
+            # Save checkpoint, flush logs, and cleanup periodically (e.g., every 50 batches)
+            if checkpoint_manager and batch_idx > 0 and batch_idx % 50 == 0: # Adjusted frequency
+                processor._flush_logs() # Flush logs before checkpointing
                 checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results)
-                checkpoint_manager.cleanup_old_checkpoints(keep_last_n=2)  # Keep only last 2 checkpoints
+                checkpoint_manager.cleanup_old_checkpoints(keep_last_n=2)
                 
                 # Log checkpoint info
                 logger.info(f"Checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
                 logger.info(f"Metrics saved in: {checkpoint_dir / 'training_metrics.json'}")
             
-            # Clear caches periodically (every 10 batches)
-            if batch_idx % 10 == 0:
+            # Clear caches periodically (e.g., every 50 batches)
+            if batch_idx > 0 and batch_idx % 50 == 0: # Adjusted frequency
                 clear_caches()
                 clear_response_cache()
                 gc.collect()
@@ -720,6 +747,9 @@ def run_manual_ppo(model, tokenizer):
             logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
         
     finally:
+        # Ensure all logs are flushed before exiting
+        if processor:
+            processor._flush_logs()
         # Cleanup temporary directory
         if checkpoint_manager:
             shutil.rmtree(checkpoint_manager.temp_dir)
