@@ -15,6 +15,7 @@ import tempfile
 import json
 from pathlib import Path
 import logging
+import requests
 
 from judge import (
     judge_coherence,
@@ -24,6 +25,7 @@ from judge import (
 )
 from generate.generator import generate_responses, clear_response_cache
 from judge.utils import clear_caches
+from training.checkpoint_manager import CheckpointManager  # Import the dedicated CheckpointManager
 
 # Set up logging
 logging.basicConfig(
@@ -35,6 +37,24 @@ logger = logging.getLogger(__name__)
 # Prevent fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# Configure requests for reliability
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+retry_strategy = Retry(
+    total=10,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+
+# Create an adapter with the retry strategy
+adapter = HTTPAdapter(max_retries=retry_strategy)
+
+# Mount the adapter on the session
+session = requests.Session()
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
 def compute_ppo_loss(old_log_probs, new_log_probs, advantages, clip_range=0.2):
     ratio = torch.exp(new_log_probs - old_log_probs)
     clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
@@ -42,250 +62,6 @@ def compute_ppo_loss(old_log_probs, new_log_probs, advantages, clip_range=0.2):
 
 def compute_advantages(reward, value):
     return reward - value
-
-class CheckpointManager:
-    def __init__(self, checkpoint_dir, model, tokenizer, optimizer):
-        self.checkpoint_dir = Path(checkpoint_dir)
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.model = model
-        self.tokenizer = tokenizer
-        self.optimizer = optimizer
-        self.checkpoint_info_path = self.checkpoint_dir / "checkpoint_info.json"
-        self.metrics_path = self.checkpoint_dir / "training_metrics.json"
-        self.lock = threading.Lock()
-        
-        # Initialize metrics file if it doesn't exist
-        if not self.metrics_path.exists():
-            with open(self.metrics_path, "w") as f:
-                json.dump({
-                    "checkpoints": [],
-                    "best_reward": 0,
-                    "best_checkpoint": None,
-                    "training_history": []
-                }, f, indent=2)
-    
-    def save_checkpoint(self, current_step, batch_results, validation_results=None):
-        """Save checkpoint atomically with verification."""
-        with self.lock:
-            try:
-                # Create temporary checkpoint directory
-                temp_checkpoint_dir = self.temp_dir / f"checkpoint_{current_step}"
-                temp_checkpoint_dir.mkdir(exist_ok=True)
-                
-                # Save model and tokenizer
-                self.model.save_pretrained(
-                    temp_checkpoint_dir,
-                    safe_serialization=False,  # Use pytorch_model.bin instead of safetensors
-                    max_shard_size="2GB"  # Split into smaller files
-                )
-                self.tokenizer.save_pretrained(temp_checkpoint_dir)
-                
-                # Save optimizer state
-                torch.save(
-                    self.optimizer.state_dict(),
-                    temp_checkpoint_dir / "optimizer.pt"
-                )
-                
-                # Convert batch results to serializable format
-                serializable_results = []
-                for result in batch_results:
-                    serializable_result = {
-                        "idx": result["idx"],
-                        "query": result["query"],
-                        "ad_facts": result["ad_facts"],
-                        "response_without_ad": result["response_without_ad"],
-                        "response_with_ad": result["response_with_ad"],
-                        "reward": result["reward"].item() if isinstance(result["reward"], torch.Tensor) else result["reward"],
-                        "scores": {
-                            "coherence": result["scores"]["coherence"],
-                            "helpfulness": result["scores"]["helpfulness"],
-                            "salience": result["scores"]["salience"],
-                            "detectability": result["scores"]["detectability"]
-                        }
-                    }
-                    serializable_results.append(serializable_result)
-                
-                # Calculate metrics safely
-                num_results = len(serializable_results)
-                avg_reward = sum(r["reward"] for r in serializable_results) / num_results if num_results > 0 else 0.0
-                avg_coherence = sum(r["scores"]["coherence"].get("Coherence Score", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
-                avg_helpfulness = sum(r["scores"]["helpfulness"].get("Helpfulness Score", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
-                avg_salience = sum(r["scores"]["salience"].get("Ad Salience Score", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
-                avg_detectability = sum(r["scores"]["detectability"].get("detectability_cosine", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
-                
-                # Save checkpoint info
-                checkpoint_info = {
-                    "step": current_step,
-                    "timestamp": time.time(),
-                    "batch_results": serializable_results,
-                    "metrics": {
-                        "avg_reward": avg_reward,
-                        "avg_coherence": avg_coherence,
-                        "avg_helpfulness": avg_helpfulness,
-                        "avg_salience": avg_salience,
-                        "avg_detectability": avg_detectability
-                    }
-                }
-                
-                if validation_results:
-                    val_avg_reward = sum(r["reward"] for r in validation_results) / len(validation_results)
-                    checkpoint_info["metrics"]["validation_avg_reward"] = val_avg_reward
-                
-                with open(temp_checkpoint_dir / "checkpoint_info.json", "w") as f:
-                    json.dump(checkpoint_info, f, indent=2)
-                
-                # Update metrics file
-                with open(self.metrics_path, "r") as f:
-                    metrics = json.load(f)
-                
-                metrics["checkpoints"].append({
-                    "step": current_step,
-                    "path": str(temp_checkpoint_dir),
-                    "metrics": checkpoint_info["metrics"]
-                })
-                
-                # Update best checkpoint if validation reward is better
-                if validation_results:
-                    val_avg_reward = sum(r["reward"] for r in validation_results) / len(validation_results)
-                    if val_avg_reward > metrics["best_reward"]:
-                        metrics["best_reward"] = val_avg_reward
-                        metrics["best_checkpoint"] = str(temp_checkpoint_dir)
-                        logger.info(f"🎉 New best model found! Validation reward: {val_avg_reward:.4f}")
-                
-                # Add to training history
-                metrics["training_history"].append({
-                    "step": current_step,
-                    "timestamp": time.time(),
-                    "metrics": checkpoint_info["metrics"]
-                })
-                
-                with open(self.metrics_path, "w") as f:
-                    json.dump(metrics, f, indent=2)
-                
-                # Verify the saved files
-                self._verify_checkpoint(temp_checkpoint_dir)
-                
-                # Atomic move to final location
-                final_checkpoint_dir = self.checkpoint_dir / f"checkpoint_{current_step}"
-                if final_checkpoint_dir.exists():
-                    shutil.rmtree(final_checkpoint_dir)
-                shutil.move(temp_checkpoint_dir, final_checkpoint_dir)
-                
-                # Update latest checkpoint info
-                with open(self.checkpoint_info_path, "w") as f:
-                    json.dump({"latest_checkpoint": str(final_checkpoint_dir)}, f)
-                
-                logger.info(f"✅ Checkpoint saved successfully at step {current_step}")
-                logger.info(f"📊 Metrics - Reward: {avg_reward:.4f}, Coherence: {avg_coherence:.4f}, "
-                          f"Helpfulness: {avg_helpfulness:.4f}, Salience: {avg_salience:.4f}, "
-                          f"Detectability: {avg_detectability:.4f}")
-                
-            except Exception as e:
-                logger.error(f"❌ Error saving checkpoint: {e}")
-                if temp_checkpoint_dir.exists():
-                    shutil.rmtree(temp_checkpoint_dir)
-                raise
-    
-    def _verify_checkpoint(self, checkpoint_dir):
-        """Verify checkpoint integrity."""
-        required_files = [
-            "config.json",
-            "optimizer.pt",
-            "checkpoint_info.json"
-        ]
-        
-        # Check for model files (either safetensors or pytorch_model.bin)
-        model_files = ["model.safetensors", "pytorch_model.bin"]
-        has_model_file = any((checkpoint_dir / file).exists() for file in model_files)
-        if not has_model_file:
-            raise ValueError("Missing model file (neither model.safetensors nor pytorch_model.bin found)")
-        
-        # Check other required files
-        for file in required_files:
-            if not (checkpoint_dir / file).exists():
-                raise ValueError(f"Missing required file: {file}")
-    
-    def load_latest_checkpoint(self):
-        """Load the latest checkpoint if available."""
-        if not self.checkpoint_info_path.exists():
-            logger.info("No checkpoint info found. Starting fresh training.")
-            return None
-            
-        try:
-            with open(self.checkpoint_info_path, "r") as f:
-                info = json.load(f)
-            
-            latest_checkpoint = Path(info["latest_checkpoint"])
-            if not latest_checkpoint.exists():
-                logger.warning(f"Checkpoint directory {latest_checkpoint} not found. Starting fresh training.")
-                return None
-            
-            logger.info(f"Loading checkpoint from {latest_checkpoint}")
-            
-            # Load model state
-            try:
-                self.model = self.model.from_pretrained(
-                    latest_checkpoint,
-                    local_files_only=True,
-                    torch_dtype=torch.float16
-                )
-                logger.info("✅ Model state loaded successfully")
-            except Exception as e:
-                logger.error(f"❌ Error loading model state: {e}")
-                return None
-            
-            # Load tokenizer
-            try:
-                self.tokenizer = self.tokenizer.from_pretrained(
-                    latest_checkpoint,
-                    local_files_only=True
-                )
-                logger.info("✅ Tokenizer loaded successfully")
-            except Exception as e:
-                logger.error(f"❌ Error loading tokenizer: {e}")
-                return None
-            
-            # Load optimizer state
-            try:
-                optimizer_path = latest_checkpoint / "optimizer.pt"
-                if optimizer_path.exists():
-                    optimizer_state = torch.load(optimizer_path)
-                    self.optimizer.load_state_dict(optimizer_state)
-                    logger.info("✅ Optimizer state loaded successfully")
-                else:
-                    logger.warning("No optimizer state found in checkpoint")
-            except Exception as e:
-                logger.error(f"❌ Error loading optimizer state: {e}")
-                return None
-            
-            # Load checkpoint info
-            try:
-                with open(latest_checkpoint / "checkpoint_info.json", "r") as f:
-                    checkpoint_info = json.load(f)
-                logger.info(f"✅ Checkpoint info loaded successfully. Step: {checkpoint_info['step']}")
-                return checkpoint_info
-            except Exception as e:
-                logger.error(f"❌ Error loading checkpoint info: {e}")
-                return None
-            
-        except Exception as e:
-            logger.error(f"❌ Error loading checkpoint: {e}")
-            return None
-    
-    def cleanup_old_checkpoints(self, keep_last_n=3):
-        """Clean up old checkpoints, keeping only the last N."""
-        try:
-            checkpoints = sorted(
-                [d for d in self.checkpoint_dir.glob("checkpoint_*") if d.is_dir()],
-                key=lambda x: int(x.name.split("_")[1])
-            )
-            
-            for checkpoint in checkpoints[:-keep_last_n]:
-                shutil.rmtree(checkpoint)
-                print(f"Cleaned up old checkpoint: {checkpoint}")
-                
-        except Exception as e:
-            print(f"❌ Error cleaning up checkpoints: {e}")
 
 class DataProcessor:
     def __init__(self, model, tokenizer, device, batch_size=32, checkpoint_manager=None, optimizer=None):
@@ -296,19 +72,14 @@ class DataProcessor:
         self.checkpoint_manager = checkpoint_manager
         self.optimizer = optimizer
         self.current_step = 0
+        # Default start index is 0, will be updated when training resumes
+        self.dataset_start_idx = 0
         
-        # Statistics tracking
-        self.stats = {
-            "total_queries": 0,
-            "successful_queries": 0,
-            "failed_queries": 0,
-            "total_generation_time": 0,
-            "total_judging_time": 0,
-            "total_training_time": 0,
-            "total_tokens": 0,
-            "avg_reward": 0,
-            "avg_loss": 0
-        }
+        # If checkpoint_manager is provided, use its model/tokenizer references
+        if self.checkpoint_manager is not None:
+            self.model = self.checkpoint_manager.model
+            self.tokenizer = self.checkpoint_manager.tokenizer
+            self.optimizer = self.checkpoint_manager.optimizer
         
         # Create directories for intermediate results
         self.generation_dir = Path("logs/generations")
@@ -330,7 +101,7 @@ class DataProcessor:
         self.judging_log_buffer = []
         self.training_log_buffer = []
         
-        # Create headers for log files with batch information
+        # Create headers for log files with batch information if they don't exist
         if not self.generation_log.exists() or os.path.getsize(self.generation_log) == 0:
             pd.DataFrame(columns=[
                 "batch_idx", "query_idx", "query", "ad_facts", "response_without_ad", "response_with_ad",
@@ -348,12 +119,70 @@ class DataProcessor:
                 "batch_idx", "query_idx", "query", "response_with_ad", "reward", "loss", "training_time"
             ]).to_csv(self.training_log, index=False)
         
+        # Initialize stats - default values
+        self.stats = {
+            "total_queries": 0,
+            "successful_queries": 0,
+            "failed_queries": 0,
+            "total_generation_time": 0,
+            "total_judging_time": 0,
+            "total_training_time": 0,
+            "total_tokens": 0,
+            "avg_reward": 0,
+            "avg_loss": 0
+        }
+        
+        # Try to load existing stats if available
+        self._load_stats()
+        
+        # Create stats file if it doesn't exist
         if not self.stats_log.exists() or os.path.getsize(self.stats_log) == 0:
             pd.DataFrame(columns=[
                 "batch_idx", "timestamp", "total_queries", "successful_queries", "failed_queries",
                 "avg_generation_time", "avg_judging_time", "avg_training_time", "avg_reward", "avg_loss",
                 "total_tokens", "memory_usage"
             ]).to_csv(self.stats_log, index=False)
+
+    def _load_stats(self):
+        """Try to load existing training statistics to resume from."""
+        try:
+            if self.stats_log.exists() and os.path.getsize(self.stats_log) > 0:
+                logger.info(f"Loading existing training statistics from {self.stats_log}")
+                stats_df = pd.read_csv(self.stats_log)
+                
+                if not stats_df.empty:
+                    # Get the latest entry
+                    latest_stats = stats_df.iloc[-1]
+                    
+                    # Load the stats
+                    self.stats["total_queries"] = int(latest_stats.get("total_queries", 0))
+                    self.stats["successful_queries"] = int(latest_stats.get("successful_queries", 0))
+                    self.stats["failed_queries"] = int(latest_stats.get("failed_queries", 0))
+                    
+                    # Calculate accumulated times from averages * counts 
+                    self.stats["total_generation_time"] = (
+                        latest_stats.get("avg_generation_time", 0) * self.stats["total_queries"]
+                    )
+                    self.stats["total_judging_time"] = (
+                        latest_stats.get("avg_judging_time", 0) * self.stats["total_queries"]
+                    )
+                    self.stats["total_training_time"] = (
+                        latest_stats.get("avg_training_time", 0) * self.stats["total_queries"]
+                    )
+                    
+                    self.stats["total_tokens"] = int(latest_stats.get("total_tokens", 0))
+                    self.stats["avg_reward"] = float(latest_stats.get("avg_reward", 0))
+                    self.stats["avg_loss"] = float(latest_stats.get("avg_loss", 0))
+                    
+                    logger.info(f"Resumed training stats: {self.stats['total_queries']} queries, "
+                               f"avg_reward: {self.stats['avg_reward']:.4f}")
+                else:
+                    logger.info("No existing training stats found, starting with fresh statistics")
+            else:
+                logger.info("No stats file exists yet, starting with fresh statistics")
+        except Exception as e:
+            logger.error(f"Error loading stats: {e}. Starting with fresh statistics.")
+            # Keep using the default values
 
     def _flush_logs(self):
         """Write buffered logs to disk."""
@@ -454,10 +283,13 @@ class DataProcessor:
                     ]
                     reward = torch.tensor(sum(reward_values) / len(reward_values) if reward_values else 0.0, dtype=torch.float32).to(self.device)
                     
-                    loss = -new_log_probs * reward.detach()
+                    # For validation, we don't need to compute loss
 
                     validation_results.append({
+                        "idx": idx,
                         "query": query,
+                        "ad_facts": ad_facts,
+                        "response_without_ad": response_without_ad,
                         "response_with_ad": response_with_ad,
                         "reward": reward.item(),
                         "scores": {
@@ -485,7 +317,18 @@ class DataProcessor:
         logger.info(f"🔄 Starting batch {batch_idx} with {len(batch_data)} queries")
         batch_start_time = time.time()
         
-        for idx, row in batch_data.iterrows():
+        # Get the actual start index in the original dataset
+        # Account for the dataset_start_idx offset
+        start_idx_in_batch = batch_idx * self.batch_size
+        # The absolute position is the offset plus the position in the current slice
+        start_idx_in_dataset = self.dataset_start_idx + start_idx_in_batch
+        current_query_position = start_idx_in_dataset  # Initialize to start of batch
+        
+        # Keep track of the position within batch
+        for i, (idx, row) in enumerate(batch_data.iterrows()):
+            # Update to current absolute position in dataset
+            current_query_position = start_idx_in_dataset + i
+            
             query = str(row['vague_query'])
             ad_facts = {
                 "ad_product": str(row['ad_product']),
@@ -494,9 +337,11 @@ class DataProcessor:
                 "description": str(row['ad_description']),
             }
 
+            # Log which query we're on in dataset
+            logger.info(f"🔄 Batch {batch_idx} - Starting generation for query {idx} (dataset position: {current_query_position})")
+
             try:
                 # Stage 1: Generation
-                logger.info(f"🔄 Batch {batch_idx} - Starting generation for query {idx}")
                 gen_start_time = time.time()
                 
                 with torch.no_grad():
@@ -517,10 +362,10 @@ class DataProcessor:
                     "token_count": token_count
                 })
                 
-                logger.info(f"✅ Batch {batch_idx} - Generation complete for query {idx} in {gen_time:.2f}s")
+                logger.info(f"✅ Batch {batch_idx} - Generation complete for query {idx} (dataset position: {current_query_position}) in {gen_time:.2f}s")
 
                 # Stage 2: Judging
-                logger.info(f"🔄 Batch {batch_idx} - Starting judging for query {idx}")
+                logger.info(f"🔄 Batch {batch_idx} - Starting judging for query {idx} (dataset position: {current_query_position})")
                 judge_start_time = time.time()
                 
                 ad_text = f"""Product: {ad_facts['ad_product']}
@@ -554,10 +399,10 @@ class DataProcessor:
                     "judging_time": judge_time
                 })
                 
-                logger.info(f"✅ Batch {batch_idx} - Judging complete for query {idx} in {judge_time:.2f}s")
+                logger.info(f"✅ Batch {batch_idx} - Judging complete for query {idx} (dataset position: {current_query_position}) in {judge_time:.2f}s")
 
                 # Stage 3: Training
-                logger.info(f"🔄 Batch {batch_idx} - Starting training for query {idx}")
+                logger.info(f"🔄 Batch {batch_idx} - Starting training for query {idx} (dataset position: {current_query_position})")
                 train_start_time = time.time()
 
                 input_ids = self.tokenizer(query, return_tensors="pt", truncation=True, max_length=384).input_ids.to(self.device)
@@ -605,7 +450,7 @@ class DataProcessor:
                     "training_time": train_time
                 })
                 
-                logger.info(f"✅ Batch {batch_idx} - Training complete for query {idx} in {train_time:.2f}s")
+                logger.info(f"✅ Batch {batch_idx} - Training complete for query {idx} (dataset position: {current_query_position}) in {train_time:.2f}s")
 
                 # Update statistics
                 self.update_stats(batch_idx, gen_time, judge_time, train_time, token_count, reward.item(), loss.item(), success=True)
@@ -624,6 +469,39 @@ class DataProcessor:
                         "detectability": score_det
                     }
                 })
+                
+                # Save current position after every query (not just every 5)
+                # Create a small incremental checkpoint file to record last processed query
+                if hasattr(self, 'checkpoint_manager') and self.checkpoint_manager:
+                    try:
+                        # Save just the query position, not the full model (which is expensive)
+                        query_checkpoint = {
+                            "last_processed_query": int(current_query_position),
+                            "original_idx": int(idx),
+                            "batch_idx": batch_idx,
+                            "timestamp": time.time()
+                        }
+                        
+                        # Save to a special file that's quick to update
+                        query_checkpoint_path = Path("checkpoints/ppo_manual/last_query_position.json")
+                        with open(query_checkpoint_path, "w") as f:
+                            json.dump(query_checkpoint, f)
+                    except Exception as e:
+                        logger.error(f"Error saving query position checkpoint: {e}")
+                
+                # Also update the simple text file
+                last_position_path = Path("checkpoints/ppo_manual/last_processed_position.txt")
+                try:
+                    with open(last_position_path, "w") as f:
+                        f.write(str(current_query_position))
+                except Exception as e:
+                    logger.error(f"Failed to save position: {e}")
+                
+                # Flush logs and save formal checkpoint every 5 examples
+                if len(results) % 5 == 0:
+                    logger.info(f"Saving incremental checkpoint at dataset position {current_query_position} (batch {batch_idx}, query idx {idx})")
+                    self._flush_logs()
+                    logger.info(f"Saved query position checkpoint: dataset position {current_query_position} (original idx {idx})")
 
             except Exception as e:
                 logger.error(f"❌ Batch {batch_idx} - Error processing query {idx}: {e}")
@@ -640,7 +518,22 @@ class DataProcessor:
 
         batch_time = time.time() - batch_start_time
         logger.info(f"✅ Completed batch {batch_idx} in {batch_time:.2f}s")
-        return results
+        
+        # Always flush logs at the end of a batch
+        self._flush_logs()
+        logger.info(f"Logs flushed for batch {batch_idx}")
+        
+        # Save the absolute latest position to a file at end of batch
+        last_position_path = Path("checkpoints/ppo_manual/last_processed_position.txt")
+        try:
+            with open(last_position_path, "w") as f:
+                f.write(str(current_query_position))
+            logger.info(f"Saved latest position at batch end: {current_query_position}")
+        except Exception as e:
+            logger.error(f"Failed to save position: {e}")
+        
+        # Return final query position along with results
+        return results, current_query_position
 
 def run_manual_ppo(model, tokenizer):
     device = model.device
@@ -671,29 +564,75 @@ def run_manual_ppo(model, tokenizer):
     log_path = log_dir / "ppo_manual_log.csv"
     periodic_eval_log_path = log_dir / "periodic_eval_log.csv"
     checkpoint_dir = base_dir
-    optimizer_path = checkpoint_dir / "optimizer.pt"
-
+    
     # Initialize checkpoint manager
     checkpoint_manager = CheckpointManager(checkpoint_dir, model, tokenizer, optimizer)
     
-    # Try to load latest checkpoint
-    checkpoint_info = checkpoint_manager.load_latest_checkpoint()
-    if checkpoint_info:
-        start_idx = checkpoint_info["step"]
-        logger.info(f"✅ Resuming training from step {start_idx}")
+    # First check for query-level checkpoint
+    query_checkpoint_path = base_dir / "last_query_position.json"
+    resume_from_query = None
+    
+    if query_checkpoint_path.exists():
+        try:
+            with open(query_checkpoint_path, "r") as f:
+                query_checkpoint = json.load(f)
+                resume_from_query = query_checkpoint.get("last_processed_query")
+                last_batch = query_checkpoint.get("batch_idx")
+                logger.info(f"Found query checkpoint! Last processed query: {resume_from_query} (batch {last_batch})")
+        except Exception as e:
+            logger.error(f"Error reading query checkpoint: {e}")
+    
+    # Try to load latest model checkpoint 
+    try:
+        # Clear CUDA cache before loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         
-        # Verify model is in eval mode
-        model.eval()
+        logger.info("Loading checkpoint...")
+        loaded_model, loaded_tokenizer, checkpoint_info = checkpoint_manager.load_latest_checkpoint()
         
-        # Verify optimizer state
-        if not any(p.grad is not None for p in model.parameters()):
-            logger.info("Optimizer state verified")
+        if loaded_model is not None:
+            # Move model back to original device if needed
+            if str(loaded_model.device) == "cpu" and str(device) != "cpu":
+                logger.info(f"Moving model from CPU to {device}...")
+                loaded_model = loaded_model.to(device)
+            
+            model = loaded_model
+            tokenizer = loaded_tokenizer
+            
+            # If we have a query checkpoint, use that as it's more precise
+            if resume_from_query is not None:
+                start_idx = resume_from_query + 1  # Start from the next query after the last one processed
+                logger.info(f"✅ Resuming training from query {start_idx} (based on query checkpoint)")
+            else:
+                # Fall back to the step in the model checkpoint
+                start_idx = checkpoint_info["step"] if checkpoint_info else 0
+                logger.info(f"✅ Resuming training from step {start_idx} (based on model checkpoint)")
+            
+            # Verify model is in eval mode
+            model.eval()
+            
+            # Verify optimizer state
+            if not any(p.grad is not None for p in model.parameters()):
+                logger.info("Optimizer state verified")
+            else:
+                logger.warning("Found gradients in model parameters. Clearing gradients...")
+                optimizer.zero_grad()
         else:
-            logger.warning("Found gradients in model parameters. Clearing gradients...")
-            optimizer.zero_grad()
-    else:
-        start_idx = 0
-        logger.info("ℹ️ Starting fresh training run")
+            # If no query checkpoint and no model checkpoint, start from beginning
+            start_idx = 0
+            logger.info("ℹ️ Starting fresh training run")
+    except Exception as e:
+        logger.error(f"❌ Error during checkpoint loading: {e}")
+        
+        # If we have a query checkpoint, we can still use it even if model loading failed
+        if resume_from_query is not None:
+            start_idx = resume_from_query + 1
+            logger.info(f"✅ Resuming from query {start_idx} based on query checkpoint (despite model load failure)")
+        else:
+            start_idx = 0
+            logger.info("ℹ️ Starting fresh training run due to loading error")
 
     # Prepare data
     total_rows = len(df)
@@ -708,20 +647,24 @@ def run_manual_ppo(model, tokenizer):
     validation_data = df_to_process.sample(n=validation_size, random_state=42)
     df_to_process = df_to_process.drop(validation_data.index)
     
-    # Initialize processor with optimizer
+    # Initialize processor with optimizer and pass the starting index
     processor = DataProcessor(model, tokenizer, device, checkpoint_manager=checkpoint_manager, optimizer=optimizer)
+    # Pass the starting index to the processor
+    processor.dataset_start_idx = start_idx
     
     try:
         batch_start = 0           # Initialize batch_start
         batch_results = []        # Initialize batch_results
         validation_results = None # Initialize validation_results
+        current_query_idx = start_idx  # Initialize current query position (absolute index)
+        
         # Process in batches
         for batch_idx, batch_start in enumerate(tqdm(range(0, len(df_to_process), processor.batch_size), desc="Manual PPO Training")):
             batch_end = min(batch_start + processor.batch_size, len(df_to_process))
             batch_data = df_to_process.iloc[batch_start:batch_end]
             
             # Process batch
-            batch_results = processor.process_batch(batch_data, batch_idx)
+            batch_results, current_query_idx = processor.process_batch(batch_data, batch_idx)
             
             # Run validation every 10 batches
             if batch_idx % 10 == 0:
@@ -730,11 +673,11 @@ def run_manual_ppo(model, tokenizer):
             # Save checkpoint, flush logs, and cleanup periodically (e.g., every 50 batches)
             if checkpoint_manager and batch_idx > 0 and batch_idx % 50 == 0: # Adjusted frequency
                 processor._flush_logs() # Flush logs before checkpointing
-                checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results)
+                checkpoint_manager.save_checkpoint(current_query_idx, batch_results, validation_results)
                 checkpoint_manager.cleanup_old_checkpoints(keep_last_n=2)
                 
                 # Log checkpoint info
-                logger.info(f"Checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
+                logger.info(f"Checkpoint saved in: {checkpoint_dir / f'checkpoint_{current_query_idx}'}")
                 logger.info(f"Metrics saved in: {checkpoint_dir / 'training_metrics.json'}")
             
             # Clear caches periodically (e.g., every 50 batches)
@@ -744,39 +687,112 @@ def run_manual_ppo(model, tokenizer):
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            
+        
     except KeyboardInterrupt:
         logger.info("\n⚠️ Stopping training...")
         
-        # Save final checkpoint before exiting
+        # Try multiple sources to find the most reliable position
+        current_position = None
+        
+        # 1. Try the last_processed_position.txt file (most reliable, written at end of batch)
+        last_position_path = Path("checkpoints/ppo_manual/last_processed_position.txt")
+        if last_position_path.exists():
+            try:
+                with open(last_position_path, "r") as f:
+                    current_position = int(f.read().strip())
+                    logger.info(f"Found batch-end position from file: {current_position}")
+            except Exception as e:
+                logger.error(f"Error reading batch-end position: {e}")
+        
+        # 2. Try the query checkpoint file (updated during batch)
+        if current_position is None:
+            query_checkpoint_path = Path("checkpoints/ppo_manual/last_query_position.json")
+            if query_checkpoint_path.exists():
+                try:
+                    with open(query_checkpoint_path, "r") as f:
+                        query_checkpoint = json.load(f)
+                        current_position = query_checkpoint.get("last_processed_query")
+                        logger.info(f"Found position from query checkpoint: {current_position}")
+                except Exception as e:
+                    logger.error(f"Error reading query checkpoint: {e}")
+        
+        # 3. Last resort: use the in-memory variable
+        if current_position is None and 'current_query_idx' in locals():
+            current_position = current_query_idx
+            logger.info(f"Using in-memory position: {current_position}")
+        
+        # Use the most reliable position we found
+        if current_position is not None:
+            logger.info(f"Current dataset position at interruption: {current_position}")
+            
+            # Save query position checkpoint
+            try:
+                query_checkpoint = {
+                    "last_processed_query": int(current_position),
+                    "batch_idx": batch_idx if 'batch_idx' in locals() else 0,
+                    "timestamp": time.time()
+                }
+                
+                # Create checkpoint dir if needed
+                query_checkpoint_path = Path("checkpoints/ppo_manual/last_query_position.json")
+                query_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Save the checkpoint
+                with open(query_checkpoint_path, "w") as f:
+                    json.dump(query_checkpoint, f)
+                    
+                logger.info(f"✅ Saved query position checkpoint at dataset position {current_position}")
+            except Exception as e:
+                logger.error(f"❌ Error saving query position checkpoint: {e}")
+        
+        # Flush logs before saving checkpoint
+        if processor:
+            logger.info("Flushing logs before saving final checkpoint...")
+            processor._flush_logs()
+        
+        # Save final model checkpoint before exiting
         if checkpoint_manager:
             try:
-                # Defensive check and logging before saving
-                current_batch_start = batch_start if 'batch_start' in locals() else 'undefined'
-                current_batch_results_len = len(batch_results) if 'batch_results' in locals() else 'undefined'
-                current_validation_results_defined = 'validation_results' in locals()
-                
-                logger.info(f"Attempting final save. State: batch_start={current_batch_start}, batch_results defined={current_batch_results_len != 'undefined'}, validation_results defined={current_validation_results_defined}")
-                
-                # Ensure variables exist before calling save_checkpoint, using defaults if needed
-                final_batch_start = batch_start if 'batch_start' in locals() else 0
-                final_batch_results = batch_results if 'batch_results' in locals() else []
-                final_validation_results = validation_results if 'validation_results' in locals() else None
+                # Use current_position instead of current_query_idx
+                if current_position is not None:
+                    logger.info(f"Saving final model checkpoint at dataset position {current_position}")
+                    
+                    # Ensure variables exist before calling save_checkpoint, using defaults if needed
+                    final_batch_results = batch_results if 'batch_results' in locals() else []
+                    final_validation_results = validation_results if 'validation_results' in locals() else None
+                    
+                    # Debug batch_results content
+                    if final_batch_results:
+                        logger.info(f"Saving checkpoint with {len(final_batch_results)} results")
+                        # Check a sample result structure
+                        sample_result = final_batch_results[0]
+                        logger.info(f"Sample result structure: idx={sample_result.get('idx')}, has_reward={isinstance(sample_result.get('reward'), (float, int, torch.Tensor))}")
+                        
+                        # Calculate and verify metrics before saving
+                        num_results = len(final_batch_results)
+                        if num_results > 0:
+                            avg_reward = sum(r["reward"].item() if isinstance(r["reward"], torch.Tensor) else r["reward"] for r in final_batch_results) / num_results
+                            logger.info(f"Verified metrics before saving - Avg Reward: {avg_reward:.4f}")
+                    else:
+                        logger.warning("No batch results to save! Checkpoint will have empty metrics.")
 
-                checkpoint_manager.save_checkpoint(final_batch_start, final_batch_results, final_validation_results)
-                logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{final_batch_start}'}")
+                    checkpoint_manager.save_checkpoint(current_position, final_batch_results, final_validation_results)
+                    logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{current_position}'}")
+                else:
+                    logger.error("Cannot save model checkpoint: no position information available")
             except UnboundLocalError as e:
                 # This should ideally not happen now, but catch just in case
                 logger.error(f"❌ UnboundLocalError during final save attempt: {e}. Could not save final checkpoint.")
             except Exception as e:
                 logger.error(f"❌ Unexpected error during final save attempt: {e}. Could not save final checkpoint.")
+                logger.exception("Detailed traceback:")
         
     finally:
         # Ensure all logs are flushed before exiting
         if processor:
             processor._flush_logs()
         # Cleanup temporary directory
-        if checkpoint_manager:
+        if checkpoint_manager and hasattr(checkpoint_manager, 'temp_dir') and checkpoint_manager.temp_dir.exists():
             shutil.rmtree(checkpoint_manager.temp_dir)
 
     logger.info("✅ PPO training complete. Log saved to logs/ppo_manual_log.csv")
