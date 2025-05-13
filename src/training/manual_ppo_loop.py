@@ -105,12 +105,13 @@ class CheckpointManager:
                     }
                     serializable_results.append(serializable_result)
                 
-                # Calculate metrics
-                avg_reward = sum(r["reward"] for r in serializable_results) / len(serializable_results)
-                avg_coherence = sum(r["scores"]["coherence"].get("Coherence Score", 0) for r in serializable_results) / len(serializable_results)
-                avg_helpfulness = sum(r["scores"]["helpfulness"].get("Helpfulness Score", 0) for r in serializable_results) / len(serializable_results)
-                avg_salience = sum(r["scores"]["salience"].get("Ad Salience Score", 0) for r in serializable_results) / len(serializable_results)
-                avg_detectability = sum(r["scores"]["detectability"].get("detectability_cosine", 0) for r in serializable_results) / len(serializable_results)
+                # Calculate metrics safely
+                num_results = len(serializable_results)
+                avg_reward = sum(r["reward"] for r in serializable_results) / num_results if num_results > 0 else 0.0
+                avg_coherence = sum(r["scores"]["coherence"].get("Coherence Score", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
+                avg_helpfulness = sum(r["scores"]["helpfulness"].get("Helpfulness Score", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
+                avg_salience = sum(r["scores"]["salience"].get("Ad Salience Score", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
+                avg_detectability = sum(r["scores"]["detectability"].get("detectability_cosine", 0) for r in serializable_results) / num_results if num_results > 0 else 0.0
                 
                 # Save checkpoint info
                 checkpoint_info = {
@@ -451,12 +452,14 @@ class DataProcessor:
                         score_sal.get("Ad Salience Score", 0),
                         score_det.get("detectability_cosine", 0) or 0
                     ]
-                    reward = sum(reward_values) / len(reward_values)
+                    reward = torch.tensor(sum(reward_values) / len(reward_values) if reward_values else 0.0, dtype=torch.float32).to(self.device)
                     
+                    loss = -new_log_probs * reward.detach()
+
                     validation_results.append({
                         "query": query,
                         "response_with_ad": response_with_ad,
-                        "reward": reward,
+                        "reward": reward.item(),
                         "scores": {
                             "coherence": score_coh,
                             "helpfulness": score_help,
@@ -469,8 +472,9 @@ class DataProcessor:
                     logger.error(f"❌ Validation error for query {idx}: {e}")
                     continue
         
-        # Compute validation metrics
-        avg_reward = sum(r["reward"] for r in validation_results) / len(validation_results) if validation_results else 0
+        # Compute validation metrics safely
+        num_val_results = len(validation_results)
+        avg_reward = sum(r["reward"] for r in validation_results) / num_val_results if num_val_results > 0 else 0.0
         logger.info(f"✅ Validation complete for batch {batch_idx}. Average reward: {avg_reward:.4f}")
         
         return validation_results
@@ -578,7 +582,7 @@ class DataProcessor:
                     score_sal.get("Ad Salience Score", 0),
                     score_det.get("detectability_cosine", 0) or 0
                 ]
-                reward = torch.tensor(sum(reward_values) / len(reward_values), dtype=torch.float32).to(self.device)
+                reward = torch.tensor(sum(reward_values) / len(reward_values) if reward_values else 0.0, dtype=torch.float32).to(self.device)
                 
                 loss = -new_log_probs * reward.detach()
 
@@ -708,7 +712,9 @@ def run_manual_ppo(model, tokenizer):
     processor = DataProcessor(model, tokenizer, device, checkpoint_manager=checkpoint_manager, optimizer=optimizer)
     
     try:
-        validation_results = None # Initialize validation_results to None
+        batch_start = 0           # Initialize batch_start
+        batch_results = []        # Initialize batch_results
+        validation_results = None # Initialize validation_results
         # Process in batches
         for batch_idx, batch_start in enumerate(tqdm(range(0, len(df_to_process), processor.batch_size), desc="Manual PPO Training")):
             batch_end = min(batch_start + processor.batch_size, len(df_to_process))
@@ -744,10 +750,26 @@ def run_manual_ppo(model, tokenizer):
         
         # Save final checkpoint before exiting
         if checkpoint_manager:
-            # batch_start and batch_results should exist from the loop
-            # validation_results might not exist if interrupted before validation ran
-            checkpoint_manager.save_checkpoint(batch_start, batch_results, validation_results) 
-            logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{batch_start}'}")
+            try:
+                # Defensive check and logging before saving
+                current_batch_start = batch_start if 'batch_start' in locals() else 'undefined'
+                current_batch_results_len = len(batch_results) if 'batch_results' in locals() else 'undefined'
+                current_validation_results_defined = 'validation_results' in locals()
+                
+                logger.info(f"Attempting final save. State: batch_start={current_batch_start}, batch_results defined={current_batch_results_len != 'undefined'}, validation_results defined={current_validation_results_defined}")
+                
+                # Ensure variables exist before calling save_checkpoint, using defaults if needed
+                final_batch_start = batch_start if 'batch_start' in locals() else 0
+                final_batch_results = batch_results if 'batch_results' in locals() else []
+                final_validation_results = validation_results if 'validation_results' in locals() else None
+
+                checkpoint_manager.save_checkpoint(final_batch_start, final_batch_results, final_validation_results)
+                logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{final_batch_start}'}")
+            except UnboundLocalError as e:
+                # This should ideally not happen now, but catch just in case
+                logger.error(f"❌ UnboundLocalError during final save attempt: {e}. Could not save final checkpoint.")
+            except Exception as e:
+                logger.error(f"❌ Unexpected error during final save attempt: {e}. Could not save final checkpoint.")
         
     finally:
         # Ensure all logs are flushed before exiting
