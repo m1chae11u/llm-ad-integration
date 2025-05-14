@@ -1,0 +1,54 @@
+{
+  "checkpoints": [
+    {
+      "step": 6,
+      "path": "checkpoints/ppo_llama/checkpoint_6",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 169,
+      "path": "checkpoints/ppo_llama/checkpoint_169",
+      "metrics": {
+        "avg_reward": 1.1511335987597704,
+        "avg_coherence": 1.59375,
+        "avg_helpfulness": 0.21875,
+        "avg_salience": 2.65625,
+        "avg_detectability": 0.135784375,
+        "validation_avg_reward": 1.155639500617981
+      }
+    }
+  ],
+  "best_reward": 1.155639500617981,
+  "best_checkpoint": "checkpoints/ppo_llama/checkpoint_169",
+  "training_history": [
+    {
+      "step": 6,
+      "timestamp": 1747211873.5162497,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 169,
+      "timestamp": 1747234546.0249236,
+      "metrics": {
+        "avg_reward": 1.1511335987597704,
+        "avg_coherence": 1.59375,
+        "avg_helpfulness": 0.21875,
+        "avg_salience": 2.65625,
+        "avg_detectability": 0.135784375,
+        "validation_avg_reward": 1.155639500617981
+      }
+    }
+  ]
+}
