@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import dotenv
+import google.generativeai as genai
 
 
 # Load environment variables
@@ -20,19 +21,16 @@ dotenv.load_dotenv()
 
 # Get API keys from environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is not set")
-if not DEEPSEEK_API_KEY:
-    raise ValueError("DEEPSEEK_API_KEY environment variable is not set")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable is not set")
 
 # Initialize clients
 embedding_client = OpenAI(api_key=OPENAI_API_KEY)
-chat_client = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
-)
+genai.configure(api_key=GOOGLE_API_KEY)
 
 # Cache for embeddings and judge results
 _embedding_cache = {}
@@ -90,22 +88,31 @@ def cache_result(ttl_seconds: int = 3600):
         return wrapper
     return decorator
 
-def batch_get_embeddings(texts: List[str], batch_size: int = 32) -> List[np.ndarray]:
-    """Get embeddings for multiple texts in batches."""
-    results = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        batch_results = []
-        for text in batch:
-            cache_key = get_cache_key("embedding", text)
-            if cache_key in _embedding_cache:
-                batch_results.append(_embedding_cache[cache_key])
-            else:
-                # Make API call and cache result
-                embedding = get_embedding(text)
-                _embedding_cache[cache_key] = embedding
-                batch_results.append(embedding)
-        results.extend(batch_results)
+def batch_get_embeddings(texts: List[str], batch_size: int = 32, max_workers: int = 10) -> List[np.ndarray]:
+    """Get embeddings for multiple texts in parallel batches."""
+    results = [None] * len(texts)
+    
+    def process_text(idx: int, text: str) -> None:
+        cache_key = get_cache_key("embedding", text)
+        if cache_key in _embedding_cache:
+            results[idx] = _embedding_cache[cache_key]
+        else:
+            embedding = get_embedding(text)
+            _embedding_cache[cache_key] = embedding
+            results[idx] = embedding
+    
+    # Process texts in parallel batches
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            futures = [
+                executor.submit(process_text, i + j, text)
+                for j, text in enumerate(batch)
+            ]
+            # Wait for batch to complete
+            for future in futures:
+                future.result()
+    
     return results
 
 def clear_caches():
@@ -113,20 +120,22 @@ def clear_caches():
     _embedding_cache.clear()
     _judge_cache.clear()
 
-def call_deepseek_and_extract_json(prompt, keys):
-    """Call DeepSeek API and extract JSON response."""
+def call_gemini_and_extract_json(prompt, keys):
+    """Call Gemini 1.5 Flash API and extract JSON response."""
     try:
-        response = chat_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "You return JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            stream=False,
-            timeout=30
-        ).choices[0].message.content
-
-        match = re.search(r'\{.*\}', response, re.DOTALL)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.1,  # Low temperature for more deterministic outputs
+                "top_p": 0.1,
+                "top_k": 1,
+            }
+        )
+        
+        # Extract JSON from response
+        text = response.text
+        match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             result = json.loads(match.group(0))
             for key in keys:
@@ -134,5 +143,61 @@ def call_deepseek_and_extract_json(prompt, keys):
             return result
         return {key: None for key in keys}
     except Exception as e:
-        print("DeepSeek API call failed:", e)
-        return {key: None for key in keys} 
+        print("Gemini API call failed:", e)
+        return {key: None for key in keys}
+
+# Alias for backward compatibility
+call_deepseek_and_extract_json = call_gemini_and_extract_json 
+
+def parallel_judge_responses(responses: List[Dict[str, str]], max_workers: int = 10) -> List[Dict[str, Any]]:
+    """Process multiple judge evaluations in parallel.
+    
+    Args:
+        responses: List of dicts containing 'query', 'response', and optionally 'ad_info'
+        max_workers: Maximum number of parallel workers
+    
+    Returns:
+        List of judge results for each response
+    """
+    from .coherence import judge_coherence
+    from .helpfulness import judge_helpfulness
+    from .salience import judge_ad_salience
+    from .detectability import judge_detectability
+    
+    def process_single_response(response_data: Dict[str, str]) -> Dict[str, Any]:
+        query = response_data['query']
+        response = response_data['response']
+        ad_info = response_data.get('ad_info')
+        
+        # Run all judge functions in parallel
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            coherence_future = executor.submit(judge_coherence, response, query)
+            helpfulness_future = executor.submit(judge_helpfulness, query, response)
+            
+            if ad_info:
+                salience_future = executor.submit(judge_ad_salience, query, response, ad_info)
+                detectability_future = executor.submit(judge_detectability, response, response_data.get('without_ad', ''))
+            else:
+                salience_future = None
+                detectability_future = None
+            
+            # Collect results
+            result = {
+                **coherence_future.result(),
+                **helpfulness_future.result()
+            }
+            
+            if salience_future:
+                result.update(salience_future.result())
+            if detectability_future:
+                result.update(detectability_future.result())
+            
+            return result
+    
+    # Process all responses in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_single_response, response)
+            for response in responses
+        ]
+        return [future.result() for future in futures] 

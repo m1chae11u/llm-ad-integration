@@ -9,6 +9,7 @@ from training.manual_ppo_loop import run_manual_ppo
 import gc
 
 CHECKPOINT_DIR = "checkpoints/ppo_manual"
+BASE_MODEL = "meta-llama/Llama-3.1-8B"  # Changed to Llama 3.1-8B
 
 def load_model_and_tokenizer():
     model_path = CHECKPOINT_DIR
@@ -17,10 +18,10 @@ def load_model_and_tokenizer():
     if os.path.exists(checkpoint_info_path):
         print(f"✅ Found local checkpoint info. Loading model from: {model_path}")
         # We'll let run_manual_ppo handle the actual loading of the latest checkpoint
-        model_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"  # Just load base model here
+        model_path = BASE_MODEL  # Use Llama 3.1-8B as base model
     else:
         print(f"ℹ️ No local checkpoint found at {model_path}. Loading base model...")
-        model_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" # Original base model
+        model_path = BASE_MODEL  # Use Llama 3.1-8B as base model
 
     print(f"Loading tokenizer from: {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -28,17 +29,18 @@ def load_model_and_tokenizer():
     print(f"Loading model from: {model_path}...")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.float16, # Use FP16 for efficiency
+        torch_dtype=torch.float16,  # Use FP16 for efficiency
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
+        use_cache=True,  # Enable KV cache for faster inference
+        low_cpu_mem_usage=True  # Reduce CPU memory usage during loading
     )
     try:
         model.generation_config = GenerationConfig.from_pretrained(model_path)
     except Exception: # Handle cases where generation_config might be missing from older checkpoints
          print("⚠️ Could not load generation_config from checkpoint. Using default.")
-         # Use generation_config from the original base model name as a fallback
-         base_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-         model.generation_config = GenerationConfig.from_pretrained(base_model_name)
+         # Use generation_config from the base model as fallback
+         model.generation_config = GenerationConfig.from_pretrained(BASE_MODEL)
 
     print("✅ Models loaded\n")
     return model, tokenizer
