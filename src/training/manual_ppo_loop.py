@@ -16,16 +16,17 @@ import json
 from pathlib import Path
 import logging
 import requests
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig # Added for base model loading
 
-from judge import (
+from ..judge import (
     judge_coherence,
     judge_helpfulness,
     judge_ad_salience,
     judge_detectability
 )
-from generate.generator import generate_responses, clear_response_cache
-from judge.utils import clear_caches
-from training.checkpoint_manager import CheckpointManager  # Import the dedicated CheckpointManager
+from ..generate.generator import generate_responses, clear_response_cache
+from ..judge.utils import clear_caches
+from .checkpoint_manager import CheckpointManager
 
 # Set up logging
 logging.basicConfig(
@@ -64,18 +65,19 @@ def compute_advantages(reward, value):
     return reward - value
 
 class DataProcessor:
-    def __init__(self, model, tokenizer, device, batch_size=32, checkpoint_manager=None, optimizer=None):
+    def __init__(self, model, tokenizer, device, checkpoint_base_dir: Path, batch_size=32, checkpoint_manager=None, optimizer=None, base_model_name=None, hf_token=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.batch_size = batch_size
         self.checkpoint_manager = checkpoint_manager
         self.optimizer = optimizer
+        self.base_model_name = base_model_name
+        self.hf_token = hf_token
         self.current_step = 0
-        # Default start index is 0, will be updated when training resumes
         self.dataset_start_idx = 0
+        self.checkpoint_base_dir = checkpoint_base_dir
         
-        # If checkpoint_manager is provided, use its model/tokenizer references
         if self.checkpoint_manager is not None:
             self.model = self.checkpoint_manager.model
             self.tokenizer = self.checkpoint_manager.tokenizer
@@ -483,14 +485,15 @@ class DataProcessor:
                         }
                         
                         # Save to a special file that's quick to update
-                        query_checkpoint_path = Path("checkpoints/ppo_manual/last_query_position.json")
+                        query_checkpoint_path = self.checkpoint_base_dir / "last_query_position.json"
+                        query_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
                         with open(query_checkpoint_path, "w") as f:
                             json.dump(query_checkpoint, f)
                     except Exception as e:
                         logger.error(f"Error saving query position checkpoint: {e}")
                 
                 # Also update the simple text file
-                last_position_path = Path("checkpoints/ppo_manual/last_processed_position.txt")
+                last_position_path = self.checkpoint_base_dir / "last_processed_position.txt"
                 try:
                     with open(last_position_path, "w") as f:
                         f.write(str(current_query_position))
@@ -524,7 +527,7 @@ class DataProcessor:
         logger.info(f"Logs flushed for batch {batch_idx}")
         
         # Save the absolute latest position to a file at end of batch
-        last_position_path = Path("checkpoints/ppo_manual/last_processed_position.txt")
+        last_position_path = self.checkpoint_base_dir / "last_processed_position.txt"
         try:
             with open(last_position_path, "w") as f:
                 f.write(str(current_query_position))
@@ -535,18 +538,58 @@ class DataProcessor:
         # Return final query position along with results
         return results, current_query_position
 
-def run_manual_ppo(model, tokenizer):
-    device = model.device
-    model.eval()
+def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: str, hf_token: str = None):
+    device = model.device if model is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    
+    # If model or tokenizer is None, it means main.py couldn't load them (e.g. gated model access issue initially)
+    # We should try to load them here using the base_model_name and hf_token.
+    if tokenizer is None and base_model_name:
+        logger.info(f"Tokenizer was None, attempting to load {base_model_name} in run_manual_ppo...")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True, token=hf_token)
+            logger.info(f"✅ Successfully loaded tokenizer for {base_model_name} in run_manual_ppo.")
+        except Exception as e:
+            logger.error(f"❌ Failed to load tokenizer for {base_model_name} in run_manual_ppo: {e}")
+            raise # Re-raise if tokenizer is critical here
+
+    if model is None and base_model_name and tokenizer is not None: # model needs tokenizer
+        logger.info(f"Model was None, attempting to load {base_model_name} in run_manual_ppo...")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+                use_cache=True,
+                low_cpu_mem_usage=True,
+                token=hf_token
+            )
+            try:
+                model.generation_config = GenerationConfig.from_pretrained(base_model_name, token=hf_token)
+            except Exception:
+                logger.warning(f"Could not load generation_config for {base_model_name}. Using default.")
+                # Attempt to create a default or load from a known good source if necessary
+                # For now, let it proceed, PPO might not strictly need it if tokenizer has EOS etc.
+            model.to(device) # Ensure model is on the correct device
+            logger.info(f"✅ Successfully loaded model {base_model_name} in run_manual_ppo to device {device}.")
+        except Exception as e:
+            logger.error(f"❌ Failed to load model {base_model_name} in run_manual_ppo: {e}")
+            raise # Re-raise if model is critical here
+    elif model is not None:
+        model.to(device) # Ensure existing model is on the correct device
+
+    if model is None or tokenizer is None:
+        logger.error("❌ Model or tokenizer is still None. Cannot proceed with PPO training.")
+        return
+
+    model.eval() # Ensure model is in eval mode initially
 
     df = pd.read_csv("data/merged_queries_ads.csv")
     optimizer = torch.optim.SGD(model.parameters(), lr=1.4e-7)
 
-    # Set up all required directories
-    base_dir = Path("checkpoints/ppo_manual")
+    base_dir = Path(checkpoint_dir_str)
     log_dir = Path("logs")
     
-    # Create directory structure
     directories = {
         "checkpoint_dir": base_dir,
         "log_dir": log_dir,
@@ -560,15 +603,8 @@ def run_manual_ppo(model, tokenizer):
         dir_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Created directory: {dir_path}")
 
-    # Set up file paths
-    log_path = log_dir / "ppo_manual_log.csv"
-    periodic_eval_log_path = log_dir / "periodic_eval_log.csv"
-    checkpoint_dir = base_dir
+    checkpoint_manager = CheckpointManager(base_dir, model, tokenizer, optimizer, base_model_name=base_model_name, hf_token=hf_token)
     
-    # Initialize checkpoint manager
-    checkpoint_manager = CheckpointManager(checkpoint_dir, model, tokenizer, optimizer)
-    
-    # First check for query-level checkpoint
     query_checkpoint_path = base_dir / "last_query_position.json"
     resume_from_query = None
     
@@ -582,59 +618,60 @@ def run_manual_ppo(model, tokenizer):
         except Exception as e:
             logger.error(f"Error reading query checkpoint: {e}")
     
-    # Try to load latest model checkpoint 
     try:
-        # Clear CUDA cache before loading
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
         
-        logger.info("Loading checkpoint...")
+        logger.info("Loading checkpoint via CheckpointManager...")
+        # CheckpointManager will load the latest checkpoint or the base model if no checkpoint exists.
+        # The model and tokenizer passed to CheckpointManager are now the ones potentially loaded in this function,
+        # or the ones passed from main.py if they were not None.
         loaded_model, loaded_tokenizer, checkpoint_info = checkpoint_manager.load_latest_checkpoint()
         
         if loaded_model is not None:
-            # Move model back to original device if needed
-            if str(loaded_model.device) == "cpu" and str(device) != "cpu":
-                logger.info(f"Moving model from CPU to {device}...")
-                loaded_model = loaded_model.to(device)
-            
             model = loaded_model
-            tokenizer = loaded_tokenizer
+            if loaded_tokenizer is not None: # Tokenizer might also be updated by CheckpointManager
+                tokenizer = loaded_tokenizer
             
-            # If we have a query checkpoint, use that as it's more precise
+            if str(model.device) == "cpu" and str(device) != "cpu":
+                logger.info(f"Moving model from CPU to {device}...")
+                model = model.to(device)
+            
             if resume_from_query is not None:
-                start_idx = resume_from_query + 1  # Start from the next query after the last one processed
+                start_idx = resume_from_query + 1
                 logger.info(f"✅ Resuming training from query {start_idx} (based on query checkpoint)")
             else:
-                # Fall back to the step in the model checkpoint
                 start_idx = checkpoint_info["step"] if checkpoint_info else 0
                 logger.info(f"✅ Resuming training from step {start_idx} (based on model checkpoint)")
             
-            # Verify model is in eval mode
             model.eval()
             
-            # Verify optimizer state
             if not any(p.grad is not None for p in model.parameters()):
-                logger.info("Optimizer state verified")
+                logger.info("Optimizer state verified (no gradients found as expected).")
             else:
                 logger.warning("Found gradients in model parameters. Clearing gradients...")
                 optimizer.zero_grad()
         else:
-            # If no query checkpoint and no model checkpoint, start from beginning
+            logger.info("ℹ️ No model loaded by CheckpointManager. This implies a fresh start or an issue.")
+            # If model is still None here, it means neither main.py nor CheckpointManager could load it.
+            # This path should ideally not be hit if base_model_name and hf_token are valid
+            # and the initial load at the top of this function succeeded.
+            if model is None: # Double check, should have been loaded or raised error
+                logger.error("CRITICAL: Model is still None after CheckpointManager.load_latest_checkpoint. Training cannot proceed.")
+                return 
             start_idx = 0
-            logger.info("ℹ️ Starting fresh training run")
+            logger.info("ℹ️ Starting fresh training run (or continuing with model loaded at function start).")
+
     except Exception as e:
-        logger.error(f"❌ Error during checkpoint loading: {e}")
-        
-        # If we have a query checkpoint, we can still use it even if model loading failed
+        logger.error(f"❌ Error during checkpoint loading sequence in run_manual_ppo: {e}")
         if resume_from_query is not None:
             start_idx = resume_from_query + 1
-            logger.info(f"✅ Resuming from query {start_idx} based on query checkpoint (despite model load failure)")
+            logger.info(f"✅ Resuming from query {start_idx} based on query checkpoint (despite model load error in sequence)")
         else:
             start_idx = 0
-            logger.info("ℹ️ Starting fresh training run due to loading error")
+            logger.info("ℹ️ Starting fresh training run due to loading error in sequence")
 
-    # Prepare data
     total_rows = len(df)
     if start_idx >= total_rows:
         logger.info("✅ Training already completed!")
@@ -642,14 +679,15 @@ def run_manual_ppo(model, tokenizer):
 
     df_to_process = df.iloc[start_idx:]
     
-    # Create validation set (10% of data)
-    validation_size = min(100, len(df_to_process) // 10)
-    validation_data = df_to_process.sample(n=validation_size, random_state=42)
-    df_to_process = df_to_process.drop(validation_data.index)
+    validation_size = min(100, len(df_to_process) // 10) if len(df_to_process) > 0 else 0
+    if validation_size > 0:
+        validation_data = df_to_process.sample(n=validation_size, random_state=42)
+        df_to_process = df_to_process.drop(validation_data.index)
+    else:
+        validation_data = pd.DataFrame() # Empty dataframe if no validation data
+        logger.info("No validation data to sample.")
     
-    # Initialize processor with optimizer and pass the starting index
-    processor = DataProcessor(model, tokenizer, device, checkpoint_manager=checkpoint_manager, optimizer=optimizer)
-    # Pass the starting index to the processor
+    processor = DataProcessor(model, tokenizer, device, checkpoint_base_dir=base_dir, checkpoint_manager=checkpoint_manager, optimizer=optimizer, base_model_name=base_model_name, hf_token=hf_token)
     processor.dataset_start_idx = start_idx
     
     try:
@@ -677,8 +715,8 @@ def run_manual_ppo(model, tokenizer):
                 checkpoint_manager.cleanup_old_checkpoints(keep_last_n=2)
                 
                 # Log checkpoint info
-                logger.info(f"Checkpoint saved in: {checkpoint_dir / f'checkpoint_{current_query_idx}'}")
-                logger.info(f"Metrics saved in: {checkpoint_dir / 'training_metrics.json'}")
+                logger.info(f"Checkpoint saved in: {checkpoint_manager.checkpoint_dir / f'checkpoint_{current_query_idx}'}")
+                logger.info(f"Metrics saved in: {checkpoint_manager.checkpoint_dir / 'training_metrics.json'}")
             
             # Clear caches periodically (e.g., every 50 batches)
             if batch_idx > 0 and batch_idx % 50 == 0: # Adjusted frequency
@@ -695,7 +733,7 @@ def run_manual_ppo(model, tokenizer):
         current_position = None
         
         # 1. Try the last_processed_position.txt file (most reliable, written at end of batch)
-        last_position_path = Path("checkpoints/ppo_manual/last_processed_position.txt")
+        last_position_path = base_dir / "last_processed_position.txt"
         if last_position_path.exists():
             try:
                 with open(last_position_path, "r") as f:
@@ -706,7 +744,7 @@ def run_manual_ppo(model, tokenizer):
         
         # 2. Try the query checkpoint file (updated during batch)
         if current_position is None:
-            query_checkpoint_path = Path("checkpoints/ppo_manual/last_query_position.json")
+            query_checkpoint_path = base_dir / "last_query_position.json"
             if query_checkpoint_path.exists():
                 try:
                     with open(query_checkpoint_path, "r") as f:
@@ -734,7 +772,7 @@ def run_manual_ppo(model, tokenizer):
                 }
                 
                 # Create checkpoint dir if needed
-                query_checkpoint_path = Path("checkpoints/ppo_manual/last_query_position.json")
+                query_checkpoint_path = base_dir / "last_query_position.json"
                 query_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
                 
                 # Save the checkpoint
@@ -777,7 +815,7 @@ def run_manual_ppo(model, tokenizer):
                         logger.warning("No batch results to save! Checkpoint will have empty metrics.")
 
                     checkpoint_manager.save_checkpoint(current_position, final_batch_results, final_validation_results)
-                    logger.info(f"Final checkpoint saved in: {checkpoint_dir / f'checkpoint_{current_position}'}")
+                    logger.info(f"Final checkpoint saved in: {checkpoint_manager.checkpoint_dir / f'checkpoint_{current_position}'}")
                 else:
                     logger.error("Cannot save model checkpoint: no position information available")
             except UnboundLocalError as e:
@@ -796,4 +834,4 @@ def run_manual_ppo(model, tokenizer):
             shutil.rmtree(checkpoint_manager.temp_dir)
 
     logger.info("✅ PPO training complete. Log saved to logs/ppo_manual_log.csv")
-    logger.info(f"All checkpoints and metrics saved in: {checkpoint_dir}")
+    logger.info(f"All checkpoints and metrics saved in: {checkpoint_manager.checkpoint_dir}")

@@ -14,6 +14,8 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import dotenv
 import google.generativeai as genai
+import asyncio
+import aiohttp
 
 
 # Load environment variables
@@ -120,14 +122,15 @@ def clear_caches():
     _embedding_cache.clear()
     _judge_cache.clear()
 
-def call_gemini_and_extract_json(prompt, keys):
-    """Call Gemini 1.5 Flash API and extract JSON response."""
+async def call_gemini_api(prompt, keys):
+    """Call Gemini 1.5 Flash API and extract JSON response asynchronously."""
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(
+        response = await asyncio.to_thread(
+            model.generate_content,
             prompt,
             generation_config={
-                "temperature": 0.1,  # Low temperature for more deterministic outputs
+                "temperature": 0.1,
                 "top_p": 0.1,
                 "top_k": 1,
             }
@@ -146,8 +149,55 @@ def call_gemini_and_extract_json(prompt, keys):
         print("Gemini API call failed:", e)
         return {key: None for key in keys}
 
-# Alias for backward compatibility
-call_deepseek_and_extract_json = call_gemini_and_extract_json 
+# Synchronous version for backward compatibility
+def call_gemini_and_extract_json(prompt, keys):
+    """Call Gemini 1.5 Flash API and extract JSON response."""
+    return asyncio.run(call_gemini_api(prompt, keys))
+
+async def async_parallel_judge_responses(responses: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Process multiple judge evaluations in parallel using async.
+    
+    Args:
+        responses: List of dicts containing 'query', 'response', and optionally 'ad_info'
+    
+    Returns:
+        List of judge results for each response
+    """
+    from .coherence import judge_coherence_async
+    from .helpfulness import judge_helpfulness_async
+    from .salience import judge_ad_salience_async
+    from .detectability import judge_detectability_async
+    
+    results = []
+    
+    for response_data in responses:
+        query = response_data['query']
+        response = response_data['response']
+        ad_info = response_data.get('ad_info')
+        
+        # Run all judge functions in parallel using asyncio
+        tasks = [
+            judge_coherence_async(response, query),
+            judge_helpfulness_async(query, response)
+        ]
+        
+        if ad_info:
+            tasks.extend([
+                judge_ad_salience_async(query, response, ad_info),
+                judge_detectability_async(response, response_data.get('without_ad', ''))
+            ])
+        
+        # Gather all results
+        judge_results = await asyncio.gather(*tasks)
+        
+        # Combine results into a single dictionary
+        combined_result = {}
+        for result in judge_results:
+            combined_result.update(result)
+        
+        results.append(combined_result)
+    
+    return results
 
 def parallel_judge_responses(responses: List[Dict[str, str]], max_workers: int = 10) -> List[Dict[str, Any]]:
     """Process multiple judge evaluations in parallel.
@@ -159,45 +209,5 @@ def parallel_judge_responses(responses: List[Dict[str, str]], max_workers: int =
     Returns:
         List of judge results for each response
     """
-    from .coherence import judge_coherence
-    from .helpfulness import judge_helpfulness
-    from .salience import judge_ad_salience
-    from .detectability import judge_detectability
-    
-    def process_single_response(response_data: Dict[str, str]) -> Dict[str, Any]:
-        query = response_data['query']
-        response = response_data['response']
-        ad_info = response_data.get('ad_info')
-        
-        # Run all judge functions in parallel
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            coherence_future = executor.submit(judge_coherence, response, query)
-            helpfulness_future = executor.submit(judge_helpfulness, query, response)
-            
-            if ad_info:
-                salience_future = executor.submit(judge_ad_salience, query, response, ad_info)
-                detectability_future = executor.submit(judge_detectability, response, response_data.get('without_ad', ''))
-            else:
-                salience_future = None
-                detectability_future = None
-            
-            # Collect results
-            result = {
-                **coherence_future.result(),
-                **helpfulness_future.result()
-            }
-            
-            if salience_future:
-                result.update(salience_future.result())
-            if detectability_future:
-                result.update(detectability_future.result())
-            
-            return result
-    
-    # Process all responses in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(process_single_response, response)
-            for response in responses
-        ]
-        return [future.result() for future in futures] 
+    # Use asyncio to run parallel API calls
+    return asyncio.run(async_parallel_judge_responses(responses)) 

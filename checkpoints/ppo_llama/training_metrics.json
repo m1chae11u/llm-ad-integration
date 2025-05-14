@@ -1,0 +1,30 @@
+{
+  "checkpoints": [
+    {
+      "step": 1,
+      "path": "checkpoints/ppo_llama/checkpoint_1",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    }
+  ],
+  "best_reward": -Infinity,
+  "best_checkpoint": null,
+  "training_history": [
+    {
+      "step": 1,
+      "timestamp": 1747199778.022881,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    }
+  ]
+}

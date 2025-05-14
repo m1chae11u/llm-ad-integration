@@ -4,36 +4,21 @@ import re
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
 from tqdm import tqdm
 from .baseline import generate_baseline_response
-from judge.utils import cache_result
+from ..judge.utils import cache_result
 
 _model = None
 _tokenizer = None
 
-def load_model():
-    global _model, _tokenizer
-    if _model is None or _tokenizer is None:
-        print("\nLoading DeepSeek model and tokenizer...")
-        model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-        _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        _model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True
-        )
-        print("✅ Model loaded")
-    return _model, _tokenizer
 
-
-def clean_response(response: str) -> str:
-    """Clean up the response by removing thinking processes and other unwanted content."""
-    response = re.sub(r'^.*?</think>', '', response, flags=re.DOTALL)
-    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
-    response = re.sub(r'(?:Let me|I\'ll|I will|First|Next|Then|Finally).*?(?=\n\n|\Z)', '', response, flags=re.DOTALL)
-    response = re.sub(r'(?:As an AI|I am an AI|I\'m an AI|As a language model).*?(?=\n\n|\Z)', '', response, flags=re.DOTALL)
+def extract_final_answer(response: str) -> str:
+    """Extracts the text after 'FINAL ANSWER:' from the model's response."""
     if "FINAL ANSWER:" in response:
-        response = response.split("FINAL ANSWER:")[-1]
+        return response.split("FINAL ANSWER:", 1)[-1].strip()
+    # If the marker isn't found, return the original response, perhaps with a warning or log.
+    # For now, returning the stripped original to avoid breaking if marker is missing.
+    # print("Warning: 'FINAL ANSWER:' marker not found in response.") 
     return response.strip()
+
 
 def get_token_count(text: str, tokenizer) -> int:
     return len(tokenizer.encode(text, truncation=False))
@@ -128,10 +113,13 @@ Description: {description}"""
         print("⚠️ Skipping: One or both responses were empty.")
         return "", ""
 
-    return clean_response(raw_no_ad), clean_response(raw_with_ad)
+    cleaned_no_ad = extract_final_answer(raw_no_ad)
+    cleaned_with_ad = extract_final_answer(raw_with_ad)
+
+    return cleaned_no_ad, cleaned_with_ad
 
 def clear_response_cache():
     """Clear the response cache used by generate_responses."""
     # The cache is stored in judge.utils._judge_cache
-    from judge.utils import _judge_cache
+    from ..judge.utils import _judge_cache
     _judge_cache.clear()
