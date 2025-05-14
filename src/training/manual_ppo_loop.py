@@ -112,8 +112,10 @@ class DataProcessor:
         
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "query_idx", "query", "response_with_ad", "coherence_score", "helpfulness_score",
-                "salience_score", "detectability_score", "judging_time"
+                "batch_idx", "query_idx", "query", "response_with_ad", 
+                "coherence_score", "helpfulness_score", "salience_score", "detectability_score", 
+                "coherence_explanation", "helpfulness_explanation", "salience_explanation",
+                "judging_time"
             ]).to_csv(self.judging_log, index=False)
         
         if not self.training_log.exists() or os.path.getsize(self.training_log) == 0:
@@ -388,6 +390,13 @@ class DataProcessor:
 
                 judge_time = time.time() - judge_start_time
                 
+                # Log the scores
+                logger.info(f"👨‍⚖️ Batch {batch_idx} - Query {idx} (Dataset: {current_query_position}) Judge Scores: \n" +
+                            f"   Coherence: {score_coh}\n" +
+                            f"   Helpfulness: {score_help}\n" +
+                            f"   Salience: {score_sal}\n" +
+                            f"   Detectability: {score_det}")
+
                 # Log judging results
                 self.judging_log_buffer.append({
                     "batch_idx": batch_idx,
@@ -398,6 +407,9 @@ class DataProcessor:
                     "helpfulness_score": score_help.get("Helpfulness Score", 0),
                     "salience_score": score_sal.get("Ad Salience Score", 0),
                     "detectability_score": score_det.get("detectability_cosine", 0),
+                    "coherence_explanation": score_coh.get("Coherence Explanation", ""),
+                    "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
+                    "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
                     "judging_time": judge_time
                 })
                 
