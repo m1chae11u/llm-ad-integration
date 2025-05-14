@@ -1,0 +1,12 @@
+{
+  "step": 10,
+  "timestamp": 1747200403.775626,
+  "batch_results": [],
+  "metrics": {
+    "avg_reward": 0.0,
+    "avg_coherence": 0.0,
+    "avg_helpfulness": 0.0,
+    "avg_salience": 0.0,
+    "avg_detectability": 0.0
+  }
+}
