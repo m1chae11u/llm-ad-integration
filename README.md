@@ -130,11 +130,14 @@ Key components include:
 *   **PPO Training Loop (`src/training/manual_ppo_loop.py`):**
     *   The core RL process using Proximal Policy Optimization (PPO).
     *   `DataProcessor`: Manages data flow, generation, judging, reward calculation, and model updates.
+    *   **Batched Training Updates:** To stabilize training, losses from individual queries are accumulated across a training batch (defined by `TRAINING_BATCH_SIZE` in `src/config.py`). A single optimizer step is then performed using the aggregated loss for the entire batch, rather than updating the model after each query.
     *   Extensive logging of generations, scores, and metrics to the `logs/` directory.
 *   **Checkpoint Management (`src/training/checkpoint_manager.py`):**
-    *   Saves model state, tokenizer, and optimizer.
-    *   Enables resuming training from the exact last processed query via `last_query_position.json`.
-    *   Tracks `training_metrics.json` including best validation reward and checkpoint.
+    *   **Comprehensive State Saving:** Full checkpoints, which include the model's state dictionary, the tokenizer's state, and the optimizer's state dictionary, are saved periodically (controlled by `CHECKPOINT_INTERVAL_BATCHES` in `src/config.py`) *after a set number of training batches have been completed*. This ensures that the saved model state reflects learning from complete batches.
+    *   **Granular Resumption:** Training can be seamlessly resumed. The system first looks for the latest valid full model checkpoint. Crucially, a `last_query_position.json` file within the `CHECKPOINT_DIR` (e.g., `checkpoints/ppo_llama/`) is updated after *every processed query*. This allows the training to restart from the exact point it left off by re-processing any queries from an interrupted batch, even if the interruption occurred before a full model checkpoint was due.
+    *   **Metrics and Best Model Tracking:** A `training_metrics.json` file in the `CHECKPOINT_DIR` logs validation scores and other metrics over time. It also keeps track of the checkpoint that achieved the best validation reward, allowing for easy identification of the top-performing model state.
+    *   **Automated Cleanup:** To manage disk space, the system automatically retains only a configurable number (`CHECKPOINTS_TO_KEEP` in `src/config.py`) of the most recent full checkpoints, deleting older ones.
+    *   All checkpoint-related files and directories are managed within the path specified by `CHECKPOINT_DIR` in `src/config.py`.
 *   **Configuration (`src/config.py`):**
     *   Centralized settings for API keys, base model name, checkpoint directory, and data file paths.
 *   **Entry Point (`src/main.py`):**
@@ -205,10 +208,17 @@ huggingface-cli cache purge
 
 ------
 ## ATTENTION 
-If you have to stop running, please save the following folders:
-- checkpoints/ppo_manual
-- logs
+To properly stop the training script and ensure final checkpoints and logs are saved, please press `Ctrl+C` in the terminal where the script is running. The script is designed to catch this interruption and perform a graceful shutdown.
 
-When you start a new runtime, remember to delete the old ppo_manual folder (which was saved in git) and drop the new version in the checkpoints folder. 
+If you have to stop running, please manually save the following critical folders to ensure you can resume your progress:
+- The entire directory specified by `CHECKPOINT_DIR` in `src/config.py` (e.g., `checkpoints/ppo_llama` if using the default setting). This directory contains all model checkpoints, optimizer states, and the crucial `last_query_position.json` for exact resumption.
+- The `logs/` directory, which contains all generation, judging, training, and statistics CSV files.
+
+When you start a new runtime or switch environments and want to resume:
+1. Ensure your `src/config.py` has the correct `CHECKPOINT_DIR` pointing to where your *intended* checkpoint data will reside.
+2. If you are restoring from a backup, completely replace the existing `CHECKPOINT_DIR` in your workspace with the version you saved.
+3. Similarly, replace the `logs/` directory with your saved version if you want to preserve historical log data.
+
+This ensures that the `CheckpointManager` and `DataProcessor` can find all necessary files to resume training and logging correctly.
 
 
