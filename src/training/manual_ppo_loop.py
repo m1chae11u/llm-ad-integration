@@ -106,13 +106,13 @@ class DataProcessor:
         # Create headers for log files with batch information if they don't exist
         if not self.generation_log.exists() or os.path.getsize(self.generation_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "query_idx", "query", "ad_facts", "response_without_ad", "response_with_ad",
+                "batch_idx", "global_batch_idx", "query_idx", "query", "ad_facts", "response_without_ad", "response_with_ad",
                 "generation_time", "token_count"
             ]).to_csv(self.generation_log, index=False)
         
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "query_idx", "query", "response_with_ad", 
+                "batch_idx", "global_batch_idx", "query_idx", "query", "response_with_ad", 
                 "coherence_score", "helpfulness_score", "salience_score", "detectability_score", 
                 "coherence_explanation", "helpfulness_explanation", "salience_explanation",
                 "judging_time"
@@ -120,7 +120,7 @@ class DataProcessor:
         
         if not self.training_log.exists() or os.path.getsize(self.training_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "query_idx", "query", "response_with_ad", "reward", "loss", "training_time"
+                "batch_idx", "global_batch_idx", "query_idx", "query", "response_with_ad", "reward", "loss", "training_time"
             ]).to_csv(self.training_log, index=False)
         
         # Initialize stats - default values
@@ -142,7 +142,7 @@ class DataProcessor:
         # Create stats file if it doesn't exist
         if not self.stats_log.exists() or os.path.getsize(self.stats_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "timestamp", "total_queries", "successful_queries", "failed_queries",
+                "batch_idx", "global_batch_idx", "timestamp", "total_queries", "successful_queries", "failed_queries",
                 "avg_generation_time", "avg_judging_time", "avg_training_time", "avg_reward", "avg_loss",
                 "total_tokens", "memory_usage"
             ]).to_csv(self.stats_log, index=False)
@@ -205,7 +205,7 @@ class DataProcessor:
             self.training_log_buffer.clear()
             logger.info(f"Flushed {len(self.training_log_buffer)} training log entries.")
 
-    def update_stats(self, batch_idx, gen_time, judge_time, train_time, token_count, reward, loss, success=True):
+    def update_stats(self, batch_idx, current_query_position, gen_time, judge_time, train_time, token_count, reward, loss, success=True):
         """Update training statistics."""
         self.stats["total_queries"] += 1
         if success:
@@ -226,8 +226,15 @@ class DataProcessor:
         # Log stats every 10 queries
         if self.stats["total_queries"] % 10 == 0:
             memory_usage = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+            # Calculate global batch index for stats
+            # (self.stats["total_queries"] -1) gives the index of the last processed query (0-indexed)
+            # So, ((self.stats["total_queries"] -1) // self.batch_size) is its global batch index.
+            # If current_query_position is available and accurate (passed from process_batch), it's better.
+            global_batch_idx_for_stats = (current_query_position // self.batch_size) if current_query_position != -1 else ((self.stats["total_queries"] -1) // self.batch_size if self.stats["total_queries"] > 0 else 0)
+
             pd.DataFrame([{
-                "batch_idx": batch_idx,
+                "batch_idx": batch_idx, # Run-specific batch_idx
+                "global_batch_idx": global_batch_idx_for_stats, # Global batch_idx
                 "timestamp": time.time(),
                 "total_queries": self.stats["total_queries"],
                 "successful_queries": self.stats["successful_queries"],
@@ -318,7 +325,7 @@ class DataProcessor:
     def process_batch(self, batch_data, batch_idx):
         """Process a batch of data."""
         results = []
-        logger.info(f"🔄 Starting batch {batch_idx} with {len(batch_data)} queries")
+        logger.info(f"🔄 Starting Run Batch {batch_idx} (approx. Global Batch { (self.dataset_start_idx + batch_idx * self.batch_size) // self.batch_size}) with {len(batch_data)} queries. Absolute start query for this run batch: {self.dataset_start_idx + batch_idx * self.batch_size}")
         batch_start_time = time.time()
         
         # Get the actual start index in the original dataset
@@ -342,7 +349,7 @@ class DataProcessor:
             }
 
             # Log which query we're on in dataset
-            logger.info(f"🔄 Batch {batch_idx} - Starting generation for query {idx} (dataset position: {current_query_position})")
+            logger.info(f"🔄 Global Batch {current_query_position // self.batch_size} (Run Batch {batch_idx}) - Starting generation for query {idx} (dataset position: {current_query_position})")
 
             try:
                 # Stage 1: Generation
@@ -356,7 +363,8 @@ class DataProcessor:
                 
                 # Log generation results
                 self.generation_log_buffer.append({
-                    "batch_idx": batch_idx,
+                    "batch_idx": batch_idx, # This is the run-specific batch_idx
+                    "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
                     "query_idx": idx,
                     "query": query,
                     "ad_facts": json.dumps(ad_facts),
@@ -399,7 +407,8 @@ class DataProcessor:
 
                 # Log judging results
                 self.judging_log_buffer.append({
-                    "batch_idx": batch_idx,
+                    "batch_idx": batch_idx, # Run-specific
+                    "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
                     "query_idx": idx,
                     "query": query,
                     "response_with_ad": response_with_ad,
@@ -455,7 +464,8 @@ class DataProcessor:
                 
                 # Log training results
                 self.training_log_buffer.append({
-                    "batch_idx": batch_idx,
+                    "batch_idx": batch_idx, # Run-specific
+                    "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
                     "query_idx": idx,
                     "query": query,
                     "response_with_ad": response_with_ad,
@@ -467,7 +477,7 @@ class DataProcessor:
                 logger.info(f"✅ Batch {batch_idx} - Training complete for query {idx} (dataset position: {current_query_position}) in {train_time:.2f}s")
 
                 # Update statistics
-                self.update_stats(batch_idx, gen_time, judge_time, train_time, token_count, reward.item(), loss.item(), success=True)
+                self.update_stats(batch_idx, current_query_position, gen_time, judge_time, train_time, token_count, reward.item(), loss.item(), success=True)
 
                 results.append({
                     "idx": idx,
@@ -492,7 +502,8 @@ class DataProcessor:
                         query_checkpoint = {
                             "last_processed_query": int(current_query_position),
                             "original_idx": int(idx),
-                            "batch_idx": batch_idx,
+                            "batch_idx": batch_idx, # Run-specific batch_idx
+                            "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
                             "timestamp": time.time()
                         }
                         
@@ -520,7 +531,7 @@ class DataProcessor:
 
             except Exception as e:
                 logger.error(f"❌ Batch {batch_idx} - Error processing query {idx}: {e}")
-                self.update_stats(batch_idx, 0, 0, 0, 0, 0, 0, success=False)
+                self.update_stats(batch_idx, current_query_position if 'current_query_position' in locals() else -1, 0, 0, 0, 0, 0, 0, success=False) # Pass current_query_position or a placeholder
                 continue
 
             # Clear caches periodically
@@ -624,9 +635,20 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
         try:
             with open(query_checkpoint_path, "r") as f:
                 query_checkpoint = json.load(f)
-                resume_from_query = query_checkpoint.get("last_processed_query")
-                last_batch = query_checkpoint.get("batch_idx")
-                logger.info(f"Found query checkpoint! Last processed query: {resume_from_query} (batch {last_batch})")
+                # Prioritize original_idx for accurate resumption
+                if query_checkpoint.get("original_idx") is not None:
+                    resume_from_query = query_checkpoint.get("original_idx")
+                    logger.info(f"Found query checkpoint! Last processed original_idx: {resume_from_query}")
+                else:
+                    # Fallback for older checkpoints that only have last_processed_query
+                    resume_from_query = query_checkpoint.get("last_processed_query")
+                    logger.warning(f"Found query checkpoint using last_processed_query (fallback): {resume_from_query}. Consider re-running from scratch or ensure dataset consistency if issues arise.")
+                
+                # The 'batch_idx' and 'global_batch_idx' here are just for logging context from the last run
+                last_run_batch_idx = query_checkpoint.get("batch_idx", "N/A")
+                last_global_batch_idx = query_checkpoint.get("global_batch_idx", "N/A")
+                logger.info(f"Context from last run checkpoint: run_batch_idx: {last_run_batch_idx}, global_batch_idx: {last_global_batch_idx}")
+
         except Exception as e:
             logger.error(f"Error reading query checkpoint: {e}")
     
@@ -777,9 +799,11 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
             
             # Save query position checkpoint
             try:
-                query_checkpoint = {
-                    "last_processed_query": int(current_position),
-                    "batch_idx": batch_idx if 'batch_idx' in locals() else 0,
+                query_checkpoint_to_save = { # Renamed to avoid conflict with loaded query_checkpoint
+                    "last_processed_query": int(current_position), # This is current_query_position
+                    "original_idx": int(query_checkpoint.get("original_idx")) if query_checkpoint and query_checkpoint.get("original_idx") is not None else int(current_position), # Preserve original_idx if available from loaded checkpoint, else estimate
+                    "batch_idx": batch_idx if 'batch_idx' in locals() else 0, # Run-specific batch_idx
+                    "global_batch_idx": (int(current_position) // processor.batch_size) if processor and hasattr(processor, 'batch_size') and processor.batch_size > 0 else -1, # Global batch_idx based on current_position
                     "timestamp": time.time()
                 }
                 
@@ -789,7 +813,7 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
                 
                 # Save the checkpoint
                 with open(query_checkpoint_path, "w") as f:
-                    json.dump(query_checkpoint, f)
+                    json.dump(query_checkpoint_to_save, f)
                     
                 logger.info(f"✅ Saved query position checkpoint at dataset position {current_position}")
             except Exception as e:
