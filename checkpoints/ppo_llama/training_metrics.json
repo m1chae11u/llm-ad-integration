@@ -91,6 +91,28 @@
         "avg_detectability": 0.14332187500000004,
         "validation_avg_reward": 1.1605487486720085
       }
+    },
+    {
+      "step": 438,
+      "path": "checkpoints/ppo_llama/checkpoint_438",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 462,
+      "path": "checkpoints/ppo_llama/checkpoint_462",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
     }
   ],
   "best_reward": 1.1605487486720085,
@@ -186,6 +208,28 @@
         "avg_salience": 2.34375,
         "avg_detectability": 0.14332187500000004,
         "validation_avg_reward": 1.1605487486720085
+      }
+    },
+    {
+      "step": 438,
+      "timestamp": 1747408390.2925742,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 462,
+      "timestamp": 1747409489.4798,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
       }
     }
   ]

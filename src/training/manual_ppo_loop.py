@@ -106,13 +106,13 @@ class DataProcessor:
         # Create headers for log files with batch information if they don't exist
         if not self.generation_log.exists() or os.path.getsize(self.generation_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "global_batch_idx", "query_idx", "query", "ad_facts", "response_without_ad", "response_with_ad",
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "query", "ad_facts", "response_without_ad", "response_with_ad",
                 "generation_time", "token_count"
             ]).to_csv(self.generation_log, index=False)
         
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "global_batch_idx", "query_idx", "query", "response_with_ad", 
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "query", "response_with_ad", 
                 "coherence_score", "helpfulness_score", "salience_score", "detectability_score", 
                 "coherence_explanation", "helpfulness_explanation", "salience_explanation",
                 "judging_time"
@@ -120,7 +120,7 @@ class DataProcessor:
         
         if not self.training_log.exists() or os.path.getsize(self.training_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "global_batch_idx", "query_idx", "query", "response_with_ad", "reward", "loss", "training_time"
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "query", "response_with_ad", "reward", "loss", "training_time"
             ]).to_csv(self.training_log, index=False)
         
         # Initialize stats - default values
@@ -347,9 +347,11 @@ class DataProcessor:
                 "url": str(row['url']),
                 "description": str(row['ad_description']),
             }
+            # Attempt to get ad_source_id from a column named 'ad_index', default to 'N/A'
+            ad_source_id = str(row.get('ad_index', 'N/A'))
 
             # Log which query we're on in dataset
-            logger.info(f"🔄 Global Batch {current_query_position // self.batch_size} (Run Batch {batch_idx}) - Starting generation for query {idx} (dataset position: {current_query_position})")
+            logger.info(f"🔄 Global Batch {current_query_position // self.batch_size} (Run Batch {batch_idx}) - Starting generation for query {idx} (dataset position: {current_query_position}, ad_source_id: {ad_source_id})")
 
             try:
                 # Stage 1: Generation
@@ -366,6 +368,7 @@ class DataProcessor:
                     "batch_idx": batch_idx, # This is the run-specific batch_idx
                     "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
                     "query_idx": idx,
+                    "ad_source_id": ad_source_id,
                     "query": query,
                     "ad_facts": json.dumps(ad_facts),
                     "response_without_ad": response_without_ad,
@@ -410,6 +413,7 @@ class DataProcessor:
                     "batch_idx": batch_idx, # Run-specific
                     "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
                     "query_idx": idx,
+                    "ad_source_id": ad_source_id,
                     "query": query,
                     "response_with_ad": response_with_ad,
                     "coherence_score": score_coh.get("Coherence Score", 0),
@@ -467,6 +471,7 @@ class DataProcessor:
                     "batch_idx": batch_idx, # Run-specific
                     "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
                     "query_idx": idx,
+                    "ad_source_id": ad_source_id,
                     "query": query,
                     "response_with_ad": response_with_ad,
                     "reward": reward.item(),
@@ -635,14 +640,16 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
         try:
             with open(query_checkpoint_path, "r") as f:
                 query_checkpoint = json.load(f)
-                # Prioritize original_idx for accurate resumption
-                if query_checkpoint.get("original_idx") is not None:
-                    resume_from_query = query_checkpoint.get("original_idx")
-                    logger.info(f"Found query checkpoint! Last processed original_idx: {resume_from_query}")
-                else:
-                    # Fallback for older checkpoints that only have last_processed_query
+                # Prioritize last_processed_query for accurate resumption
+                if query_checkpoint.get("last_processed_query") is not None:
                     resume_from_query = query_checkpoint.get("last_processed_query")
-                    logger.warning(f"Found query checkpoint using last_processed_query (fallback): {resume_from_query}. Consider re-running from scratch or ensure dataset consistency if issues arise.")
+                    logger.info(f"Found query checkpoint! Last processed absolute query index: {resume_from_query}")
+                elif query_checkpoint.get("original_idx") is not None: # Fallback to original_idx
+                    # This case might indicate an older checkpoint or a point where last_processed_query wasn't reliably saved
+                    resume_from_query = query_checkpoint.get("original_idx")
+                    logger.warning(f"Found query checkpoint using original_idx (fallback): {resume_from_query}. This might occur with older checkpoints.")
+                else:
+                    logger.warning("Query checkpoint found but contains neither 'last_processed_query' nor 'original_idx'. Will rely on model checkpoint step.")
                 
                 # The 'batch_idx' and 'global_batch_idx' here are just for logging context from the last run
                 last_run_batch_idx = query_checkpoint.get("batch_idx", "N/A")
