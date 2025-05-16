@@ -100,8 +100,14 @@ HUGGINGFACE_TOKEN=your_token_if_needed
 
 ## 5. Run the Pipeline
 
+### TO RUN THE TRAINING
 ```bash
 python src/main.py
+```
+
+### TO RUN THE BASELINE
+```bash
+python src/baseline/baseline_loop.py
 ```
 This script will:
 - Generate responses (with/without ads) using a base LLM.
