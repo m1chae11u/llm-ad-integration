@@ -57,10 +57,44 @@
         "avg_detectability": 0.14131875000000002,
         "validation_avg_reward": 1.129935748577118
       }
+    },
+    {
+      "step": 418,
+      "path": "checkpoints/ppo_llama/checkpoint_418",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 398,
+      "path": "checkpoints/ppo_llama/checkpoint_398",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 438,
+      "path": "checkpoints/ppo_llama/checkpoint_438",
+      "metrics": {
+        "avg_reward": 1.0827054679393768,
+        "avg_coherence": 1.53125,
+        "avg_helpfulness": 0.3125,
+        "avg_salience": 2.34375,
+        "avg_detectability": 0.14332187500000004,
+        "validation_avg_reward": 1.1605487486720085
+      }
     }
   ],
-  "best_reward": 1.155639500617981,
-  "best_checkpoint": "checkpoints/ppo_llama/checkpoint_169",
+  "best_reward": 1.1605487486720085,
+  "best_checkpoint": "checkpoints/ppo_llama/checkpoint_438",
   "training_history": [
     {
       "step": 6,
@@ -118,6 +152,40 @@
         "avg_salience": 2.53125,
         "avg_detectability": 0.14131875000000002,
         "validation_avg_reward": 1.129935748577118
+      }
+    },
+    {
+      "step": 400,
+      "timestamp": 1747364884.772852,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 398,
+      "timestamp": 1747365810.815232,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 438,
+      "timestamp": 1747378178.8365922,
+      "metrics": {
+        "avg_reward": 1.0827054679393768,
+        "avg_coherence": 1.53125,
+        "avg_helpfulness": 0.3125,
+        "avg_salience": 2.34375,
+        "avg_detectability": 0.14332187500000004,
+        "validation_avg_reward": 1.1605487486720085
       }
     }
   ]
