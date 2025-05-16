@@ -1,8 +1,8 @@
 {
   "checkpoints": [
     {
-      "step": 6,
-      "path": "checkpoints/ppo_llama/checkpoint_6",
+      "step": 9,
+      "path": "checkpoints/ppo_llama/checkpoint_9",
       "metrics": {
         "avg_reward": 0.0,
         "avg_coherence": 0.0,
@@ -12,20 +12,8 @@
       }
     },
     {
-      "step": 169,
-      "path": "checkpoints/ppo_llama/checkpoint_169",
-      "metrics": {
-        "avg_reward": 1.1511335987597704,
-        "avg_coherence": 1.59375,
-        "avg_helpfulness": 0.21875,
-        "avg_salience": 2.65625,
-        "avg_detectability": 0.135784375,
-        "validation_avg_reward": 1.155639500617981
-      }
-    },
-    {
-      "step": 276,
-      "path": "checkpoints/ppo_llama/checkpoint_276",
+      "step": 16,
+      "path": "checkpoints/ppo_llama/checkpoint_16",
       "metrics": {
         "avg_reward": 0.0,
         "avg_coherence": 0.0,
@@ -35,92 +23,36 @@
       }
     },
     {
-      "step": 332,
-      "path": "checkpoints/ppo_llama/checkpoint_332",
+      "step": 250,
+      "path": "checkpoints/ppo_llama/checkpoint_250",
       "metrics": {
-        "avg_reward": 1.02469140291214,
-        "avg_coherence": 1.5,
+        "avg_reward": 1.1050164084881544,
+        "avg_coherence": 1.46875,
+        "avg_helpfulness": 0.1875,
+        "avg_salience": 2.625,
+        "avg_detectability": 0.138815625,
+        "validation_avg_reward": 1.1124804985523224
+      }
+    },
+    {
+      "step": 515,
+      "path": "checkpoints/ppo_llama/checkpoint_515",
+      "metrics": {
+        "avg_reward": 1.1504218727350235,
+        "avg_coherence": 1.65625,
         "avg_helpfulness": 0.25,
-        "avg_salience": 2.21875,
-        "avg_detectability": 0.13001562499999997,
-        "validation_avg_reward": 1.1359277495741844
-      }
-    },
-    {
-      "step": 397,
-      "path": "checkpoints/ppo_llama/checkpoint_397",
-      "metrics": {
-        "avg_reward": 1.136892195791006,
-        "avg_coherence": 1.5625,
-        "avg_helpfulness": 0.3125,
-        "avg_salience": 2.53125,
-        "avg_detectability": 0.14131875000000002,
-        "validation_avg_reward": 1.129935748577118
-      }
-    },
-    {
-      "step": 418,
-      "path": "checkpoints/ppo_llama/checkpoint_418",
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    },
-    {
-      "step": 398,
-      "path": "checkpoints/ppo_llama/checkpoint_398",
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    },
-    {
-      "step": 438,
-      "path": "checkpoints/ppo_llama/checkpoint_438",
-      "metrics": {
-        "avg_reward": 1.0827054679393768,
-        "avg_coherence": 1.53125,
-        "avg_helpfulness": 0.3125,
-        "avg_salience": 2.34375,
-        "avg_detectability": 0.14332187500000004,
-        "validation_avg_reward": 1.1605487486720085
-      }
-    },
-    {
-      "step": 438,
-      "path": "checkpoints/ppo_llama/checkpoint_438",
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    },
-    {
-      "step": 462,
-      "path": "checkpoints/ppo_llama/checkpoint_462",
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
+        "avg_salience": 2.5625,
+        "avg_detectability": 0.1329375,
+        "validation_avg_reward": 1.0805254966020583
       }
     }
   ],
-  "best_reward": 1.1605487486720085,
-  "best_checkpoint": "checkpoints/ppo_llama/checkpoint_438",
+  "best_reward": 1.1124804985523224,
+  "best_checkpoint": "checkpoints/ppo_llama/checkpoint_250",
   "training_history": [
     {
-      "step": 6,
-      "timestamp": 1747211873.5162497,
+      "step": 9,
+      "timestamp": 1747410817.1453311,
       "metrics": {
         "avg_reward": 0.0,
         "avg_coherence": 0.0,
@@ -130,20 +62,8 @@
       }
     },
     {
-      "step": 169,
-      "timestamp": 1747234546.0249236,
-      "metrics": {
-        "avg_reward": 1.1511335987597704,
-        "avg_coherence": 1.59375,
-        "avg_helpfulness": 0.21875,
-        "avg_salience": 2.65625,
-        "avg_detectability": 0.135784375,
-        "validation_avg_reward": 1.155639500617981
-      }
-    },
-    {
-      "step": 276,
-      "timestamp": 1747280405.488907,
+      "step": 16,
+      "timestamp": 1747411270.3631227,
       "metrics": {
         "avg_reward": 0.0,
         "avg_coherence": 0.0,
@@ -153,83 +73,27 @@
       }
     },
     {
-      "step": 332,
-      "timestamp": 1747285118.6303344,
+      "step": 250,
+      "timestamp": 1747420116.0428703,
       "metrics": {
-        "avg_reward": 1.02469140291214,
-        "avg_coherence": 1.5,
+        "avg_reward": 1.1050164084881544,
+        "avg_coherence": 1.46875,
+        "avg_helpfulness": 0.1875,
+        "avg_salience": 2.625,
+        "avg_detectability": 0.138815625,
+        "validation_avg_reward": 1.1124804985523224
+      }
+    },
+    {
+      "step": 515,
+      "timestamp": 1747429525.4279425,
+      "metrics": {
+        "avg_reward": 1.1504218727350235,
+        "avg_coherence": 1.65625,
         "avg_helpfulness": 0.25,
-        "avg_salience": 2.21875,
-        "avg_detectability": 0.13001562499999997,
-        "validation_avg_reward": 1.1359277495741844
-      }
-    },
-    {
-      "step": 397,
-      "timestamp": 1747289551.1164448,
-      "metrics": {
-        "avg_reward": 1.136892195791006,
-        "avg_coherence": 1.5625,
-        "avg_helpfulness": 0.3125,
-        "avg_salience": 2.53125,
-        "avg_detectability": 0.14131875000000002,
-        "validation_avg_reward": 1.129935748577118
-      }
-    },
-    {
-      "step": 400,
-      "timestamp": 1747364884.772852,
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    },
-    {
-      "step": 398,
-      "timestamp": 1747365810.815232,
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    },
-    {
-      "step": 438,
-      "timestamp": 1747378178.8365922,
-      "metrics": {
-        "avg_reward": 1.0827054679393768,
-        "avg_coherence": 1.53125,
-        "avg_helpfulness": 0.3125,
-        "avg_salience": 2.34375,
-        "avg_detectability": 0.14332187500000004,
-        "validation_avg_reward": 1.1605487486720085
-      }
-    },
-    {
-      "step": 438,
-      "timestamp": 1747408390.2925742,
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    },
-    {
-      "step": 462,
-      "timestamp": 1747409489.4798,
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
+        "avg_salience": 2.5625,
+        "avg_detectability": 0.1329375,
+        "validation_avg_reward": 1.0805254966020583
       }
     }
   ]

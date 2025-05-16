@@ -724,6 +724,11 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
     if validation_size > 0:
         validation_data = df_to_process.sample(n=validation_size, random_state=42)
         df_to_process = df_to_process.drop(validation_data.index)
+        logger.info(f"📊 Sampled {len(validation_data)} queries for validation.")
+        if len(validation_data) < 20: # Log individual indices if the set is small
+            logger.info(f"Validation query_idx values (original DataFrame index): {sorted(list(validation_data.index))}")
+        else: # Log a summary if the set is large
+            logger.info(f"Validation query_idx values range from {min(validation_data.index)} to {max(validation_data.index)} (not necessarily contiguous).")
     else:
         validation_data = pd.DataFrame() # Empty dataframe if no validation data
         logger.info("No validation data to sample.")
@@ -806,11 +811,18 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
             
             # Save query position checkpoint
             try:
-                query_checkpoint_to_save = { # Renamed to avoid conflict with loaded query_checkpoint
-                    "last_processed_query": int(current_position), # This is current_query_position
-                    "original_idx": int(query_checkpoint.get("original_idx")) if query_checkpoint and query_checkpoint.get("original_idx") is not None else int(current_position), # Preserve original_idx if available from loaded checkpoint, else estimate
-                    "batch_idx": batch_idx if 'batch_idx' in locals() else 0, # Run-specific batch_idx
-                    "global_batch_idx": (int(current_position) // processor.batch_size) if processor and hasattr(processor, 'batch_size') and processor.batch_size > 0 else -1, # Global batch_idx based on current_position
+                # Initialize original_idx to current_position as a fallback
+                original_idx_to_save = int(current_position)
+                # Try to get original_idx from query_checkpoint if it was loaded
+                # Need to check if 'query_checkpoint' exists in the local scope and is not None
+                if 'query_checkpoint' in locals() and query_checkpoint is not None and query_checkpoint.get("original_idx") is not None:
+                    original_idx_to_save = int(query_checkpoint.get("original_idx"))
+
+                query_checkpoint_to_save = { 
+                    "last_processed_query": int(current_position),
+                    "original_idx": original_idx_to_save,
+                    "batch_idx": batch_idx if 'batch_idx' in locals() else 0, 
+                    "global_batch_idx": (int(current_position) // processor.batch_size) if processor and hasattr(processor, 'batch_size') and processor.batch_size > 0 else -1, 
                     "timestamp": time.time()
                 }
                 
