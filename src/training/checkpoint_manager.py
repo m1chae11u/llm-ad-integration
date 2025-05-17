@@ -149,8 +149,8 @@ class CheckpointManager:
                 
                 metrics = {"avg_reward": 0.0, "avg_coherence": 0.0, "avg_helpfulness": 0.0, "avg_salience": 0.0, "avg_detectability": 0.0}
                 if serializable_results:
-                num_results = len(serializable_results)
-                        metrics["avg_reward"] = sum(r["reward"] for r in serializable_results) / num_results
+                    num_results = len(serializable_results)
+                    metrics["avg_reward"] = sum(r["reward"] for r in serializable_results) / num_results
                     metrics["avg_coherence"] = sum(r["scores"].get("coherence", {}).get("Coherence Score", 0) for r in serializable_results) / num_results
                     metrics["avg_helpfulness"] = sum(r["scores"].get("helpfulness", {}).get("Helpfulness Score", 0) for r in serializable_results) / num_results
                     metrics["avg_salience"] = sum(r["scores"].get("salience", {}).get("Ad Salience Score", 0) for r in serializable_results) / num_results
@@ -222,12 +222,12 @@ class CheckpointManager:
                 The loaded model, tokenizer, and checkpoint info dict, or (None, None, None) if loading fails.
         """
         with self.lock:
-        if not self.checkpoint_info_path.exists():
+            if not self.checkpoint_info_path.exists():
                 logger.info("No checkpoint_info.json found. Attempting to load base model.")
                 self._model, self._tokenizer = self._load_base_model_and_tokenizer()
                 if self._model is None or self._tokenizer is None:
                     logger.error("Failed to load base model and tokenizer. Cannot proceed.")
-            return None, None, None
+                    return None, None, None
                 # Optimizer is typically re-initialized by the caller (e.g., run_manual_ppo) 
                 # when loading the base model, so no explicit reset needed here for self._optimizer.
                 return self._model, self._tokenizer, None # No checkpoint info for base model load
@@ -241,7 +241,7 @@ class CheckpointManager:
                 self._model, self._tokenizer = self._load_base_model_and_tokenizer()
                 if self._model is None or self._tokenizer is None:
                     logger.error("Failed to load base model and tokenizer after invalid checkpoint. Cannot proceed.")
-                return None, None, None
+                    return None, None, None
                 # Optimizer is typically re-initialized by the caller (e.g., run_manual_ppo) 
                 # when loading the base model, so no explicit reset needed here for self._optimizer.
                 return self._model, self._tokenizer, None
@@ -297,7 +297,7 @@ class CheckpointManager:
                 self._model, self._tokenizer = self._load_base_model_and_tokenizer()
                 if self._model is None or self._tokenizer is None:
                     logger.error("Failed to load base model as fallback. Cannot proceed.")
-                return None, None, None
+                    return None, None, None
                 # Optimizer is typically re-initialized by the caller (e.g., run_manual_ppo) 
                 # when loading the base model, so no explicit reset needed here for self._optimizer.
                 return self._model, self._tokenizer, None
@@ -344,5 +344,5 @@ class CheckpointManager:
                         os.remove(self.checkpoint_info_path)
                         logger.info("Removed checkpoint_info.json as all checkpoints were deleted.")
                 
-        except Exception as e:
+            except Exception as e:
                 logger.error(f"Error during checkpoint cleanup: {e}")

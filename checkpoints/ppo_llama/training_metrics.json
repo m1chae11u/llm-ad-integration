@@ -69,6 +69,18 @@
         "avg_detectability": 1.00638125,
         "validation_avg_reward": 1.1180789959430695
       }
+    },
+    {
+      "step": 1788,
+      "path": "checkpoints/ppo_llama/checkpoint_1788",
+      "metrics": {
+        "avg_reward": 1.1197968749329448,
+        "avg_coherence": 1.53125,
+        "avg_helpfulness": 0.25,
+        "avg_salience": 2.5625,
+        "avg_detectability": 0.13543750000000002,
+        "validation_avg_reward": 1.1275390070676803
+      }
     }
   ],
   "best_reward": 1.1431269970536233,
@@ -142,6 +154,18 @@
         "avg_salience": 2.5,
         "avg_detectability": 1.00638125,
         "validation_avg_reward": 1.1180789959430695
+      }
+    },
+    {
+      "step": 1788,
+      "timestamp": 1747507035.4846506,
+      "metrics": {
+        "avg_reward": 1.1197968749329448,
+        "avg_coherence": 1.53125,
+        "avg_helpfulness": 0.25,
+        "avg_salience": 2.5625,
+        "avg_detectability": 0.13543750000000002,
+        "validation_avg_reward": 1.1275390070676803
       }
     }
   ]
