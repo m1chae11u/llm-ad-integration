@@ -45,16 +45,16 @@ def load_model_and_tokenizer():
 
     print(f"Loading model from: {effective_model_path_for_model}...")
     try:
-        model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
             effective_model_path_for_model,
-            torch_dtype=torch.float16,  # Use FP16 for efficiency
-            device_map="auto",
-            trust_remote_code=True,
-            use_cache=True,  # Enable KV cache for faster inference
+        torch_dtype=torch.float16,  # Use FP16 for efficiency
+        device_map="auto",
+        trust_remote_code=True,
+        use_cache=True,  # Enable KV cache for faster inference
             low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
             token=hf_token
-        )
-        try:
+    )
+    try:
             model.generation_config = GenerationConfig.from_pretrained(effective_model_path_for_model, token=hf_token)
         except Exception: # Handle cases where generation_config might be missing
             print(f"⚠️ Could not load generation_config from {effective_model_path_for_model}. Using default from {BASE_MODEL}.")

@@ -149,8 +149,8 @@ class CheckpointManager:
                 
                 metrics = {"avg_reward": 0.0, "avg_coherence": 0.0, "avg_helpfulness": 0.0, "avg_salience": 0.0, "avg_detectability": 0.0}
                 if serializable_results:
-                    num_results = len(serializable_results)
-                    metrics["avg_reward"] = sum(r["reward"] for r in serializable_results) / num_results
+                num_results = len(serializable_results)
+                        metrics["avg_reward"] = sum(r["reward"] for r in serializable_results) / num_results
                     metrics["avg_coherence"] = sum(r["scores"].get("coherence", {}).get("Coherence Score", 0) for r in serializable_results) / num_results
                     metrics["avg_helpfulness"] = sum(r["scores"].get("helpfulness", {}).get("Helpfulness Score", 0) for r in serializable_results) / num_results
                     metrics["avg_salience"] = sum(r["scores"].get("salience", {}).get("Ad Salience Score", 0) for r in serializable_results) / num_results
@@ -175,14 +175,14 @@ class CheckpointManager:
                     logger.info(f"🎉 New best model! Val reward: {metrics_file['best_reward']:.4f}")
                 metrics_file["training_history"].append({"step": current_step, "timestamp": time.time(), "metrics": checkpoint_info["metrics"]})
                 with open(self.metrics_path, "w") as f: json.dump(metrics_file, f, indent=2)
-
+                
                 if final_checkpoint_dir.exists(): shutil.rmtree(final_checkpoint_dir)
                 shutil.move(str(temp_checkpoint_dir), str(final_checkpoint_dir))
                 logger.info(f"✅ Checkpoint {current_step} saved to {final_checkpoint_dir}")
                 
                 with open(self.checkpoint_info_path, "w") as f:
                     json.dump({"latest_checkpoint": str(final_checkpoint_dir)}, f)
-
+                
             except Exception as e:
                 logger.error(f"❌ Error saving checkpoint {current_step}: {e}")
                 logger.exception("Detailed traceback for checkpoint saving error:")
@@ -222,16 +222,16 @@ class CheckpointManager:
                 The loaded model, tokenizer, and checkpoint info dict, or (None, None, None) if loading fails.
         """
         with self.lock:
-            if not self.checkpoint_info_path.exists():
+        if not self.checkpoint_info_path.exists():
                 logger.info("No checkpoint_info.json found. Attempting to load base model.")
                 self._model, self._tokenizer = self._load_base_model_and_tokenizer()
                 if self._model is None or self._tokenizer is None:
                     logger.error("Failed to load base model and tokenizer. Cannot proceed.")
-                    return None, None, None 
+            return None, None, None
                 # Optimizer is typically re-initialized by the caller (e.g., run_manual_ppo) 
                 # when loading the base model, so no explicit reset needed here for self._optimizer.
                 return self._model, self._tokenizer, None # No checkpoint info for base model load
-
+            
             with open(self.checkpoint_info_path, "r") as f:
                 info = json.load(f)
             latest_checkpoint_path = Path(info.get("latest_checkpoint"))
@@ -241,7 +241,7 @@ class CheckpointManager:
                 self._model, self._tokenizer = self._load_base_model_and_tokenizer()
                 if self._model is None or self._tokenizer is None:
                     logger.error("Failed to load base model and tokenizer after invalid checkpoint. Cannot proceed.")
-                    return None, None, None
+                return None, None, None
                 # Optimizer is typically re-initialized by the caller (e.g., run_manual_ppo) 
                 # when loading the base model, so no explicit reset needed here for self._optimizer.
                 return self._model, self._tokenizer, None
@@ -249,7 +249,7 @@ class CheckpointManager:
             try:
                 logger.info(f"Loading model from checkpoint: {latest_checkpoint_path}")
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                
+
                 # If self._model was None (e.g. from main.py initial load failure), instantiate it first from base.
                 # This scenario is less likely now that run_manual_ppo also tries to load the model.
                 # However, to be robust, if _model is None, we load the base model before applying checkpoint.
@@ -268,7 +268,7 @@ class CheckpointManager:
                 # For simplicity with AutoModel, loading the checkpoint as a new instance is often safer.
                 loaded_cpt_model = AutoModelForCausalLM.from_pretrained(
                     latest_checkpoint_path, 
-                    torch_dtype=torch.float16, 
+                    torch_dtype=torch.float16,
                     device_map="auto", 
                     trust_remote_code=True, 
                     token=self.hf_token # Use token if checkpoint refers to external files that might be gated
@@ -297,11 +297,11 @@ class CheckpointManager:
                 self._model, self._tokenizer = self._load_base_model_and_tokenizer()
                 if self._model is None or self._tokenizer is None:
                     logger.error("Failed to load base model as fallback. Cannot proceed.")
-                    return None, None, None
+                return None, None, None
                 # Optimizer is typically re-initialized by the caller (e.g., run_manual_ppo) 
                 # when loading the base model, so no explicit reset needed here for self._optimizer.
                 return self._model, self._tokenizer, None
-
+    
     def cleanup_old_checkpoints(self, keep_last_n=3):
         """Clean up old checkpoints, keeping only the last N."""
         with self.lock:
@@ -343,6 +343,6 @@ class CheckpointManager:
                     elif not checkpoints_to_keep and latest_cpt_path.exists(): # All checkpoints deleted somehow
                         os.remove(self.checkpoint_info_path)
                         logger.info("Removed checkpoint_info.json as all checkpoints were deleted.")
-                            
-            except Exception as e:
+                
+        except Exception as e:
                 logger.error(f"Error during checkpoint cleanup: {e}")
