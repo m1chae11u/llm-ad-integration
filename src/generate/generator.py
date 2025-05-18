@@ -90,6 +90,25 @@ def generate_response_with_ad(user_query: str, ad_text: str, model, tokenizer) -
     response = generate_text(full_prompt, model, tokenizer)
     return response
 
+def generate_response_with_multi_ads(user_query: str, multi_ad_block: str, model, tokenizer) -> str:
+    print("\n🟧 Generating response with MULTIPLE ads...")
+    base_prompt = get_prompt_without_ad(user_query)
+    max_total_tokens = 2048
+    max_ad_tokens = max_total_tokens - get_token_count(base_prompt, tokenizer)
+    if max_ad_tokens <= 0:
+        print("⚠️ Not enough space for multi-ad content.")
+        return ""
+    # Truncate the multi_ad_block if needed
+    tokens = tokenizer.encode(multi_ad_block, truncation=False)
+    if len(tokens) > max_ad_tokens:
+        multi_ad_block = tokenizer.decode(tokens[:max_ad_tokens], skip_special_tokens=True)
+    full_prompt = get_prompt_with_multi_ads(user_query, multi_ad_block)
+    if get_token_count(full_prompt, tokenizer) > max_total_tokens:
+        print("⚠️ Skipping: full prompt too long (with multi ads)")
+        return ""
+    response = generate_text(full_prompt, model, tokenizer)
+    return response    
+
 @cache_result(ttl_seconds=3600)  # Cache for 1 hour
 def generate_responses(user_query: str, ad_facts: dict, model, tokenizer) -> tuple[str, str]:
     """Generate both responses - with and without ad, and clean them."""

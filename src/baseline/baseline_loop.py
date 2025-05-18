@@ -94,7 +94,7 @@ class BaselineDataProcessor:
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
                 "run_batch_idx", "global_item_idx", "original_query_idx", "query", "response_with_ad", 
-                "coherence_score", "helpfulness_score", "salience_score", "detectability_score", 
+                "coherence_score", "helpfulness_score", "salience_score", 
                 "coherence_explanation", "helpfulness_explanation", "salience_explanation", "judging_time"
             ]).to_csv(self.judging_log, index=False)
         
