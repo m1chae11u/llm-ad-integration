@@ -1,0 +1,15 @@
+.env
+**/__pycache__/
+venv/
+
+checkpoints/ppo_deepseek_backup/*.bin
+checkpoints/ppo_deepseek_backup/*.safetensors
+checkpoints/ppo_deepseek_backup/optimizer.pt
+*.bin
+*.pt
+*.safetensors
+test_generator.py
+generator_test_output.json
+checkpoints/ppo_llama/*.bin
+checkpoints/ppo_llama/*.safetensors
+checkpoints/ppo_llama/optimizer.pt
