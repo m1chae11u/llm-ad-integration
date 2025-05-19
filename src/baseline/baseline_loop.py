@@ -13,20 +13,13 @@ import logging
 import requests # For robust session
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# Adjust relative imports based on the new location src/baseline/
-# Assuming judge, generator, and utils are in parent's sibling directories or accessible via PYTHONPATH
-# e.g., from ..judge import ... if src/ is in PYTHONPATH and script is in src/baseline/
-# For simplicity, if you encounter import errors, ensure PYTHONPATH is set up correctly
-# or adjust these relative paths (e.g. from src.judge import ... if called from project root with src in path)
-
 # Attempting common relative import structure, assuming PYTHONPATH includes project root
 from src.judge import (
     judge_coherence,
     judge_helpfulness,
     judge_ad_salience,
-    judge_detectability
 )
-from src.generate.generator import generate_responses, clear_response_cache
+from src.generate.generator import generate_response_with_ad, clear_response_cache
 from src.judge.utils import clear_caches 
 # CheckpointManager is not used in this baseline script for model saving during the loop.
 # Model loading will be handled directly in run_baseline_evaluation.
@@ -88,7 +81,7 @@ class BaselineDataProcessor:
         if not self.generation_log.exists() or os.path.getsize(self.generation_log) == 0:
             pd.DataFrame(columns=[
                 "run_batch_idx", "global_item_idx", "original_query_idx", "query", "ad_facts", 
-                "response_without_ad", "response_with_ad", "generation_time", "token_count"
+                "response_with_ad", "generation_time", "token_count"
             ]).to_csv(self.generation_log, index=False)
         
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
@@ -179,18 +172,16 @@ class BaselineDataProcessor:
             }]).to_csv(self.stats_log, mode="a", header=False, index=False)
             logger.info(f"Stats updated at item {self.stats['total_items_processed']}. Avg Reward: {self.stats['avg_reward']:.4f}")
 
-    def _run_judges_parallel(self, query, response_with_ad, response_without_ad, ad_text):
-        with ThreadPoolExecutor(max_workers=4) as executor: # Limit workers or make configurable
+    def _run_judges_parallel(self, query, response_with_ad, ad_text):
+        with ThreadPoolExecutor(max_workers=3) as executor: # Reduced from 4 to 3 judges
             future_coh = executor.submit(judge_coherence, query, response_with_ad)
             future_help = executor.submit(judge_helpfulness, query, response_with_ad)
             future_sal = executor.submit(judge_ad_salience, query, response_with_ad, ad_text)
-            future_det = executor.submit(judge_detectability, response_with_ad, response_without_ad)
             
             score_coh = future_coh.result()
             score_help = future_help.result()
             score_sal = future_sal.result()
-            score_det = future_det.result()
-        return score_coh, score_help, score_sal, score_det
+        return score_coh, score_help, score_sal
 
     def process_single_item(self, original_query_idx, query_data, run_batch_idx, global_item_idx):
         query = str(query_data['vague_query'])
@@ -200,46 +191,46 @@ class BaselineDataProcessor:
         }
         logger.info(f"Processing: RunBatch {run_batch_idx}, GlobalItem {global_item_idx}, OriginalQueryIdx {original_query_idx}")
 
-        response_without_ad, response_with_ad, gen_time, token_count = None, None, 0, 0
-        score_coh, score_help, score_sal, score_det = {}, {}, {}, {}
+        response_with_ad, gen_time, token_count = None, 0, 0
+        score_coh, score_help, score_sal = {}, {}, {}
         judge_time = 0
         reward_value = 0.0
         success = False
 
         try:
-            # Stage 1: Generation
+            # Stage 1: Generation (only with ad)
             gen_start_time = time.time()
             with torch.no_grad():
-                response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                response_with_ad = generate_response_with_ad(query, ad_facts, self.model, self.tokenizer)
             gen_time = time.time() - gen_start_time
             token_count = len(self.tokenizer.encode(response_with_ad))
             self.generation_log_buffer.append({
                 "run_batch_idx": run_batch_idx, "global_item_idx": global_item_idx, "original_query_idx": original_query_idx,
                 "query": query, "ad_facts": json.dumps(ad_facts),
-                "response_without_ad": response_without_ad, "response_with_ad": response_with_ad,
+                "response_with_ad": response_with_ad,
                 "generation_time": gen_time, "token_count": token_count
             })
             logger.debug(f"Generation for OriginalQueryIdx {original_query_idx} complete in {gen_time:.2f}s")
 
-            # Stage 2: Judging
+            # Stage 2: Judging (without detectability)
             judge_start_time = time.time()
             ad_text = f"Product: {ad_facts['ad_product']}\nBrand: {ad_facts['brand']}\nURL: {ad_facts['url']}\nDescription: {ad_facts['description']}"
-            score_coh, score_help, score_sal, score_det = self._run_judges_parallel(query, response_with_ad, response_without_ad, ad_text)
+            score_coh, score_help, score_sal = self._run_judges_parallel(query, response_with_ad, ad_text)
             judge_time = time.time() - judge_start_time
             self.judging_log_buffer.append({
                 "run_batch_idx": run_batch_idx, "global_item_idx": global_item_idx, "original_query_idx": original_query_idx,
                 "query": query, "response_with_ad": response_with_ad,
                 "coherence_score": score_coh.get("Coherence Score", 0), "helpfulness_score": score_help.get("Helpfulness Score", 0),
-                "salience_score": score_sal.get("Ad Salience Score", 0), "detectability_score": score_det.get("detectability_cosine", 0),
+                "salience_score": score_sal.get("Ad Salience Score", 0),
                 "coherence_explanation": score_coh.get("Coherence Explanation", ""), "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
                 "salience_explanation": score_sal.get("Ad Salience Explanation", ""), "judging_time": judge_time
             })
             logger.debug(f"Judging for OriginalQueryIdx {original_query_idx} complete in {judge_time:.2f}s")
 
-            # Stage 3: Reward Calculation
+            # Stage 3: Reward Calculation (without detectability)
             reward_values = [
                 score_coh.get("Coherence Score", 0), score_help.get("Helpfulness Score", 0),
-                score_sal.get("Ad Salience Score", 0), (1.0 - (score_det.get("detectability_cosine", 1.0) or 1.0)) # Reward higher if less detectable (cosine close to 0)
+                score_sal.get("Ad Salience Score", 0)
             ]
             reward_value = sum(reward_values) / len(reward_values) if reward_values else 0.0
             self.evaluation_log_buffer.append({
@@ -266,9 +257,9 @@ class BaselineDataProcessor:
 
         return {
             "original_query_idx": original_query_idx, "query": query, "ad_facts": ad_facts,
-            "response_without_ad": response_without_ad, "response_with_ad": response_with_ad,
+            "response_with_ad": response_with_ad,
             "reward": reward_value, 
-            "scores": {"coherence": score_coh, "helpfulness": score_help, "salience": score_sal, "detectability": score_det},
+            "scores": {"coherence": score_coh, "helpfulness": score_help, "salience": score_sal},
             "processed_successfully": success
         }
 
@@ -352,16 +343,6 @@ def run_baseline_evaluation(model, tokenizer, base_model_name: str, data_file_pa
         logger.info("No data to process after considering resume point.")
         return
 
-    # --- Validation Set (Optional) --- # 
-    # For baseline, validation might be less critical than in training, but can be kept for consistency
-    validation_data = pd.DataFrame() # No validation split by default for simpler baseline
-    # Example if you want validation:
-    # validation_size = min(max(10, int(len(df_to_process) * 0.01)), 100) # e.g. 1% or up to 100 samples
-    # if len(df_to_process) > validation_size * 2: # Ensure enough data for validation and processing
-    #     validation_data = df_to_process.sample(n=validation_size, random_state=42)
-    #     df_to_process = df_to_process.drop(validation_data.index)
-    # else: logger.info("Not enough data to create a validation split.")
-
     # --- Initialize Processor --- #
     processor = BaselineDataProcessor(model, tokenizer, device, logs_base_dir=logs_base_dir, batch_size=batch_size)
     processor.dataset_start_idx = start_global_item_idx # Inform processor of the global starting point in the dataset
@@ -387,9 +368,6 @@ def run_baseline_evaluation(model, tokenizer, base_model_name: str, data_file_pa
             _, last_processed_global_idx_in_batch = processor.process_batch(current_batch_df, run_batch_idx) 
             last_processed_global_idx_overall = max(last_processed_global_idx_overall, last_processed_global_idx_in_batch)
             processed_item_count_in_this_run += len(current_batch_df)
-
-            if not validation_data.empty and run_batch_idx % 10 == 0: # Validate periodically if validation_data exists
-                processor.validate_model(validation_data, run_batch_idx)
             
             if run_batch_idx > 0 and run_batch_idx % 20 == 0: # Less frequent cleanup for baseline
                 clear_caches(); clear_response_cache(); gc.collect()
