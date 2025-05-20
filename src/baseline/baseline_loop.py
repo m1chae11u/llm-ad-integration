@@ -37,9 +37,22 @@ class BaselineDataProcessor:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.batch_size = batch_size
+        # Get batch size from environment variable or use default
+        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "64"))
         self.dataset_start_idx = 0
         self.logs_base_dir = logs_base_dir
+
+        # Enable memory optimizations
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Set memory allocation strategy
+            torch.cuda.set_per_process_memory_fraction(0.9)  # Use 90% of available GPU memory
+            torch.cuda.memory.set_per_process_memory_fraction(0.9)
+        
+        # Initialize response cache
+        self.response_cache = {}
+        self.cache_size = 1000  # Maximum number of cached responses
 
         # Create directories for intermediate results
         self.generation_dir = self.logs_base_dir / "generations"
@@ -69,8 +82,18 @@ class BaselineDataProcessor:
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
                 "run_batch_idx", "global_item_idx", "original_query_idx", "ad_id", "ad_index", "query", "response_with_ad", 
-                "coherence_score", "helpfulness_score", "salience_score", 
-                "coherence_explanation", "helpfulness_explanation", "salience_explanation", "judging_time"
+                # Coherence subscores
+                "C1", "C2", "C3", "C4",
+                "coherence_score", "coherence_explanation",
+                # Helpfulness subscore
+                "H1",
+                "helpfulness_score", "helpfulness_explanation",
+                # Salience subscores
+                "S1", "S2", "S3",
+                "salience_score", "salience_explanation",
+                # Detectability score
+                "detectability_cosine",
+                "judging_time"
             ]).to_csv(self.judging_log, index=False)
         
         if not self.evaluation_log.exists() or os.path.getsize(self.evaluation_log) == 0:
@@ -181,9 +204,10 @@ class BaselineDataProcessor:
             "url": str(query_data['url']), 
             "description": str(query_data['ad_description']),
         }
-        ad_id = query_data.get('ad_id', None)
-        ad_index = query_data.get('ad_index', None)
-        logger.info(f"Processing: RunBatch {run_batch_idx}, GlobalItem {global_item_idx}, OriginalQueryIdx {original_query_idx}")
+        # Get both ad_id and ad_index from the dataset
+        ad_id = str(query_data.get('ad_id', 'N/A'))
+        ad_index = str(query_data.get('ad_index', 'N/A'))
+        logger.info(f"Processing: RunBatch {run_batch_idx}, GlobalItem {global_item_idx}, OriginalQueryIdx {original_query_idx}, AdID: {ad_id}, AdIndex: {ad_index}")
 
         response_with_ad, gen_time, token_count = None, 0, 0
         score_coh, score_help, score_sal = {}, {}, {}
@@ -232,19 +256,32 @@ class BaselineDataProcessor:
                 "ad_index": ad_index,
                 "query": query, 
                 "response_with_ad": response_with_ad,
-                "coherence_score": score_coh.get("Coherence Score", 0), 
+                # Coherence subscores
+                "C1": score_coh.get("C1", 0),
+                "C2": score_coh.get("C2", 0),
+                "C3": score_coh.get("C3", 0),
+                "C4": score_coh.get("C4", 0),
+                "coherence_score": score_coh.get("Coherence Score", 0),
+                "coherence_explanation": score_coh.get("Coherence Explanation", ""),
+                # Helpfulness subscore
+                "H1": score_help.get("H1", 0),
                 "helpfulness_score": score_help.get("Helpfulness Score", 0),
-                "salience_score": score_sal.get("Ad Salience Score", 0),
-                "coherence_explanation": score_coh.get("Coherence Explanation", ""), 
                 "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
-                "salience_explanation": score_sal.get("Ad Salience Explanation", ""), 
+                # Salience subscores
+                "S1": score_sal.get("S1", 0),
+                "S2": score_sal.get("S2", 0),
+                "S3": score_sal.get("S3", 0),
+                "salience_score": score_sal.get("Ad Salience Score", 0),
+                "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
+                # Detectability score
+                "detectability_cosine": score_det.get("detectability_cosine", 0) if 'score_det' in locals() else 0,
                 "judging_time": judge_time
             })
 
             # Calculate reward
             reward_values = [
                 score_coh.get("Coherence Score", 0), 
-                score_help.get("Helpfulness Score", 0),
+                score_help.get("H1", 0),
                 score_sal.get("Ad Salience Score", 0)
             ]
             reward_value = sum(reward_values) / len(reward_values)
@@ -275,7 +312,8 @@ class BaselineDataProcessor:
                 json.dump({
                     "last_processed_global_item_idx": global_item_idx,
                     "last_ad_id": ad_id,
-                    "last_ad_index": ad_index
+                    "last_ad_index": ad_index,
+                    "last_original_query_idx": original_query_idx
                 }, f)
         except Exception as e:
             logger.error(f"Failed to save resume checkpoint: {e}")
@@ -284,32 +322,94 @@ class BaselineDataProcessor:
             "original_query_idx": original_query_idx, 
             "query": query, 
             "ad_facts": ad_facts,
+            "ad_id": ad_id,
+            "ad_index": ad_index,
             "response_with_ad": response_with_ad,
             "reward": reward_value, 
             "scores": {"coherence": score_coh, "helpfulness": score_help, "salience": score_sal},
             "processed_successfully": success
         }
 
+    def _clear_memory(self):
+        """Aggressive memory cleanup."""
+        clear_caches()
+        clear_response_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        
+        # Clear response cache if it's too large
+        if len(self.response_cache) > self.cache_size:
+            self.response_cache.clear()
+
     async def process_batch(self, batch_data_df, run_batch_idx):
         batch_results = []
+        batch_start_time = time.time()
         
+        # Pre-process all queries in the batch
+        queries = []
+        ad_facts_list = []
+        ad_ids = []
+        ad_indices = []
+        for _, row in batch_data_df.iterrows():
+            queries.append(str(row['vague_query']))
+            ad_facts_list.append({
+                "ad_product": str(row['ad_product']),
+                "brand": str(row['brand']),
+                "url": str(row['url']),
+                "description": str(row['ad_description']),
+            })
+            ad_ids.append(str(row.get('ad_id', 'N/A')))
+            ad_indices.append(str(row.get('ad_index', 'N/A')))
+
+        # Batch generate responses
+        with torch.no_grad():
+            responses = []
+            for query, ad_facts in zip(queries, ad_facts_list):
+                _, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                responses.append(response_with_ad)
+
         # Process items in parallel
         tasks = []
-        for i, (original_query_idx, row_data) in enumerate(batch_data_df.iterrows()):
+        for i, (query, response_with_ad, ad_facts, ad_id, ad_index) in enumerate(zip(queries, responses, ad_facts_list, ad_ids, ad_indices)):
             global_item_idx = self.dataset_start_idx + (run_batch_idx * self.batch_size) + i
-            task = self.process_single_item(original_query_idx, row_data, run_batch_idx, global_item_idx)
+            task = self.process_single_item(i, {
+                'vague_query': query,
+                'ad_product': ad_facts['ad_product'],
+                'brand': ad_facts['brand'],
+                'url': ad_facts['url'],
+                'ad_description': ad_facts['description'],
+                'ad_id': ad_id,
+                'ad_index': ad_index
+            }, run_batch_idx, global_item_idx)
             tasks.append(task)
         
         # Wait for all tasks to complete
         batch_results = await asyncio.gather(*tasks)
         
+        batch_time = time.time() - batch_start_time
+        logger.info(f"✅ Completed batch {run_batch_idx} in {batch_time:.2f}s")
+        
         self._flush_logs()
         logger.info(f"Completed processing batch {run_batch_idx}. Processed {len(batch_results)} items.")
+        
+        # Clear memory after each batch
+        self._clear_memory()
+        
         last_global_idx_in_batch = self.dataset_start_idx + (run_batch_idx * self.batch_size) + (len(batch_data_df) -1) if not batch_data_df.empty else -1
         return batch_results, last_global_idx_in_batch
 
 async def run_baseline_evaluation(model, tokenizer, base_model_name: str, data_file_path: str, results_dir_str: str, hf_token: str = None, batch_size: int = 32, resume: bool = True):
     device = model.device if model is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+
+    # Enable memory optimizations
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.set_per_process_memory_fraction(0.9)
+        torch.cuda.memory.set_per_process_memory_fraction(0.9)
 
     # Load model and tokenizer if needed
     if tokenizer is None and base_model_name:
@@ -330,7 +430,15 @@ async def run_baseline_evaluation(model, tokenizer, base_model_name: str, data_f
                 trust_remote_code=True, 
                 use_cache=True, 
                 low_cpu_mem_usage=True, 
-                token=hf_token
+                token=hf_token,
+                # Add performance optimizations
+                offload_folder="offload",
+                offload_state_dict=True,
+                max_memory={0: "24GB"},
+                load_in_8bit=True,
+                use_flash_attention_2=True,
+                attn_implementation="flash_attention_2",
+                gradient_checkpointing=True
             )
             model.to(device)
         except Exception as e:
@@ -398,12 +506,9 @@ async def run_baseline_evaluation(model, tokenizer, base_model_name: str, data_f
             last_processed_global_idx = max(last_processed_global_idx, last_processed_global_idx_in_batch)
             processed_item_count += len(current_batch_df)
             
-            if run_batch_idx > 0 and run_batch_idx % 20 == 0:
-                clear_caches()
-                clear_response_cache()
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # Clear memory more frequently
+            if run_batch_idx > 0 and run_batch_idx % 10 == 0:  # Changed from 20 to 10
+                processor._clear_memory()
                 
     except KeyboardInterrupt:
         logger.warning("\n⚠️ User interrupted evaluation...")
@@ -441,7 +546,16 @@ if __name__ == "__main__":
             device_map="auto",
             trust_remote_code=True,
             use_cache=True,
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
+            # Add performance optimizations
+            offload_folder="offload",
+            offload_state_dict=True,
+            max_memory={0: "24GB"},  # Adjust based on your GPU memory
+            load_in_8bit=True,  # Enable 8-bit quantization
+            # Add additional optimizations
+            use_flash_attention_2=True,  # Enable Flash Attention 2
+            attn_implementation="flash_attention_2",  # Use Flash Attention 2 implementation
+            gradient_checkpointing=True  # Enable gradient checkpointing
         )
         
         asyncio.run(run_baseline_evaluation(

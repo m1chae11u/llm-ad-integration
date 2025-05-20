@@ -37,8 +37,7 @@ LLM Response:
     result = call_gemini_and_extract_json(prompt, keys=["H1", "explanation"])
     return {
         "H1": result.get("H1", 0),
-        "Helpfulness Explanation": result.get("explanation", ""),
-        "Helpfulness Score": result.get("H1", 0)
+        "Helpfulness Explanation": result.get("explanation", "")
     }
 
 async def judge_helpfulness_async(query, response):
@@ -78,6 +77,5 @@ LLM Response:
     result = await call_gemini_api(prompt, keys=["H1", "explanation"])
     return {
         "H1": result.get("H1", 0),
-        "Helpfulness Explanation": result.get("explanation", ""),
-        "Helpfulness Score": result.get("H1", 0)
+        "Helpfulness Explanation": result.get("explanation", "")
     }

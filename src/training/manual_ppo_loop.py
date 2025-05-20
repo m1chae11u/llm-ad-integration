@@ -65,11 +65,12 @@ def compute_advantages(reward, value):
     return reward - value
 
 class DataProcessor:
-    def __init__(self, model, tokenizer, device, checkpoint_base_dir: Path, batch_size=32, checkpoint_manager=None, optimizer=None, base_model_name=None, hf_token=None):
+    def __init__(self, model, tokenizer, device, checkpoint_base_dir: Path, batch_size=None, checkpoint_manager=None, optimizer=None, base_model_name=None, hf_token=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.batch_size = batch_size
+        # Get batch size from environment variable or use default
+        self.batch_size = batch_size or int(os.getenv("PPO_BATCH_SIZE", "64"))
         self.checkpoint_manager = checkpoint_manager
         self.optimizer = optimizer
         self.base_model_name = base_model_name
@@ -77,6 +78,18 @@ class DataProcessor:
         self.current_step = 0
         self.dataset_start_idx = 0
         self.checkpoint_base_dir = checkpoint_base_dir
+        
+        # Enable memory optimizations
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Set memory allocation strategy
+            torch.cuda.set_per_process_memory_fraction(0.9)  # Use 90% of available GPU memory
+            torch.cuda.memory.set_per_process_memory_fraction(0.9)
+        
+        # Initialize response cache
+        self.response_cache = {}
+        self.cache_size = 1000  # Maximum number of cached responses
         
         if self.checkpoint_manager is not None:
             self.model = self.checkpoint_manager.model
@@ -106,13 +119,17 @@ class DataProcessor:
         # Create headers for log files with batch information if they don't exist
         if not self.generation_log.exists() or os.path.getsize(self.generation_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "query", "ad_facts", "response_without_ad", "response_with_ad",
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "ad_id", "query", "ad_facts", "response_without_ad", "response_with_ad",
                 "generation_time", "token_count"
             ]).to_csv(self.generation_log, index=False)
         
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "query", "response_with_ad", 
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "ad_id", "query", "response_with_ad", 
+                "C1", "C2", "C3", "C4",  # Coherence subscores
+                "H1",  # Helpfulness subscore
+                "S1", "S2", "S3",  # Salience subscores
+                "detectability_cosine",  # Detectability score
                 "coherence_score", "helpfulness_score", "salience_score", "detectability_score", 
                 "coherence_explanation", "helpfulness_explanation", "salience_explanation",
                 "judging_time"
@@ -120,7 +137,7 @@ class DataProcessor:
         
         if not self.training_log.exists() or os.path.getsize(self.training_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "query", "response_with_ad", "reward", "loss", "training_time"
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "ad_id", "query", "response_with_ad", "reward", "loss", "training_time"
             ]).to_csv(self.training_log, index=False)
         
         # Initialize stats - default values
@@ -274,7 +291,9 @@ class DataProcessor:
                                 URL: {ad_facts['url']}
                                 Description: {ad_facts['description']}"""
                     
-                    with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+                    # Calculate optimal number of workers based on CPU cores
+                    num_workers = min(multiprocessing.cpu_count(), 4)  # Cap at 4 workers to prevent overload
+                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
                         future_coh = executor.submit(judge_coherence, query, response_with_ad)
                         future_help = executor.submit(judge_helpfulness, query, response_with_ad)
                         future_sal = executor.submit(judge_ad_salience, query, response_with_ad, ad_text)
@@ -303,12 +322,25 @@ class DataProcessor:
                         "response_without_ad": response_without_ad,
                         "response_with_ad": response_with_ad,
                         "reward": reward.item(),
-                        "scores": {
-                            "coherence": score_coh,
-                            "helpfulness": score_help,
-                            "salience": score_sal,
-                            "detectability": score_det
-                        }
+                        # Coherence subscores
+                        "C1": score_coh.get("C1", 0),
+                        "C2": score_coh.get("C2", 0),
+                        "C3": score_coh.get("C3", 0),
+                        "C4": score_coh.get("C4", 0),
+                        "coherence_score": score_coh.get("Coherence Score", 0),
+                        "coherence_explanation": score_coh.get("Coherence Explanation", ""),
+                        # Helpfulness subscore
+                        "H1": score_help.get("H1", 0),
+                        "helpfulness_score": score_help.get("Helpfulness Score", 0),
+                        "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
+                        # Salience subscores
+                        "S1": score_sal.get("S1", 0),
+                        "S2": score_sal.get("S2", 0),
+                        "S3": score_sal.get("S3", 0),
+                        "salience_score": score_sal.get("Ad Salience Score", 0),
+                        "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
+                        # Detectability score
+                        "detectability_cosine": score_det.get("detectability_cosine", 0)
                     })
                     
                 except Exception as e:
@@ -324,9 +356,8 @@ class DataProcessor:
 
     def process_batch(self, batch_data, batch_idx):
         """Process a batch of data."""
-        results = []
-        logger.info(f"🔄 Starting Run Batch {batch_idx} (approx. Global Batch { (self.dataset_start_idx + batch_idx * self.batch_size) // self.batch_size}) with {len(batch_data)} queries. Absolute start query for this run batch: {self.dataset_start_idx + batch_idx * self.batch_size}")
         batch_start_time = time.time()
+        results = []
         
         # Get the actual start index in the original dataset
         # Account for the dataset_start_idx offset
@@ -347,205 +378,60 @@ class DataProcessor:
                 "url": str(row['url']),
                 "description": str(row['ad_description']),
             }
-            # Attempt to get ad_source_id from a column named 'ad_index', default to 'N/A'
+            # Get both ad_source_id and ad_id from the dataset
             ad_source_id = str(row.get('ad_index', 'N/A'))
+            ad_id = str(row.get('ad_id', 'N/A'))  # Get the original ad_id
 
             # Log which query we're on in dataset
-            logger.info(f"🔄 Global Batch {current_query_position // self.batch_size} (Run Batch {batch_idx}) - Starting generation for query {idx} (dataset position: {current_query_position}, ad_source_id: {ad_source_id})")
+            logger.info(f"🔄 Global Batch {current_query_position // self.batch_size} (Run Batch {batch_idx}) - Starting generation for query {idx} (dataset position: {current_query_position}, ad_source_id: {ad_source_id}, ad_id: {ad_id})")
 
-            try:
-                # Stage 1: Generation
-                gen_start_time = time.time()
-                
-                with torch.no_grad():
-                    response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
-                
-                gen_time = time.time() - gen_start_time
-                token_count = len(self.tokenizer.encode(response_with_ad))
-                
-                # Log generation results
-                self.generation_log_buffer.append({
-                    "batch_idx": batch_idx, # This is the run-specific batch_idx
-                    "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
-                    "query_idx": idx,
-                    "ad_source_id": ad_source_id,
-                    "query": query,
-                    "ad_facts": json.dumps(ad_facts),
-                    "response_without_ad": response_without_ad,
-                    "response_with_ad": response_with_ad,
-                    "generation_time": gen_time,
-                    "token_count": token_count
-                })
-                
-                logger.info(f"✅ Batch {batch_idx} - Generation complete for query {idx} (dataset position: {current_query_position}) in {gen_time:.2f}s")
+            # Stage 1: Generation
+            gen_start_time = time.time()
+            with torch.no_grad():
+                response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+            gen_time = time.time() - gen_start_time
 
-                # Stage 2: Judging
-                logger.info(f"🔄 Batch {batch_idx} - Starting judging for query {idx} (dataset position: {current_query_position})")
-                judge_start_time = time.time()
-                
-                ad_text = f"""Product: {ad_facts['ad_product']}
-                            Brand: {ad_facts['brand']}
-                            URL: {ad_facts['url']}
-                            Description: {ad_facts['description']}"""
+            # Process the item
+            result = self._process_single_item(query, response_without_ad, response_with_ad, ad_facts, ad_source_id, ad_id, batch_idx, current_query_position)
+            if result:
+                results.append(result)
 
-                with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-                    future_coh = executor.submit(judge_coherence, query, response_with_ad)
-                    future_help = executor.submit(judge_helpfulness, query, response_with_ad)
-                    future_sal = executor.submit(judge_ad_salience, query, response_with_ad, ad_text)
-                    future_det = executor.submit(judge_detectability, response_with_ad, response_without_ad)
-
-                    score_coh = future_coh.result()
-                    score_help = future_help.result()
-                    score_sal = future_sal.result()
-                    score_det = future_det.result()
-
-                judge_time = time.time() - judge_start_time
-                
-                # Log the scores
-                logger.info(f"👨‍⚖️ Batch {batch_idx} - Query {idx} (Dataset: {current_query_position}) Judge Scores: \n" +
-                            f"   Coherence: {score_coh}\n" +
-                            f"   Helpfulness: {score_help}\n" +
-                            f"   Salience: {score_sal}\n" +
-                            f"   Detectability: {score_det}")
-
-                # Log judging results
-                self.judging_log_buffer.append({
-                    "batch_idx": batch_idx, # Run-specific
-                    "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
-                    "query_idx": idx,
-                    "ad_source_id": ad_source_id,
-                    "query": query,
-                    "response_with_ad": response_with_ad,
-                    "coherence_score": score_coh.get("Coherence Score", 0),
-                    "helpfulness_score": score_help.get("Helpfulness Score", 0),
-                    "salience_score": score_sal.get("Ad Salience Score", 0),
-                    "detectability_score": score_det.get("detectability_cosine", 0),
-                    "coherence_explanation": score_coh.get("Coherence Explanation", ""),
-                    "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
-                    "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
-                    "judging_time": judge_time
-                })
-                
-                logger.info(f"✅ Batch {batch_idx} - Judging complete for query {idx} (dataset position: {current_query_position}) in {judge_time:.2f}s")
-
-                # Stage 3: Training
-                logger.info(f"🔄 Batch {batch_idx} - Starting training for query {idx} (dataset position: {current_query_position})")
-                train_start_time = time.time()
-
-                input_ids = self.tokenizer(query, return_tensors="pt", truncation=True, max_length=384).input_ids.to(self.device)
-                response_ids = self.tokenizer(response_with_ad, return_tensors="pt", truncation=True, max_length=128).input_ids.to(self.device)[0]
-
-                if input_ids.shape[1] + response_ids.shape[0] > 512:
-                    logger.warning(f"⚠️ Batch {batch_idx} - Skipping: combined input too long for query {idx}")
-                    continue
-
-                input_plus_response = torch.cat([input_ids[0], response_ids])
-                inputs = input_plus_response.unsqueeze(0)
-                labels = input_plus_response[1:]
-
-                self.model.train()
-                logits = self.model(inputs).logits[0, :-1]
-                new_log_probs = F.log_softmax(logits, dim=-1)[torch.arange(len(labels)), labels].sum()
-                
-                # Compute reward
-                reward_values = [
-                    score_coh.get("Coherence Score", 0),
-                    score_help.get("Helpfulness Score", 0),
-                    score_sal.get("Ad Salience Score", 0),
-                    score_det.get("detectability_cosine", 0) or 0
-                ]
-                reward = torch.tensor(sum(reward_values) / len(reward_values) if reward_values else 0.0, dtype=torch.float32).to(self.device)
-                
-                loss = -new_log_probs * reward.detach()
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                self.model.eval()
-
-                train_time = time.time() - train_start_time
-                
-                # Log training results
-                self.training_log_buffer.append({
-                    "batch_idx": batch_idx, # Run-specific
-                    "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
-                    "query_idx": idx,
-                    "ad_source_id": ad_source_id,
-                    "query": query,
-                    "response_with_ad": response_with_ad,
-                    "reward": reward.item(),
-                    "loss": loss.item(),
-                    "training_time": train_time
-                })
-                
-                logger.info(f"✅ Batch {batch_idx} - Training complete for query {idx} (dataset position: {current_query_position}) in {train_time:.2f}s")
-
-                # Update statistics
-                self.update_stats(batch_idx, current_query_position, gen_time, judge_time, train_time, token_count, reward.item(), loss.item(), success=True)
-
-                results.append({
-                    "idx": idx,
-                    "query": query,
-                    "ad_facts": ad_facts,
-                    "response_without_ad": response_without_ad,
-                    "response_with_ad": response_with_ad,
-                    "reward": reward,
-                    "scores": {
-                        "coherence": score_coh,
-                        "helpfulness": score_help,
-                        "salience": score_sal,
-                        "detectability": score_det
-                    }
-                })
-                
-                # Save current position after every query (not just every 5)
-                # Create a small incremental checkpoint file to record last processed query
-                if hasattr(self, 'checkpoint_manager') and self.checkpoint_manager:
-                    try:
-                        # Save just the query position, not the full model (which is expensive)
-                        query_checkpoint = {
-                            "last_processed_query": int(current_query_position),
-                            "original_idx": int(idx),
-                            "batch_idx": batch_idx, # Run-specific batch_idx
-                            "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
-                            "timestamp": time.time()
-                        }
-                        
-                        # Save to a special file that's quick to update
-                        query_checkpoint_path = self.checkpoint_base_dir / "last_query_position.json"
-                        query_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(query_checkpoint_path, "w") as f:
-                            json.dump(query_checkpoint, f)
-                    except Exception as e:
-                        logger.error(f"Error saving query position checkpoint: {e}")
-                
-                # Also update the simple text file
-                last_position_path = self.checkpoint_base_dir / "last_processed_position.txt"
+            # Save current position after every query
+            if hasattr(self, 'checkpoint_manager') and self.checkpoint_manager:
                 try:
-                    with open(last_position_path, "w") as f:
-                        f.write(str(current_query_position))
+                    # Save just the query position, not the full model (which is expensive)
+                    query_checkpoint = {
+                        "last_processed_query": int(current_query_position),
+                        "original_idx": int(idx),
+                        "ad_source_id": ad_source_id,
+                        "ad_id": ad_id,
+                        "batch_idx": batch_idx, # Run-specific batch_idx
+                        "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
+                        "timestamp": time.time()
+                    }
+                    
+                    # Save to a special file that's quick to update
+                    query_checkpoint_path = self.checkpoint_base_dir / "last_query_position.json"
+                    query_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(query_checkpoint_path, "w") as f:
+                        json.dump(query_checkpoint, f)
                 except Exception as e:
-                    logger.error(f"Failed to save position: {e}")
-                
-                # Flush logs and save formal checkpoint every 5 examples
-                if len(results) % 5 == 0:
-                    logger.info(f"Saving incremental checkpoint at dataset position {current_query_position} (batch {batch_idx}, query idx {idx})")
-                    self._flush_logs()
-                    logger.info(f"Saved query position checkpoint: dataset position {current_query_position} (original idx {idx})")
-
+                    logger.error(f"Error saving query position checkpoint: {e}")
+            
+            # Also update the simple text file
+            last_position_path = self.checkpoint_base_dir / "last_processed_position.txt"
+            try:
+                with open(last_position_path, "w") as f:
+                    f.write(str(current_query_position))
             except Exception as e:
-                logger.error(f"❌ Batch {batch_idx} - Error processing query {idx}: {e}")
-                self.update_stats(batch_idx, current_query_position if 'current_query_position' in locals() else -1, 0, 0, 0, 0, 0, 0, success=False) # Pass current_query_position or a placeholder
-                continue
-
-            # Clear caches periodically
-            if len(results) % 10 == 0:
-                clear_caches()
-                clear_response_cache()
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                logger.error(f"Failed to save position: {e}")
+            
+            # Flush logs and save formal checkpoint every 5 examples
+            if len(results) % 5 == 0:
+                logger.info(f"Saving incremental checkpoint at dataset position {current_query_position} (batch {batch_idx}, query idx {idx})")
+                self._flush_logs()
+                logger.info(f"Saved query position checkpoint: dataset position {current_query_position} (original idx {idx})")
+                self._clear_memory()
 
         batch_time = time.time() - batch_start_time
         logger.info(f"✅ Completed batch {batch_idx} in {batch_time:.2f}s")
@@ -565,6 +451,185 @@ class DataProcessor:
         
         # Return final query position along with results
         return results, current_query_position
+
+    def _process_single_item(self, query, response_without_ad, response_with_ad, ad_facts, ad_source_id, ad_id, batch_idx, current_query_position):
+        """Process a single item in the batch."""
+        try:
+            # Stage 1: Generation logging
+            gen_time = 0  # Already generated in batch
+            token_count = len(self.tokenizer.encode(response_with_ad))
+            
+            # Log generation results
+            self.generation_log_buffer.append({
+                "batch_idx": batch_idx,
+                "global_batch_idx": current_query_position // self.batch_size,
+                "query_idx": current_query_position,
+                "ad_source_id": ad_source_id,
+                "ad_id": ad_id,
+                "query": query,
+                "ad_facts": json.dumps(ad_facts),
+                "response_without_ad": response_without_ad,
+                "response_with_ad": response_with_ad,
+                "generation_time": gen_time,
+                "token_count": token_count
+            })
+
+            # Stage 2: Judging
+            logger.info(f"🔄 Batch {batch_idx} - Starting judging for query {current_query_position}")
+            judge_start_time = time.time()
+            ad_text = f"""Product: {ad_facts['ad_product']}
+                        Brand: {ad_facts['brand']}
+                        URL: {ad_facts['url']}
+                        Description: {ad_facts['description']}"""
+
+            # Run judges in parallel
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                logger.info(f"🔄 Batch {batch_idx} - Running coherence judge for query {current_query_position}")
+                future_coh = executor.submit(judge_coherence, query, response_with_ad)
+                logger.info(f"🔄 Batch {batch_idx} - Running helpfulness judge for query {current_query_position}")
+                future_help = executor.submit(judge_helpfulness, query, response_with_ad)
+                logger.info(f"🔄 Batch {batch_idx} - Running salience judge for query {current_query_position}")
+                future_sal = executor.submit(judge_ad_salience, query, response_with_ad, ad_text)
+                logger.info(f"🔄 Batch {batch_idx} - Running detectability judge for query {current_query_position}")
+                future_det = executor.submit(judge_detectability, response_with_ad, response_without_ad)
+
+                score_coh = future_coh.result()
+                score_help = future_help.result()
+                score_sal = future_sal.result()
+                score_det = future_det.result()
+
+            judge_time = time.time() - judge_start_time
+            logger.info(f"✅ Batch {batch_idx} - Judging completed for query {current_query_position} in {judge_time:.2f}s")
+
+            # Log judging results immediately (ensure correct order and mapping)
+            self.judging_log_buffer.append({
+                "batch_idx": batch_idx,
+                "global_batch_idx": current_query_position // self.batch_size,
+                "query_idx": current_query_position,
+                "ad_source_id": ad_source_id,
+                "ad_id": ad_id,
+                "query": query,
+                "response_with_ad": response_with_ad,
+                # Coherence subscores
+                "C1": score_coh.get("C1", 0),
+                "C2": score_coh.get("C2", 0),
+                "C3": score_coh.get("C3", 0),
+                "C4": score_coh.get("C4", 0),
+                # Helpfulness subscore (binary)
+                "H1": score_help.get("H1", 0),
+                # Salience subscores
+                "S1": score_sal.get("S1", 0),
+                "S2": score_sal.get("S2", 0),
+                "S3": score_sal.get("S3", 0),
+                # Detectability score
+                "detectability_cosine": score_det.get("detectability_cosine", 0),
+                # Aggregate scores (for convenience)
+                "coherence_score": score_coh.get("Coherence Score", 0),
+                "helpfulness_score": score_help.get("H1", 0),  # Only H1
+                "salience_score": score_sal.get("Ad Salience Score", 0),
+                "detectability_score": score_det.get("detectability_score", 0),
+                # Explanations
+                "coherence_explanation": score_coh.get("Coherence Explanation", ""),
+                "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
+                "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
+                # Timing
+                "judging_time": judge_time
+            })
+            
+            # Flush judging logs immediately after judging
+            self._flush_logs()
+            logger.info(f"✅ Batch {batch_idx} - Judging logs flushed for query {current_query_position}")
+
+            # Stage 3: Training
+            logger.info(f"🔄 Batch {batch_idx} - Starting training for query {current_query_position}")
+            train_start_time = time.time()
+
+            input_ids = self.tokenizer(query, return_tensors="pt", truncation=True, max_length=384).input_ids.to(self.device)
+            response_ids = self.tokenizer(response_with_ad, return_tensors="pt", truncation=True, max_length=128).input_ids.to(self.device)[0]
+
+            if input_ids.shape[1] + response_ids.shape[0] > 512:
+                logger.warning(f"⚠️ Batch {batch_idx} - Skipping: combined input too long for query {current_query_position}")
+                return None
+
+            input_plus_response = torch.cat([input_ids[0], response_ids])
+            inputs = input_plus_response.unsqueeze(0)
+            labels = input_plus_response[1:]
+
+            self.model.train()
+            logits = self.model(inputs).logits[0, :-1]
+            new_log_probs = F.log_softmax(logits, dim=-1)[torch.arange(len(labels)), labels].sum()
+            
+            # Compute reward
+            reward_values = [
+                score_coh.get("Coherence Score", 0),
+                score_help.get("H1", 0),  # Changed from Helpfulness Score to H1
+                score_sal.get("Ad Salience Score", 0),
+                score_det.get("detectability_cosine", 0) or 0
+            ]
+            reward = torch.tensor(sum(reward_values) / len(reward_values) if reward_values else 0.0, dtype=torch.float32).to(self.device)
+            
+            loss = -new_log_probs * reward.detach()
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            self.model.eval()
+
+            train_time = time.time() - train_start_time
+            
+            # Log training results
+            self.training_log_buffer.append({
+                "batch_idx": batch_idx, # Run-specific
+                "global_batch_idx": current_query_position // self.batch_size, # Adding global batch index
+                "query_idx": current_query_position,
+                "ad_source_id": ad_source_id,
+                "ad_id": ad_id,
+                "query": query,
+                "response_with_ad": response_with_ad,
+                "reward": reward.item(),
+                "loss": loss.item(),
+                "training_time": train_time
+            })
+            
+            # Update statistics
+            self.update_stats(batch_idx, current_query_position, gen_time, judge_time, train_time, token_count, reward.item(), loss.item(), success=True)
+
+            return {
+                "idx": current_query_position,
+                "query": query,
+                "ad_facts": ad_facts,
+                "ad_source_id": ad_source_id,
+                "ad_id": ad_id,
+                "response_without_ad": response_without_ad,
+                "response_with_ad": response_with_ad,
+                "reward": reward,
+                "scores": {
+                    "coherence": score_coh,
+                    "helpfulness": score_help,
+                    "salience": score_sal,
+                    "detectability": score_det
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Batch {batch_idx} - Error processing query {current_query_position}: {e}")
+            self.update_stats(batch_idx, current_query_position if 'current_query_position' in locals() else -1, 0, 0, 0, 0, 0, 0, success=False)
+            return None
+
+    def _clear_memory(self):
+        """Aggressive memory cleanup."""
+        clear_caches()
+        clear_response_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        
+        # Clear response cache if it's too large
+        if len(self.response_cache) > self.cache_size:
+            self.response_cache.clear()
 
 def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: str, hf_token: str = None):
     device = model.device if model is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
@@ -590,7 +655,16 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
                 trust_remote_code=True,
                 use_cache=True,
                 low_cpu_mem_usage=True,
-                token=hf_token
+                token=hf_token,
+                # Add performance optimizations
+                offload_folder="offload",
+                offload_state_dict=True,
+                max_memory={0: "24GB"},  # Adjust based on your GPU memory
+                load_in_8bit=True,  # Enable 8-bit quantization
+                # Add additional optimizations
+                use_flash_attention_2=True,  # Enable Flash Attention 2
+                attn_implementation="flash_attention_2",  # Use Flash Attention 2 implementation
+                gradient_checkpointing=True  # Enable gradient checkpointing
             )
             try:
                 model.generation_config = GenerationConfig.from_pretrained(base_model_name, token=hf_token)
@@ -766,14 +840,15 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
             
             # Clear caches periodically (e.g., every 50 batches)
             if batch_idx > 0 and batch_idx % 50 == 0: # Adjusted frequency
-                clear_caches()
-                clear_response_cache()
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                processor._clear_memory()
         
     except KeyboardInterrupt:
         logger.info("\n⚠️ Stopping training...")
+        
+        # Flush logs immediately when interrupted
+        if processor:
+            logger.info("Flushing logs immediately after interruption...")
+            processor._flush_logs()
         
         # Try multiple sources to find the most reliable position
         current_position = None
