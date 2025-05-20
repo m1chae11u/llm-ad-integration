@@ -33,12 +33,12 @@ logger = logging.getLogger(__name__)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 class BaselineDataProcessor:
-    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=32):
+    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=2):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         # Get batch size from environment variable or use default
-        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "64"))
+        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "2"))
         self.dataset_start_idx = 0
         self.logs_base_dir = logs_base_dir
 
@@ -91,8 +91,8 @@ class BaselineDataProcessor:
                 # Salience subscores
                 "S1", "S2", "S3",
                 "salience_score", "salience_explanation",
-                # Detectability score
-                "detectability_cosine",
+                # Remove detectability
+                # "detectability_cosine",
                 "judging_time"
             ]).to_csv(self.judging_log, index=False)
         
@@ -265,7 +265,7 @@ class BaselineDataProcessor:
                 "coherence_explanation": score_coh.get("Coherence Explanation", ""),
                 # Helpfulness subscore
                 "H1": score_help.get("H1", 0),
-                "helpfulness_score": score_help.get("Helpfulness Score", 0),
+                "helpfulness_score": score_help.get("H1", 0),
                 "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
                 # Salience subscores
                 "S1": score_sal.get("S1", 0),
@@ -273,8 +273,6 @@ class BaselineDataProcessor:
                 "S3": score_sal.get("S3", 0),
                 "salience_score": score_sal.get("Ad Salience Score", 0),
                 "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
-                # Detectability score
-                "detectability_cosine": score_det.get("detectability_cosine", 0) if 'score_det' in locals() else 0,
                 "judging_time": judge_time
             })
 
@@ -435,11 +433,9 @@ async def run_baseline_evaluation(model, tokenizer, base_model_name: str, data_f
                 offload_folder="offload",
                 offload_state_dict=True,
                 max_memory={0: "24GB"},
-                load_in_8bit=True,
-                use_flash_attention_2=True,
-                attn_implementation="flash_attention_2",
-                gradient_checkpointing=True
+                load_in_8bit=True
             )
+            model.gradient_checkpointing_enable()
             model.to(device)
         except Exception as e:
             logger.error(f"Failed to load model {base_model_name}: {e}")
@@ -526,7 +522,7 @@ if __name__ == "__main__":
     
     data_file = os.getenv("DATA_FILE", "data/merged_queries_ads.csv")
     results_dir = os.getenv("RESULTS_DIR", "results/baseline_run_test")
-    batch_size = int(os.getenv("BATCH_SIZE", "40"))
+    batch_size = int(os.getenv("BATCH_SIZE", "2"))
     base_model_name = os.getenv("BASE_MODEL", BASE_MODEL)
     hf_token = os.getenv("HF_TOKEN", HF_TOKEN)
 
@@ -540,23 +536,19 @@ if __name__ == "__main__":
         
         logger.info(f"Loading model: {base_model_name}")
         model = AutoModelForCausalLM.from_pretrained(
-            base_model_name, 
-            token=hf_token, 
+            base_model_name,
+            token=hf_token,
             torch_dtype=torch.float16,
             device_map="auto",
             trust_remote_code=True,
             use_cache=True,
             low_cpu_mem_usage=True,
-            # Add performance optimizations
             offload_folder="offload",
             offload_state_dict=True,
-            max_memory={0: "24GB"},  # Adjust based on your GPU memory
-            load_in_8bit=True,  # Enable 8-bit quantization
-            # Add additional optimizations
-            use_flash_attention_2=True,  # Enable Flash Attention 2
-            attn_implementation="flash_attention_2",  # Use Flash Attention 2 implementation
-            gradient_checkpointing=True  # Enable gradient checkpointing
+            max_memory={0: "24GB"},
+            load_in_8bit=True
         )
+        model.gradient_checkpointing_enable()
         
         asyncio.run(run_baseline_evaluation(
             model=model,
