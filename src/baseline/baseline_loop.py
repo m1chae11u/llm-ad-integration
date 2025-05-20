@@ -17,6 +17,7 @@ from src.judge import (
     judge_coherence_async,
     judge_helpfulness_async,
     judge_ad_salience_async,
+    judge_detectability_async,
 )
 from src.generate.generator import generate_responses, clear_response_cache
 from src.judge.utils import clear_caches 
@@ -33,12 +34,14 @@ logger = logging.getLogger(__name__)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 class BaselineDataProcessor:
-    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=2):
+    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=20):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         # Get batch size from environment variable or use default
-        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "2"))
+        # Note: Larger batch sizes can improve throughput but require more GPU memory
+        # If you encounter OOM errors, try reducing the batch size to 8 or 4
+        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "20"))
         self.dataset_start_idx = 0
         self.logs_base_dir = logs_base_dir
 
@@ -81,19 +84,11 @@ class BaselineDataProcessor:
         
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
-                "run_batch_idx", "global_item_idx", "original_query_idx", "ad_id", "ad_index", "query", "response_with_ad", 
-                # Coherence subscores
-                "C1", "C2", "C3", "C4",
-                "coherence_score", "coherence_explanation",
-                # Helpfulness subscore
-                "H1",
-                "helpfulness_score", "helpfulness_explanation",
-                # Salience subscores
-                "S1", "S2", "S3",
-                "salience_score", "salience_explanation",
-                # Remove detectability
-                # "detectability_cosine",
-                "judging_time"
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "ad_id", "query", 
+                "response_with_ad", "response_without_ad", "C1", "C2", "C3", "C4", "H1", "S1", "S2", "S3",
+                "detectability_cosine", "coherence_score", "helpfulness_score", "salience_score",
+                "detectability_score", "coherence_explanation", "helpfulness_explanation",
+                "salience_explanation", "judging_time"
             ]).to_csv(self.judging_log, index=False)
         
         if not self.evaluation_log.exists() or os.path.getsize(self.evaluation_log) == 0:
@@ -177,7 +172,7 @@ class BaselineDataProcessor:
             }]).to_csv(self.stats_log, mode="a", header=False, index=False)
             logger.info(f"Stats updated at item {self.stats['total_items_processed']}. Avg Reward: {self.stats['avg_reward']:.4f}")
 
-    async def _run_judges_parallel(self, query, response_with_ad, ad_text, item_idx):
+    async def _run_judges_parallel(self, query, response_with_ad, response_without_ad, ad_text, item_idx):
         logger.info(f"Starting parallel judges for item {item_idx}...")
         try:
             # Run all judges concurrently
@@ -209,8 +204,8 @@ class BaselineDataProcessor:
         ad_index = str(query_data.get('ad_index', 'N/A'))
         logger.info(f"Processing: RunBatch {run_batch_idx}, GlobalItem {global_item_idx}, OriginalQueryIdx {original_query_idx}, AdID: {ad_id}, AdIndex: {ad_index}")
 
-        response_with_ad, gen_time, token_count = None, 0, 0
-        score_coh, score_help, score_sal = {}, {}, {}
+        response_with_ad, response_without_ad, gen_time, token_count = None, None, 0, 0
+        score_coh, score_help, score_sal, score_det = {}, {}, {}, {}
         judge_time = 0
         reward_value = 0.0
         success = False
@@ -220,7 +215,7 @@ class BaselineDataProcessor:
             logger.info(f"Generating response for item {global_item_idx}...")
             gen_start_time = time.time()
             with torch.no_grad():
-                _, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
             gen_time = time.time() - gen_start_time
             token_count = len(self.tokenizer.encode(response_with_ad))
             logger.info(f"Item {global_item_idx} - Response generated in {gen_time:.2f}s")
@@ -243,35 +238,41 @@ class BaselineDataProcessor:
             logger.info(f"Starting judging pipeline for item {global_item_idx}...")
             judge_start_time = time.time()
             ad_text = f"Product: {ad_facts['ad_product']}\nBrand: {ad_facts['brand']}\nURL: {ad_facts['url']}\nDescription: {ad_facts['description']}"
-            score_coh, score_help, score_sal = await self._run_judges_parallel(query, response_with_ad, ad_text, global_item_idx)
+            
+            # Run main judges
+            score_coh, score_help, score_sal = await self._run_judges_parallel(query, response_with_ad, response_without_ad, ad_text, global_item_idx)
+            
+            # Run detectability judge
+            score_det = await judge_detectability_async(response_with_ad, response_without_ad)
+            
             judge_time = time.time() - judge_start_time
             logger.info(f"Item {global_item_idx} - Judging completed in {judge_time:.2f}s")
             
             # Log judging results
             self.judging_log_buffer.append({
-                "run_batch_idx": run_batch_idx, 
-                "global_item_idx": global_item_idx, 
-                "original_query_idx": original_query_idx,
+                "batch_idx": run_batch_idx,
+                "global_batch_idx": global_item_idx,
+                "query_idx": original_query_idx,
+                "ad_source_id": ad_id,
                 "ad_id": ad_id,
-                "ad_index": ad_index,
-                "query": query, 
+                "query": query,
                 "response_with_ad": response_with_ad,
-                # Coherence subscores
+                "response_without_ad": response_without_ad,
                 "C1": score_coh.get("C1", 0),
                 "C2": score_coh.get("C2", 0),
                 "C3": score_coh.get("C3", 0),
                 "C4": score_coh.get("C4", 0),
-                "coherence_score": score_coh.get("Coherence Score", 0),
-                "coherence_explanation": score_coh.get("Coherence Explanation", ""),
-                # Helpfulness subscore
                 "H1": score_help.get("H1", 0),
-                "helpfulness_score": score_help.get("H1", 0),
-                "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
-                # Salience subscores
                 "S1": score_sal.get("S1", 0),
                 "S2": score_sal.get("S2", 0),
                 "S3": score_sal.get("S3", 0),
+                "detectability_cosine": score_det.get("detectability_cosine", 0),
+                "coherence_score": score_coh.get("Coherence Score", 0),
+                "helpfulness_score": score_help.get("Helpfulness Score", 0),
                 "salience_score": score_sal.get("Ad Salience Score", 0),
+                "detectability_score": score_det.get("detectability_cosine", 0),
+                "coherence_explanation": score_coh.get("Coherence Explanation", ""),
+                "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
                 "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
                 "judging_time": judge_time
             })
@@ -280,7 +281,8 @@ class BaselineDataProcessor:
             reward_values = [
                 score_coh.get("Coherence Score", 0), 
                 score_help.get("H1", 0),
-                score_sal.get("Ad Salience Score", 0)
+                score_sal.get("Ad Salience Score", 0),
+                score_det.get("detectability_cosine", 0)
             ]
             reward_value = sum(reward_values) / len(reward_values)
             logger.info(f"Item {global_item_idx} - Final reward: {reward_value:.2f}")
@@ -366,12 +368,12 @@ class BaselineDataProcessor:
         with torch.no_grad():
             responses = []
             for query, ad_facts in zip(queries, ad_facts_list):
-                _, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
-                responses.append(response_with_ad)
+                response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                responses.append((response_without_ad, response_with_ad))
 
         # Process items in parallel
         tasks = []
-        for i, (query, response_with_ad, ad_facts, ad_id, ad_index) in enumerate(zip(queries, responses, ad_facts_list, ad_ids, ad_indices)):
+        for i, (query, (response_without_ad, response_with_ad), ad_facts, ad_id, ad_index) in enumerate(zip(queries, responses, ad_facts_list, ad_ids, ad_indices)):
             global_item_idx = self.dataset_start_idx + (run_batch_idx * self.batch_size) + i
             task = self.process_single_item(i, {
                 'vague_query': query,
@@ -522,7 +524,7 @@ if __name__ == "__main__":
     
     data_file = os.getenv("DATA_FILE", "data/merged_queries_ads.csv")
     results_dir = os.getenv("RESULTS_DIR", "results/baseline_run_test")
-    batch_size = int(os.getenv("BATCH_SIZE", "2"))
+    batch_size = int(os.getenv("BATCH_SIZE", "20"))
     base_model_name = os.getenv("BASE_MODEL", BASE_MODEL)
     hf_token = os.getenv("HF_TOKEN", HF_TOKEN)
 

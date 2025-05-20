@@ -1,30 +1,6 @@
 {
-  "checkpoints": [
-    {
-      "step": 0,
-      "path": "checkpoints/ppo_llama/checkpoint_0",
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    }
-  ],
+  "checkpoints": [],
   "best_reward": -Infinity,
   "best_checkpoint": null,
-  "training_history": [
-    {
-      "step": 0,
-      "timestamp": 1747709775.1261172,
-      "metrics": {
-        "avg_reward": 0.0,
-        "avg_coherence": 0.0,
-        "avg_helpfulness": 0.0,
-        "avg_salience": 0.0,
-        "avg_detectability": 0.0
-      }
-    }
-  ]
+  "training_history": []
 }

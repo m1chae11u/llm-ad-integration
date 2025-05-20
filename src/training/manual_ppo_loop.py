@@ -125,12 +125,12 @@ class DataProcessor:
         
         if not self.judging_log.exists() or os.path.getsize(self.judging_log) == 0:
             pd.DataFrame(columns=[
-                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "ad_id", "query", "response_with_ad", 
+                "batch_idx", "global_batch_idx", "query_idx", "ad_source_id", "ad_id", "query", "response_with_ad", "response_without_ad",
                 "C1", "C2", "C3", "C4",  # Coherence subscores
                 "H1",  # Helpfulness subscore
                 "S1", "S2", "S3",  # Salience subscores
                 "detectability_cosine",  # Detectability score
-                "coherence_score", "helpfulness_score", "salience_score", "detectability_score", 
+                "coherence_score", "helpfulness_score", "salience_score",
                 "coherence_explanation", "helpfulness_explanation", "salience_explanation",
                 "judging_time"
             ]).to_csv(self.judging_log, index=False)
@@ -510,6 +510,7 @@ class DataProcessor:
                 "ad_id": ad_id,
                 "query": query,
                 "response_with_ad": response_with_ad,
+                "response_without_ad": response_without_ad,
                 # Coherence subscores
                 "C1": score_coh.get("C1", 0),
                 "C2": score_coh.get("C2", 0),
@@ -527,7 +528,6 @@ class DataProcessor:
                 "coherence_score": score_coh.get("Coherence Score", 0),
                 "helpfulness_score": score_help.get("H1", 0),  # Only H1
                 "salience_score": score_sal.get("Ad Salience Score", 0),
-                "detectability_score": score_det.get("detectability_score", 0),
                 # Explanations
                 "coherence_explanation": score_coh.get("Coherence Explanation", ""),
                 "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
