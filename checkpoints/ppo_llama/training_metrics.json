@@ -10,14 +10,148 @@
         "avg_salience": 0.0,
         "avg_detectability": 0.0
       }
+    },
+    {
+      "step": 310,
+      "path": "checkpoints/ppo_llama/checkpoint_310",
+      "metrics": {
+        "avg_reward": 1.1443953095003963,
+        "avg_coherence": 1.46875,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 2.703125,
+        "avg_detectability": 0.14008125000000002,
+        "validation_avg_reward": 1.0815797472000122
+      }
+    },
+    {
+      "step": 311,
+      "path": "checkpoints/ppo_llama/checkpoint_311",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 323,
+      "path": "checkpoints/ppo_llama/checkpoint_323",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 327,
+      "path": "checkpoints/ppo_llama/checkpoint_327",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 386,
+      "path": "checkpoints/ppo_llama/checkpoint_386",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 640,
+      "path": "checkpoints/ppo_llama/checkpoint_640",
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
     }
   ],
-  "best_reward": -Infinity,
-  "best_checkpoint": null,
+  "best_reward": 1.0815797472000122,
+  "best_checkpoint": "checkpoints/ppo_llama/checkpoint_310",
   "training_history": [
     {
       "step": 29,
       "timestamp": 1747719810.4160416,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 310,
+      "timestamp": 1747779926.5253112,
+      "metrics": {
+        "avg_reward": 1.1443953095003963,
+        "avg_coherence": 1.46875,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 2.703125,
+        "avg_detectability": 0.14008125000000002,
+        "validation_avg_reward": 1.0815797472000122
+      }
+    },
+    {
+      "step": 311,
+      "timestamp": 1747780216.0034814,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 323,
+      "timestamp": 1747780649.465759,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 327,
+      "timestamp": 1747781354.5220768,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 386,
+      "timestamp": 1747783049.125479,
+      "metrics": {
+        "avg_reward": 0.0,
+        "avg_coherence": 0.0,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 0.0,
+        "avg_detectability": 0.0
+      }
+    },
+    {
+      "step": 640,
+      "timestamp": 1747882708.3581023,
       "metrics": {
         "avg_reward": 0.0,
         "avg_coherence": 0.0,

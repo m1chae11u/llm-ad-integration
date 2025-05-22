@@ -70,7 +70,7 @@ class DataProcessor:
         self.tokenizer = tokenizer
         self.device = device
         # Get batch size from environment variable or use default
-        self.batch_size = batch_size or int(os.getenv("PPO_BATCH_SIZE", "64"))
+        self.batch_size = batch_size or int(os.getenv("PPO_BATCH_SIZE", "512"))
         self.checkpoint_manager = checkpoint_manager
         self.optimizer = optimizer
         self.base_model_name = base_model_name
