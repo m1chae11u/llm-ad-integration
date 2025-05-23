@@ -250,7 +250,7 @@ class BaselineDataProcessor:
                 coherence_task, helpfulness_task, salience_task
             )
             
-            logger.info(f"Item {item_idx} - Judges completed. Scores - Coherence: {score_coh.get('Coherence Score', 0)}, Helpfulness: {score_help.get('Helpfulness Score', 0)}, Salience: {score_sal.get('Ad Salience Score', 0)}")
+            logger.info(f"Item {item_idx} - Judges completed. Scores - Coherence: {score_coh.get('Coherence Score', 0)}, Helpfulness: {score_help.get('H1', 0)}, Salience: {score_sal.get('Ad Salience Score', 0)}")
             return score_coh, score_help, score_sal
         except Exception as e:
             logger.error(f"Error in parallel judges for item {item_idx}: {e}", exc_info=True)
