@@ -21,10 +21,22 @@
         "avg_salience": 2.7,
         "avg_detectability": 0.14590299999999998
       }
+    },
+    {
+      "step": 377,
+      "path": "checkpoints/ppo_llama/checkpoint_377",
+      "metrics": {
+        "avg_reward": 6.683985991477966,
+        "avg_coherence": 3.76,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 2.58,
+        "avg_detectability": 0.14398599999999995,
+        "validation_avg_reward": 6.654370996952057
+      }
     }
   ],
-  "best_reward": -Infinity,
-  "best_checkpoint": null,
+  "best_reward": 6.654370996952057,
+  "best_checkpoint": "checkpoints/ppo_llama/checkpoint_377",
   "training_history": [
     {
       "step": 1,
@@ -46,6 +58,18 @@
         "avg_helpfulness": 0.0,
         "avg_salience": 2.7,
         "avg_detectability": 0.14590299999999998
+      }
+    },
+    {
+      "step": 377,
+      "timestamp": 1748035194.213546,
+      "metrics": {
+        "avg_reward": 6.683985991477966,
+        "avg_coherence": 3.76,
+        "avg_helpfulness": 0.0,
+        "avg_salience": 2.58,
+        "avg_detectability": 0.14398599999999995,
+        "validation_avg_reward": 6.654370996952057
       }
     }
   ]
