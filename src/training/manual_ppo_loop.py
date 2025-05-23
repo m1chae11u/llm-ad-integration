@@ -132,7 +132,7 @@ class DataProcessor:
                 "detectability_cosine",  # Detectability score
                 "coherence_score", "helpfulness_score", "salience_score",
                 "coherence_explanation", "helpfulness_explanation", "salience_explanation",
-                "judging_time"
+                "judging_time", "total_reward"  # Add total_reward column
             ]).to_csv(self.judging_log, index=False)
         
         if not self.training_log.exists() or os.path.getsize(self.training_log) == 0:
@@ -311,7 +311,7 @@ class DataProcessor:
                         score_sal.get("Ad Salience Score", 0),
                         score_det.get("detectability_cosine", 0) or 0
                     ]
-                    reward = torch.tensor(sum(reward_values) / len(reward_values) if reward_values else 0.0, dtype=torch.float32).to(self.device)
+                    reward = torch.tensor(sum(reward_values), dtype=torch.float32).to(self.device)
                     
                     # For validation, we don't need to compute loss
 
@@ -533,7 +533,8 @@ class DataProcessor:
                 "helpfulness_explanation": score_help.get("Helpfulness Explanation", ""),
                 "salience_explanation": score_sal.get("Ad Salience Explanation", ""),
                 # Timing
-                "judging_time": judge_time
+                "judging_time": judge_time,
+                "total_reward": sum([score_coh.get("Coherence Score", 0), score_help.get("H1", 0), score_sal.get("Ad Salience Score", 0), score_det.get("detectability_cosine", 0) or 0])  # Add total reward to the buffer
             })
             
             # Flush judging logs immediately after judging
@@ -566,7 +567,8 @@ class DataProcessor:
                 score_sal.get("Ad Salience Score", 0),
                 score_det.get("detectability_cosine", 0) or 0
             ]
-            reward = torch.tensor(sum(reward_values) / len(reward_values) if reward_values else 0.0, dtype=torch.float32).to(self.device)
+            total_reward = sum(reward_values)
+            reward = torch.tensor(total_reward, dtype=torch.float32).to(self.device)
             
             loss = -new_log_probs * reward.detach()
 
@@ -807,7 +809,7 @@ def run_manual_ppo(model, tokenizer, base_model_name: str, checkpoint_dir_str: s
         validation_data = pd.DataFrame() # Empty dataframe if no validation data
         logger.info("No validation data to sample.")
     
-    processor = DataProcessor(model, tokenizer, device, checkpoint_base_dir=base_dir, checkpoint_manager=checkpoint_manager, optimizer=optimizer, base_model_name=base_model_name, hf_token=hf_token)
+    processor = DataProcessor(model, tokenizer, device, checkpoint_base_dir=base_dir, checkpoint_manager=checkpoint_manager, optimizer=optimizer, base_model_name=base_model_name, hf_token=hf_token, batch_size=100)
     processor.dataset_start_idx = start_idx
     
     try:
