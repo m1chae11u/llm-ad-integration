@@ -1,6 +1,6 @@
 from .utils import call_gemini_and_extract_json, call_gemini_api
 
-def judge_coherence(response, query):
+def judge_coherence(query, response):
     prompt = f"""
 SYSTEM
 You are an impartial evaluator.
@@ -62,7 +62,7 @@ LLM Response:
         "Coherence Score": total
     }
 
-async def judge_coherence_async(response, query):
+async def judge_coherence_async(query, reponse):
     prompt = f"""
 SYSTEM
 You are an impartial evaluator.
