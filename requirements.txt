@@ -143,3 +143,5 @@ xxhash>=3.5.0
 pyarrow>=20.0.0
 multiprocess>=0.70.16
 dill>=0.3.8
+bitsandbytes
+hf_xet

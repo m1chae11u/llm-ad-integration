@@ -62,7 +62,7 @@ LLM Response:
         "Coherence Score": total
     }
 
-async def judge_coherence_async(query, reponse):
+async def judge_coherence_async(query, response):
     prompt = f"""
 SYSTEM
 You are an impartial evaluator.

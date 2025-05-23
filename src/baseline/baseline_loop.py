@@ -35,11 +35,11 @@ logger = logging.getLogger(__name__)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 class BaselineDataProcessor:
-    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=2):
+    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=20):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "2"))
+        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "20"))
         self.dataset_start_idx = 0
         self.logs_base_dir = logs_base_dir
 
@@ -595,7 +595,7 @@ if __name__ == "__main__":
     
     data_file = os.getenv("DATA_FILE", "data/merged_queries_ads.csv")
     results_dir = os.getenv("RESULTS_DIR", "results/baseline_run_test")
-    batch_size = int(os.getenv("BATCH_SIZE", "2"))
+    batch_size = int(os.getenv("BATCH_SIZE", "20"))
     base_model_name = os.getenv("BASE_MODEL", BASE_MODEL)
     hf_token = os.getenv("HF_TOKEN", HF_TOKEN)
 
