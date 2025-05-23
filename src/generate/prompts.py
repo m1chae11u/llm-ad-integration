@@ -12,6 +12,7 @@ GUIDELINES:
 - Maintain a smooth, natural flow — avoid sounding scripted or mechanical
 
 STRICT RULES:
+- DO NOT repeat the user's question in your response
 - DO NOT include any internal thinking, reasoning, or planning in your response
 - DO NOT include system messages, notes to self, or any formatting tags
 - DO NOT explain your thought process
