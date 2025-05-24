@@ -1,0 +1,1 @@
+batch_idx,query,ad_facts,response_without_ad,response_with_ad,generation_time,token_count

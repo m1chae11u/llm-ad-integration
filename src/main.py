@@ -73,7 +73,13 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
     gc.collect()
     
-    model, tokenizer, hf_token = load_model_and_tokenizer()
-    # Let run_manual_ppo handle checkpoint management and definitive model loading
-    run_manual_ppo(model, tokenizer, base_model_name=BASE_MODEL, checkpoint_dir_str=CHECKPOINT_DIR, hf_token=hf_token) # Pass CHECKPOINT_DIR
+    # Load Hugging Face token
+    hf_token = os.getenv("HF_TOKEN")
+    # Run manual PPO training loop
+    run_manual_ppo(
+        BASE_MODEL,
+        DATA_FILE,
+        CHECKPOINT_DIR,
+        hf_token=hf_token
+    )
     
