@@ -1,6 +1,6 @@
-# File: src/training/manual_ppo_loop.py
-
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import sys
 import json
 import gc
@@ -8,6 +8,7 @@ import time
 import signal
 import logging
 import asyncio
+import copy
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -15,10 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 import pandas as pd
 from tqdm import tqdm
-from transformers import AutoTokenizer, GenerationConfig, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, GenerationConfig
 from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead, create_reference_model
 from trl.core import LengthSampler
 from datasets import Dataset as HFDataset
+import torch.nn as nn
 
 from src.generate.generator import generate_responses, clear_response_cache
 from src.judge.utils import clear_caches
@@ -173,27 +175,26 @@ def run_manual_ppo(
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     policy = AutoModelForCausalLMWithValueHead.from_pretrained(
-        model_name, device_map="auto", torch_dtype=torch.float16,
-        trust_remote_code=True, token=hf_token
+        model_name, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True, token=hf_token
     ).to(DEVICE)
-
+    # Create a separate value model instance for PPOTrainer
     value_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        model_name, trust_remote_code=True, token=hf_token
+        model_name, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True, token=hf_token
     ).to(DEVICE)
+    # Expose backbone prefix, backbone module, and score method for the PPO trainer
+    value_model.base_model_prefix = value_model.pretrained_model.base_model_prefix
+    # attach the actual backbone module so getattr(wrapper, base_model_prefix) finds it
+    setattr(value_model, value_model.base_model_prefix, value_model.pretrained_model.model)
+    # attach a score method that uses the v_head
+    value_model.score = lambda hidden_states: value_model.v_head(hidden_states).squeeze(-1)
 
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, trust_remote_code=True, token=hf_token, num_labels=1
-    ).to(DEVICE)
+    # Dummy reward model to satisfy PPOTrainer (we feed actual rewards manually)
+    dummy_reward = nn.Identity().to(DEVICE)
 
     # ensure generation_config exists
     if not hasattr(policy, "generation_config"):
         policy.generation_config = GenerationConfig.from_pretrained(model_name, token=hf_token)
     policy.generation_config.eos_token_id = tokenizer.eos_token_id
-
-    ref = create_reference_model(policy).to(DEVICE)
-    ref.eval()
-    for p in ref.parameters():
-        p.requires_grad = False 
 
     ppo_cfg = PPOConfig(
         output_dir=str(out_dir),
@@ -211,10 +212,10 @@ def run_manual_ppo(
         args=ppo_cfg,
         processing_class=tokenizer,
         model=policy,
-        ref_model=ref,
-        reward_model=reward_model,
+        ref_model=None,
+        reward_model=dummy_reward,
         train_dataset=hf_ds,
-        value_model=value_model
+        value_model=value_model,
     )
 
     length_sampler = LengthSampler(32, 128)
@@ -249,6 +250,10 @@ def run_manual_ppo(
                 no_ads.append(no_ad)
                 with_ads.append(with_ad)
             gen_time_each = (time.time() - t0) / len(records)
+
+            # inject the no-ad baseline into each record so compute_rewards can see it
+            for idx, r in enumerate(records):
+                r["response_without_ad"] = no_ads[idx]
 
             # 2) log generation
             for idx, r in enumerate(records):

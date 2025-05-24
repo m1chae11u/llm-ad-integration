@@ -1,7 +1,7 @@
 import os
 import json
 import re
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, OpenAIError
 import functools
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -50,17 +50,30 @@ session.mount("http://", adapter)
 session.mount("https://", adapter)
 
 def get_embedding(text: str, model: str = "text-embedding-ada-002") -> np.ndarray:
-    """Get embedding for a single text using OpenAI's API."""
-    try:
-        response = embedding_client.embeddings.create(
-            model=model,
-            input=[text]
-        )
-        return np.array(response.data[0].embedding)
-    except Exception as e:
-        print(f"Error getting embedding: {e}")
-        # Return a random vector as fallback to avoid zero similarity
-        return np.random.randn(1536) / np.sqrt(1536)  # Normalized random vector
+    """Get embedding for a single text using OpenAI's API, retrying on rate limits."""
+    # Throttle requests to avoid hitting API rate limits
+    time.sleep(0.2)
+    max_retries = 5
+    backoff = 1.0
+    for attempt in range(max_retries):
+        try:
+            response = embedding_client.embeddings.create(
+                model=model,
+                input=[text]
+            )
+            return np.array(response.data[0].embedding)
+        except RateLimitError as e:
+            print(f"Rate limit exceeded, retrying in {backoff}s... (attempt {attempt+1}/{max_retries})")
+            time.sleep(backoff)
+            backoff *= 2
+        except OpenAIError as e:
+            print(f"OpenAI API error: {e}")
+            break
+        except Exception as e:
+            print(f"Unexpected error getting embedding: {e}")
+            break
+    # Fallback to random vector to avoid blocking downstream logic
+    return np.random.randn(1536) / np.sqrt(1536)
 
 def get_cache_key(func_name: str, *args, **kwargs) -> str:
     """Generate a cache key from function name and arguments."""
@@ -91,7 +104,7 @@ def cache_result(ttl_seconds: int = 3600):
     return decorator
 
 def batch_get_embeddings(texts: List[str], batch_size: int = 32, max_workers: int = 10) -> List[np.ndarray]:
-    """Get embeddings for multiple texts in parallel batches."""
+    """Get embeddings for multiple texts in parallel batches (serial by default)."""
     results = [None] * len(texts)
     
     def process_text(idx: int, text: str) -> None:
@@ -103,8 +116,8 @@ def batch_get_embeddings(texts: List[str], batch_size: int = 32, max_workers: in
             _embedding_cache[cache_key] = embedding
             results[idx] = embedding
     
-    # Process texts in parallel batches
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # Limit parallel embedding threads to avoid exceeding API rate limits
+    with ThreadPoolExecutor(max_workers=1) as executor:
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
             futures = [
@@ -211,3 +224,8 @@ def parallel_judge_responses(responses: List[Dict[str, str]], max_workers: int =
     """
     # Use asyncio to run parallel API calls
     return asyncio.run(async_parallel_judge_responses(responses)) 
+
+
+
+    ## note: the embedding API is rate-limited, so we need to throttle requests
+    ## the current version of ppo doesnt support step() with a reward model. willl try to figure out a way to do this. 
