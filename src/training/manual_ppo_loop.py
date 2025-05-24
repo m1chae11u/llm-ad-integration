@@ -327,3 +327,7 @@ def run_manual_ppo(
     })
     flush_logs()
     logger.info("✅ PPO training complete.")
+
+
+    ## note: the embedding API is rate-limited, so we need to throttle requests
+    ## the current version of ppo doesnt support step() with a reward model. willl try to figure out a way to do this. 
