@@ -35,11 +35,11 @@ logger = logging.getLogger(__name__)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 class BaselineDataProcessor:
-    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=20):
+    def __init__(self, model, tokenizer, device, logs_base_dir: Path, batch_size=50):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "20"))
+        self.batch_size = batch_size or int(os.getenv("BASELINE_BATCH_SIZE", "50"))
         self.dataset_start_idx = 0
         self.logs_base_dir = logs_base_dir
 
@@ -51,12 +51,12 @@ class BaselineDataProcessor:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            # Reduce GPU memory fraction to 40% to allow for other processes
-            torch.cuda.set_per_process_memory_fraction(0.4)
-            torch.cuda.memory.set_per_process_memory_fraction(0.4)
+            # Reduce GPU memory fraction to 30% to allow for larger batches
+            torch.cuda.set_per_process_memory_fraction(0.3)
+            torch.cuda.memory.set_per_process_memory_fraction(0.3)
             # Set lower priority for GPU operations
             torch.cuda.set_device(0)
-            torch.cuda.set_per_process_memory_fraction(0.4, 0)
+            torch.cuda.set_per_process_memory_fraction(0.3, 0)
             # Enable memory efficient attention
             if hasattr(self.model, 'config'):
                 self.model.config.use_cache = False
@@ -256,6 +256,18 @@ class BaselineDataProcessor:
             logger.error(f"Error in parallel judges for item {item_idx}: {e}", exc_info=True)
             raise
 
+    async def _generate_response_async(self, query, ad_facts, item_idx):
+        """Generate response asynchronously for a single item."""
+        logger.info(f"Generating response for item {item_idx}...")
+        try:
+            with torch.no_grad():
+                response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+            token_count = len(self.tokenizer.encode(response_with_ad))
+            return response_with_ad, token_count
+        except Exception as e:
+            logger.error(f"Error generating response for item {item_idx}: {e}", exc_info=True)
+            raise
+
     async def process_single_item(self, original_query_idx, query_data, run_batch_idx, global_item_idx):
         query = str(query_data['vague_query'])
         ad_facts = {
@@ -420,16 +432,21 @@ class BaselineDataProcessor:
             ad_ids.append(str(row.get('ad_id', 'N/A')))
             ad_indices.append(str(row.get('ad_index', 'N/A')))
 
-        # Batch generate responses
-        with torch.no_grad():
-            responses = []
-            for query, ad_facts in zip(queries, ad_facts_list):
-                response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
-                responses.append(response_with_ad)
+        # Generate responses in parallel
+        generation_tasks = []
+        for i, (query, ad_facts) in enumerate(zip(queries, ad_facts_list)):
+            global_item_idx = self.dataset_start_idx + (run_batch_idx * self.batch_size) + i
+            task = self._generate_response_async(query, ad_facts, global_item_idx)
+            generation_tasks.append(task)
+        
+        # Wait for all generations to complete
+        generation_results = await asyncio.gather(*generation_tasks)
+        responses = [result[0] for result in generation_results]
+        token_counts = [result[1] for result in generation_results]
 
         # Process items in parallel with larger batch size
         tasks = []
-        for i, (query, response_with_ad, ad_facts, ad_id, ad_index) in enumerate(zip(queries, responses, ad_facts_list, ad_ids, ad_indices)):
+        for i, (query, response_with_ad, ad_facts, ad_id, ad_index, token_count) in enumerate(zip(queries, responses, ad_facts_list, ad_ids, ad_indices, token_counts)):
             global_item_idx = self.dataset_start_idx + (run_batch_idx * self.batch_size) + i
             task = self.process_single_item(i, {
                 'vague_query': query,
@@ -493,7 +510,7 @@ async def run_baseline_evaluation(model, tokenizer, base_model_name: str, data_f
                 token=hf_token,
                 offload_folder="offload",
                 offload_state_dict=True,
-                max_memory={0: "12GB"},  # Reduced from 24GB
+                max_memory={0: "16GB"},  # Adjusted for larger batches
                 load_in_8bit=True
             )
             model.gradient_checkpointing_enable()
@@ -595,7 +612,7 @@ if __name__ == "__main__":
     
     data_file = os.getenv("DATA_FILE", "data/merged_queries_ads.csv")
     results_dir = os.getenv("RESULTS_DIR", "results/baseline_run_test")
-    batch_size = int(os.getenv("BATCH_SIZE", "20"))
+    batch_size = int(os.getenv("BATCH_SIZE", "50"))
     base_model_name = os.getenv("BASE_MODEL", BASE_MODEL)
     hf_token = os.getenv("HF_TOKEN", HF_TOKEN)
 
@@ -618,7 +635,7 @@ if __name__ == "__main__":
             low_cpu_mem_usage=True,
             offload_folder="offload",
             offload_state_dict=True,
-            max_memory={0: "24GB"},
+            max_memory={0: "16GB"},  # Adjusted for larger batches
             load_in_8bit=True
         )
         model.gradient_checkpointing_enable()
