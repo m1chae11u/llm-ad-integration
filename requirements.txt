@@ -146,3 +146,4 @@ dill>=0.3.8
 bitsandbytes
 hf_xet
 trl
+llamafactory
