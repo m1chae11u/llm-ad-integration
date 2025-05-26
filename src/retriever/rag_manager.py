@@ -133,7 +133,7 @@ Use Cases: {', '.join(ad['use_cases'])}"""
         """Enhance ad context with relevant information from similar successful ads."""
         # Get relevant ads similar to the current one
         ad_query = self._create_rich_ad_text(ad_facts)
-        similar_ads = self.get_relevant_ads(ad_query, k=3)
+        similar_ads = self.get_relevant_ads(ad_query, k=10)
         
         # Extract and merge useful information from similar ads
         enhanced_facts = ad_facts.copy()
