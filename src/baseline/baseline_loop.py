@@ -261,7 +261,7 @@ class BaselineDataProcessor:
         logger.info(f"Generating response for item {item_idx}...")
         try:
             with torch.no_grad():
-                response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
             token_count = len(self.tokenizer.encode(response_with_ad))
             return response_with_ad, token_count
         except Exception as e:
@@ -292,7 +292,7 @@ class BaselineDataProcessor:
             logger.info(f"Generating response for item {global_item_idx}...")
             gen_start_time = time.time()
             with torch.no_grad():
-                response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
+                response_without_ad, response_with_ad = generate_responses(query, ad_facts, self.model, self.tokenizer)
             gen_time = time.time() - gen_start_time
             token_count = len(self.tokenizer.encode(response_with_ad))
             logger.info(f"Item {global_item_idx} - Response generated in {gen_time:.2f}s")
