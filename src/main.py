@@ -5,7 +5,7 @@ import pandas as pd
 from pathlib import Path
 
 from config import BASE_MODEL, HF_TOKEN, DATA_FILE
-from training.ppo_training import make_trainer, TRAINING_LOGS, run_ppo
+from training.ppo_training import make_trainer, TRAINING_LOGS
 
 if __name__ == "__main__":
     # 1) Read your CSV of queries + ad facts
@@ -36,15 +36,29 @@ if __name__ == "__main__":
         trainer.training_args.resume_from_checkpoint = str(last_ckpt)
     else:
         trainer.training_args.resume_from_checkpoint = None
+        print("⏺ No checkpoint found, starting fresh PPO training")
 
-    # 3) Run PPO via llama-factory's run_ppo function
-    run_ppo(
-        trainer.model_args,
-        trainer.data_args,
-        trainer.training_args,
-        trainer.finetuning_args,
-        trainer.generating_args,
-    )
+    # 3) Run PPO training loop
+    print("⏱ Starting PPO training...")
+    try:
+        trainer.ppo_train(resume_from_checkpoint=trainer.training_args.resume_from_checkpoint)
+    except ValueError as e:
+        if "will be supported in the future version" in str(e):
+            print(f"⚠️ {e}. Running PPO without resume.")
+            trainer.ppo_train()
+        else:
+            raise
+    except KeyboardInterrupt:
+        print("⚠️ Training interrupted. Saving checkpoint before exit…")
+        trainer.save_model()
+        sys.exit(0)
+    else:
+        trainer.save_model()
+        try:
+            trainer.save_state()
+        except Exception:
+            pass
+        print("🏁 PPO training complete")
 
     # 4) Dump your judging logs in output_dir
     output_dir = Path(trainer.training_args.output_dir)

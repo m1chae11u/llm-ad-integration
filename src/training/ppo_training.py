@@ -25,6 +25,7 @@ import pandas as pd
 from pathlib import Path
 import sys  # for handling interrupt and exit
 from config import DATA_FILE
+import os
 # Suppress deprecation warnings about Trainer.tokenizer
 import warnings
 warnings.filterwarnings(
@@ -372,22 +373,25 @@ def make_trainer(
     ds = load_dataset("csv", data_files={"train": data_path})["train"]
     # Add sample index for each example so we can align ad_facts
     ds = ds.map(lambda examples, idx: {"idx": idx}, with_indices=True)
-
-    # Tokenize the "vague_query" field
+    # Define the tokenize function for the vague_query field
     def tokenize_fn(examples):
-        # Tokenize queries and preserve dataset idx for ad alignment
         tokenized = tokenizer(
             examples["vague_query"],
             truncation=True,
-            padding="max_length",  # or "longest"
+            padding="max_length",
             max_length=512,
         )
-        # Propagate original dataset index
         tokenized["idx"] = examples.get("idx")
         return tokenized
-
-    ds = ds.map(tokenize_fn, batched=True)
-    # ds = ds.remove_columns(["vague_query", "ad_product", "brand", "url", "ad_description"])
+    # Inform user and tokenize dataset (this may take some time)
+    print(f"ℹ️ Loaded {len(ds)} raw examples. Tokenizing dataset (this may take some time)...")
+    ds = ds.map(
+        tokenize_fn,
+        batched=True,
+        num_proc=os.cpu_count() or 1,
+        desc="Tokenizing dataset",
+    )
+    print("✅ Dataset tokenization complete.")
 
     # — build a pad collator for batches —
     collator = PPODataCollator(tokenizer)
@@ -396,7 +400,11 @@ def make_trainer(
 
     # — build all of your dataclass args —
     model_args      = ModelArguments(   model_name_or_path=model_name, trust_remote_code=True, hf_hub_token=hf_token)
-    data_args       = DataArguments(    template="default" )
+    data_args       = DataArguments(
+        template="default",
+        dataset=Path(data_path).name,
+        dataset_dir=str(Path(data_path).parent),
+    )
     training_args   = TrainingArguments(
         output_dir="logs/ppo_run",
         per_device_train_batch_size=4,
@@ -409,9 +417,10 @@ def make_trainer(
     generating_args = GeneratingArguments(
         do_sample=False,
         max_new_tokens=512,
-        temperature=1.0,
-        top_k=0,
-        top_p=1.0,
+        temperature=0.7,
+        top_k=50,
+        top_p=0.95,
+        repetition_penalty=1.2,
     )
 
 
