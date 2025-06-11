@@ -12,6 +12,12 @@ from llamafactory.hparams import (
     GeneratingArguments,
 )
 from datasets import load_dataset
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r"Trainer\.tokenizer is now deprecated.*",
+    category=UserWarning,
+) 
 from transformers import AutoTokenizer, BitsAndBytesConfig
 from trl import AutoModelForCausalLMWithValueHead, create_reference_model
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
@@ -96,6 +102,12 @@ class MyPPOTrainer(CustomPPOTrainer):
             self.tokenizer.decode(ids, skip_special_tokens=True)
             for ids in batch["input_ids"]
         ]
+        model = self.accelerator.unwrap_model(self.model)
+
+        self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.unk_token
+        self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
+        model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.tokenizer.padding_side = "left"
         # Store raw user queries for later logging
         self._last_batch_raw_qs = raw_qs
         # Extract ad metadata from ad_facts_list using dataset indices
@@ -144,7 +156,8 @@ class MyPPOTrainer(CustomPPOTrainer):
         input_ids_no_ad = tok_no_ad.input_ids.to(self.current_device)
         attention_mask_no_ad = tok_no_ad.attention_mask.to(self.current_device)
 
-        model = self.accelerator.unwrap_model(self.model)
+        # model = self.accelerator.unwrap_model(self.model)
+       
         # Generate with-ad responses
         logger.info(f"🟨 Generating with-ad responses for batch of size {len(full_prompts_ad)}...")
         # Build generation kwargs from config, but remove duplicate pad/eos tokens
@@ -154,6 +167,8 @@ class MyPPOTrainer(CustomPPOTrainer):
         gen_kwargs.pop("pad_token_id", None)
         gen_kwargs.pop("eos_token_id", None)
         gen_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask, **gen_kwargs}
+        self.tokenizer.padding_side = "left"
+        model = model.to(self.current_device)
         gen_out_ad = model.generate(
             generation_config=self.generation_config,
             pad_token_id=self.tokenizer.pad_token_id,
@@ -169,6 +184,7 @@ class MyPPOTrainer(CustomPPOTrainer):
         gen_kwargs_no_ad.pop("pad_token_id", None)
         gen_kwargs_no_ad.pop("eos_token_id", None)
         gen_kwargs_no_ad = {"input_ids": input_ids_no_ad, "attention_mask": attention_mask_no_ad, **gen_kwargs_no_ad}
+        self.tokenizer.padding_side = "left"
         gen_out_no_ad = model.generate(
             generation_config=self.generation_config,
             pad_token_id=self.tokenizer.pad_token_id,
@@ -200,7 +216,9 @@ class MyPPOTrainer(CustomPPOTrainer):
         # Store dataset indices to align ad facts in logs
         self._last_batch_dataset_idxs = dataset_idxs
 
+        self.tokenizer.padding_side = "left"
         return input_ids, response_tensors
+
     @torch.no_grad()
     def get_rewards(
         self,
@@ -287,11 +305,14 @@ class MyPPOTrainer(CustomPPOTrainer):
             logger.info(
                 f"   Detectability: detectability_cosine={det.get('detectability_cosine', None)}, similarity_cosine={det.get('similarity_cosine', None)}"
             )
+            det_cos = det.get("detectability_cosine", 0)
+            det_cos = max(min(det_cos, 1.0), -1.0)  # Clamp between -1 and 1
+
             total = (
                 sc.get("Coherence Score", 0)
                 + sh.get("H1", 0)
                 + ss.get("Ad Salience Score", 0)
-                + det.get("detectability_cosine", 0)
+                + det_cos
             )
             scores.append(torch.tensor(total, device=self.current_device))
             logger.info(f"✅ Judges complete for item {i}, total reward: {total:.4f}")
@@ -328,6 +349,7 @@ class MyPPOTrainer(CustomPPOTrainer):
                 # Total reward
                 "total_reward": total,
             })
+            logger.info(f"🧮 PPO reward distribution: {[r.item() for r in scores]}")
         return scores
  
 
@@ -349,6 +371,11 @@ def make_trainer(
     tokenizer.padding_side = "left"
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # Add pad token if missing — common for LLaMA-based models
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+
     # — load the policy (with value head) —
     # Disable 8-bit quantization for stability/debugging
     bnb = BitsAndBytesConfig(load_in_8bit=False)
@@ -359,6 +386,12 @@ def make_trainer(
         use_auth_token=hf_token,
         device_map="auto",
     )
+
+    def patched_forward(self, *args, **kwargs):
+        output = super(self.__class__, self).forward(*args, **kwargs)
+        return output.logits, None, output.value
+
+    policy.forward = patched_forward.__get__(policy, policy.__class__)
     # Log which policy model we are using
     logger.info(f"🔨 Policy model loaded: {model_name} ({policy.__class__.__name__})")
     policy.gradient_checkpointing_enable()
@@ -380,8 +413,9 @@ def make_trainer(
             truncation=True,
             padding="max_length",
             max_length=512,
+
         )
-        tokenized["idx"] = examples.get("idx")
+        tokenized["idx"] = examples["idx"] 
         return tokenized
     # Inform user and tokenize dataset (this may take some time)
     print(f"ℹ️ Loaded {len(ds)} raw examples. Tokenizing dataset (this may take some time)...")
@@ -390,7 +424,10 @@ def make_trainer(
         batched=True,
         num_proc=os.cpu_count() or 1,
         desc="Tokenizing dataset",
-    )
+        remove_columns=["vague_query", "label"],
+    )       
+    print(ds.column_names)
+    print(ds[0])
     print("✅ Dataset tokenization complete.")
 
     # — build a pad collator for batches —
@@ -411,18 +448,20 @@ def make_trainer(
         save_strategy="steps",
         save_steps=1,
         logging_steps=1,
+        max_grad_norm=1.0,  # for gradient clipping
+        gradient_checkpointing=True,
     )
     finetuning_args = FinetuningArguments(ppo_epochs=4, ppo_buffer_size=1)  # one 4-example buffer per step
     # For stability: use greedy decoding (disable sampling) to avoid invalid probabilities
     generating_args = GeneratingArguments(
         do_sample=False,
         max_new_tokens=512,
-        temperature=0.7,
-        top_k=50,
-        top_p=0.95,
+        # temperature=0.7,
+        # top_k=50,
+        # top_p=0.95,
         repetition_penalty=1.2,
     )
-
+ 
 
     logger.info("🚀 Starting PPO training...")
     trainer: MyPPOTrainer = None
@@ -442,6 +481,9 @@ def make_trainer(
             train_dataset   = ds,
             ad_facts_list   = ad_facts_list,   
         )
+        # trainer.generation_config.top_p = None
+        # trainer.generation_config.top_k = None
+
         # Make data_args accessible for run_ppo in main.py
         trainer.data_args = data_args
         # Expose full set of args and objects for run_ppo in main.py
