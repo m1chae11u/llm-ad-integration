@@ -1,6 +1,6 @@
 import llamafactory.train.ppo.workflow as _wf
 _wf.create_reward_model = lambda model, model_args, finetuning_args: None
-from llamafactory.train.ppo.workflow import CustomPPOTrainer, run_ppo
+from llamafactory.train.ppo.workflow import CustomPPOTrainer
 import torch
 import asyncio
 from typing import List, Optional
@@ -61,9 +61,21 @@ class PPODataCollator:
 
     def __call__(self, features):
         print(f"📦 Collating batch: {features[0].keys() if features else 'EMPTY'}")
-        if not features or not all("input_ids" in f for f in features):
+        if not features:
+            raise ValueError("❌ Empty features list provided to collator")
+        if not all("input_ids" in f for f in features):
             raise ValueError(f"❌ Missing input_ids in batch: {features}")
-        return self.tokenizer.pad(features, padding=True, return_tensors="pt")
+        
+        # Ensure all tensors are on the same device
+        features = [{k: v.to(features[0]["input_ids"].device) if torch.is_tensor(v) else v 
+                    for k, v in f.items()} for f in features]
+        
+        # Pad the batch
+        batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
+        
+        # Print batch info for debugging
+        print(f"📦 Collated batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in batch.items()]}")
+        return batch
 
 class MyPPOTrainer(CustomPPOTrainer):
     def __init__(
@@ -85,25 +97,70 @@ class MyPPOTrainer(CustomPPOTrainer):
         self.ad_facts_list = ad_facts_list
         # Store no-ad responses for detectability
         self.no_ad_responses: List[str] = []
-        # Create a DataLoader for batching
-        self.dataloader = iter(DataLoader(
-            self.train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            collate_fn=self.data_collator,
-        ))
-    def _make_batch(self):
+        
+        # Debug dataloader
+        print("\n🔍 Dataloader Debug Info in Trainer:")
+        print(f"Dataloader length: {len(self.dataloader)}")
+        if hasattr(self, 'args') and hasattr(self.args, 'per_device_train_batch_size'):
+            print(f"Batch size: {self.args.per_device_train_batch_size}")
+        
+        # Initialize dataloader iterator
+        self._dataloader_iter = None
+        self._reset_dataloader()
+
+    def _reset_dataloader(self):
+        """Reset the dataloader iterator."""
+        print("\n🔄 Resetting dataloader...")
         try:
-            return next(self.dataloader)
-        except StopIteration:
-            from torch.utils.data import DataLoader
-            self.dataloader = iter(DataLoader(
+            # Create a new dataloader with explicit settings
+            self.dataloader = torch.utils.data.DataLoader(
                 self.train_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=True,
+                batch_size=self.args.per_device_train_batch_size,
                 collate_fn=self.data_collator,
-            ))
-            return next(self.dataloader)
+                shuffle=True,
+                num_workers=0,  # Disable multiprocessing for debugging
+                drop_last=False  # Keep all samples
+            )
+            self._dataloader_iter = iter(self.dataloader)
+            
+            # Test first batch
+            test_batch = next(self._dataloader_iter)
+            if test_batch is None:
+                raise RuntimeError("Got None batch from dataloader")
+                
+            print("✅ First batch after reset:")
+            print(f"Batch keys: {test_batch.keys()}")
+            print(f"Batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in test_batch.items()]}")
+            
+            # Reset iterator after test
+            self._dataloader_iter = iter(self.dataloader)
+            
+        except Exception as e:
+            print(f"❌ Failed to reset dataloader: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"Failed to reset dataloader: {e}")
+
+    def _make_batch(self):
+        """Get the next batch from the dataloader, resetting if needed."""
+        try:
+            if self._dataloader_iter is None:
+                self._reset_dataloader()
+            batch = next(self._dataloader_iter)
+            if batch is None:
+                raise RuntimeError("Got None batch from dataloader")
+            return batch
+        except (StopIteration, UnboundLocalError):
+            print("🔄 Resetting dataloader iterator...")
+            self._reset_dataloader()
+            try:
+                batch = next(self._dataloader_iter)
+                if batch is None:
+                    raise RuntimeError("Got None batch from dataloader")
+                return batch
+            except Exception as e:
+                print(f"❌ Failed to get batch after reset: {e}")
+                raise RuntimeError(f"Failed to get batch: {e}")
 
     @torch.no_grad()
     def get_inputs(self, batch):
@@ -361,7 +418,65 @@ class MyPPOTrainer(CustomPPOTrainer):
             })
             logger.info(f"🧮 PPO reward distribution: {[r.item() for r in scores]}")
         return scores
- 
+
+
+    def ppo_train(self):
+        print("✅ USING CUSTOM ppo_train!")
+
+        total_loss = 0.0
+        total_reward = 0.0
+        total_steps = 0
+
+        # Reset dataloader at the start of training
+        self._reset_dataloader()
+
+        for step in range(self.finetuning_args.ppo_epochs):
+            try:
+                batch = self._make_batch()
+                if not batch:
+                    print(f"⚠️ Skipping step {step}: empty batch")
+                    continue
+
+                print(f"🔁 PPO Step {step}")
+                self.model.eval()
+                
+                # Ensure batch is on the correct device
+                batch = {k: v.to(self.current_device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                queries, responses = self.get_inputs(batch)
+                rewards = self.get_rewards(queries, responses)
+
+                if not rewards:
+                    print(f"⚠️ Step {step}: No rewards returned, skipping optimization")
+                    continue
+
+                self.model.train()
+                stats = self.step(queries, responses, rewards)
+
+                step_loss = float(stats.get("ppo/loss/total", 0.0))
+                step_reward = torch.stack(rewards).mean().item()
+
+                total_loss += step_loss
+                total_reward += step_reward
+                total_steps += 1
+
+                print(f"✅ Step {step} — Loss: {step_loss:.4f}, Reward: {step_reward:.4f}")
+
+            except Exception as e:
+                print(f"❌ Step {step} failed due to: {e}")
+                import traceback
+                traceback.print_exc()
+                print("❌ Exiting due to error in PPO training")
+                sys.exit(1)
+
+        if total_steps > 0:
+            avg_loss = total_loss / total_steps
+            avg_reward = total_reward / total_steps
+            print(f"🏁 PPO Training Complete — Avg Loss: {avg_loss:.4f}, Avg Reward: {avg_reward:.4f}")
+        else:
+            print("❌ PPO training ended with 0 valid steps.")
+            sys.exit(1)
 
 def make_trainer(
     model_name: str,
@@ -415,13 +530,13 @@ def make_trainer(
     # — load your CSV as a HuggingFace Dataset —
     ds = load_dataset("csv", data_files={"train": data_path})["train"]
     print(f"Raw dataset loaded from {data_path}: {len(ds)} samples")
-    print(ds[0] if len(ds) > 0 else "⚠️ Dataset is empty!")
+    print(f"Dataset columns: {ds.column_names}")
+    print(f"First sample: {ds[0]}")
+    
     # Add sample index for each example so we can align ad_facts
-    ds = ds.map(lambda examples, idx: {"idx": idx}, with_indices=True)
-    ds.set_format(
-        type="torch",
-        columns=[col for col in ds.column_names if col in {"input_ids", "attention_mask", "idx"}]
-    )
+    ds = ds.add_column("idx", list(range(len(ds))))
+    ds = ds.map(lambda ex: {"dataset_idx": ex["idx"]})
+    
     # Define the tokenize function for the vague_query field
     def tokenize_fn(examples):
         # Handle batched input
@@ -433,6 +548,7 @@ def make_trainer(
             max_length=512,
         )
         tokenized["idx"] = examples["idx"]  # Keep your custom index
+        tokenized["dataset_idx"] = examples["idx"]  # Keep dataset index
 
         # Keep other fields (like label, ad_product, etc.) if needed
         if "label" in examples:
@@ -447,6 +563,7 @@ def make_trainer(
             tokenized["ad_description"] = examples["ad_description"]
 
         return tokenized
+
     # Inform user and tokenize dataset (this may take some time)
     print(f"ℹ️ Loaded {len(ds)} raw examples. Tokenizing dataset (this may take some time)...")
     ds = ds.map(
@@ -454,15 +571,18 @@ def make_trainer(
         batched=True,
         num_proc=os.cpu_count() or 1,
         desc="Tokenizing dataset",
+        remove_columns=ds.column_names  # Remove original columns to avoid conflicts
     )  
-    print(ds[0])
-    assert "input_ids" in ds[0], "❌ Still missing input_ids!"     
+    
     print(f"Post-tokenization sample: {ds[0]}")
     assert "input_ids" in ds[0], "Missing input_ids"
-    assert "vague_query" in ds.column_names, "vague_query is missing in the CSV"
-    print(ds.column_names)
-    print(ds[0])
-    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "idx"])
+    assert "dataset_idx" in ds[0], "Missing dataset_idx"
+    
+    # Set the format after tokenization
+    ds.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", "dataset_idx"]
+    )
     print("✅ Dataset tokenization complete.")
 
     # — build a pad collator for batches —
@@ -474,8 +594,10 @@ def make_trainer(
     try:
         batch_test = collator([sample])
         print(f"✅ Collator output keys: {batch_test.keys()}")
+        print(f"✅ Collator output shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in batch_test.items()]}")
     except Exception as e:
         print(f"❌ Collator test failed: {e}")
+        raise RuntimeError(f"Collator initialization failed: {e}")
 
     # For a 4-example batch per PPO step: buffer_size=1 so config.batch_size = 4 * 1 = 4
 
@@ -494,6 +616,7 @@ def make_trainer(
         logging_steps=1,
         max_grad_norm=1.0,  # for gradient clipping
         gradient_checkpointing=True,
+        dataloader_num_workers=0,  # Disable multiprocessing for debugging
     )
     finetuning_args = FinetuningArguments(ppo_epochs=4, ppo_buffer_size=1)  # one 4-example buffer per step
     # For stability: use greedy decoding (disable sampling) to avoid invalid probabilities
@@ -505,10 +628,41 @@ def make_trainer(
        max_new_tokens=512,
     )
  
-
     logger.info("🚀 Starting PPO training...")
     print(f"📦 Collator type: {type(collator)}")
     assert collator is not None, "❌ Collator is None!"
+
+    # Debug dataset before creating trainer
+    print("\n🔍 Dataset Debug Info:")
+    print(f"Dataset size: {len(ds)}")
+    print(f"Dataset columns: {ds.column_names}")
+    print(f"First sample keys: {ds[0].keys()}")
+    print(f"First sample shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in ds[0].items()]}")
+    
+    # Test dataloader creation
+    test_loader = torch.utils.data.DataLoader(
+        ds,
+        batch_size=4,
+        collate_fn=collator,
+        shuffle=True,
+        num_workers=0,
+        drop_last=False
+    )
+    
+    # Test a single batch
+    try:
+        test_batch = next(iter(test_loader))
+        if test_batch is None:
+            raise RuntimeError("Test batch is None")
+        print("\n✅ Test batch created successfully")
+        print(f"Test batch keys: {test_batch.keys()}")
+        print(f"Test batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in test_batch.items()]}")
+    except Exception as e:
+        print(f"\n❌ Test batch creation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"Failed to create test batch: {e}")
+
     trainer: MyPPOTrainer = None
     try:
         trainer = MyPPOTrainer(
@@ -536,11 +690,17 @@ def make_trainer(
         trainer.generating_args = generating_args
         trainer.callbacks = None
         trainer.processor = None
-        trainer.data_collator = collator
         trainer.train_dataset = ds
         trainer.reward_model = None
         trainer.ref_model = ref
         trainer.tokenizer = tokenizer
+
+        # Debug trainer's dataloader
+        print("\n🔍 Trainer Dataloader Debug Info:")
+        print(f"Trainer dataloader length: {len(trainer.dataloader)}")
+        if hasattr(trainer, 'training_args'):
+            print(f"Trainer batch size: {trainer.training_args.per_device_train_batch_size}")
+        
     except KeyboardInterrupt:
         logger.warning("⚠️ Training interrupted by user. Saving checkpoint...")
         if trainer:
@@ -557,6 +717,3 @@ def make_trainer(
 
     return trainer
 
-# Monkey-patch LlamaFactory to use MyPPOTrainer in run_ppo
-import llamafactory.train.ppo.workflow as _workflow_module
-_workflow_module.CustomPPOTrainer = MyPPOTrainer
