@@ -27,6 +27,7 @@ from judge import (
     judge_ad_salience_async,
     judge_detectability_async,
 )
+from torch.utils.data import DataLoader
 import pandas as pd
 from pathlib import Path
 import sys  # for handling interrupt and exit
@@ -59,20 +60,10 @@ class PPODataCollator:
         self.ad_keys = ad_keys or ["ad_product", "brand", "url", "ad_description"]
 
     def __call__(self, features):
-        # features: list of dicts with keys: input_ids, attention_mask, and raw fields
-        batch = self.tokenizer.pad(
-            features,
-            return_tensors="pt"
-        )
-        # Safely extract dataset indices (fallback to feature position if missing)
-        idxs = []
-        for i, f in enumerate(features):
-            idx = f.get("idx")
-            if idx is None:
-                idx = i
-            idxs.append(idx)
-        batch["dataset_idx"] = torch.tensor(idxs, dtype=torch.long)
-        return batch
+        print(f"📦 Collating batch: {features[0].keys() if features else 'EMPTY'}")
+        if not features or not all("input_ids" in f for f in features):
+            raise ValueError(f"❌ Missing input_ids in batch: {features}")
+        return self.tokenizer.pad(features, padding=True, return_tensors="pt")
 
 class MyPPOTrainer(CustomPPOTrainer):
     def __init__(
@@ -94,6 +85,25 @@ class MyPPOTrainer(CustomPPOTrainer):
         self.ad_facts_list = ad_facts_list
         # Store no-ad responses for detectability
         self.no_ad_responses: List[str] = []
+        # Create a DataLoader for batching
+        self.dataloader = iter(DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            collate_fn=self.data_collator,
+        ))
+    def _make_batch(self):
+        try:
+            return next(self.dataloader)
+        except StopIteration:
+            from torch.utils.data import DataLoader
+            self.dataloader = iter(DataLoader(
+                self.train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                collate_fn=self.data_collator,
+            ))
+            return next(self.dataloader)
 
     @torch.no_grad()
     def get_inputs(self, batch):
@@ -404,18 +414,38 @@ def make_trainer(
 
     # — load your CSV as a HuggingFace Dataset —
     ds = load_dataset("csv", data_files={"train": data_path})["train"]
+    print(f"Raw dataset loaded from {data_path}: {len(ds)} samples")
+    print(ds[0] if len(ds) > 0 else "⚠️ Dataset is empty!")
     # Add sample index for each example so we can align ad_facts
     ds = ds.map(lambda examples, idx: {"idx": idx}, with_indices=True)
+    ds.set_format(
+        type="torch",
+        columns=[col for col in ds.column_names if col in {"input_ids", "attention_mask", "idx"}]
+    )
     # Define the tokenize function for the vague_query field
     def tokenize_fn(examples):
+        # Handle batched input
+        texts = examples["vague_query"]
         tokenized = tokenizer(
-            examples["vague_query"],
+            texts,
             truncation=True,
             padding="max_length",
             max_length=512,
-
         )
-        tokenized["idx"] = examples["idx"] 
+        tokenized["idx"] = examples["idx"]  # Keep your custom index
+
+        # Keep other fields (like label, ad_product, etc.) if needed
+        if "label" in examples:
+            tokenized["label"] = examples["label"]
+        if "ad_product" in examples:
+            tokenized["ad_product"] = examples["ad_product"]
+        if "brand" in examples:
+            tokenized["brand"] = examples["brand"]
+        if "url" in examples:
+            tokenized["url"] = examples["url"]
+        if "ad_description" in examples:
+            tokenized["ad_description"] = examples["ad_description"]
+
         return tokenized
     # Inform user and tokenize dataset (this may take some time)
     print(f"ℹ️ Loaded {len(ds)} raw examples. Tokenizing dataset (this may take some time)...")
@@ -424,14 +454,28 @@ def make_trainer(
         batched=True,
         num_proc=os.cpu_count() or 1,
         desc="Tokenizing dataset",
-        remove_columns=["vague_query", "label"],
-    )       
+    )  
+    print(ds[0])
+    assert "input_ids" in ds[0], "❌ Still missing input_ids!"     
+    print(f"Post-tokenization sample: {ds[0]}")
+    assert "input_ids" in ds[0], "Missing input_ids"
+    assert "vague_query" in ds.column_names, "vague_query is missing in the CSV"
     print(ds.column_names)
     print(ds[0])
+    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "idx"])
     print("✅ Dataset tokenization complete.")
 
     # — build a pad collator for batches —
     collator = PPODataCollator(tokenizer)
+    # Debug: test that collator actually works
+    sample = ds[0]
+    print(f"🧪 Sample keys before collation: {sample.keys()}")
+
+    try:
+        batch_test = collator([sample])
+        print(f"✅ Collator output keys: {batch_test.keys()}")
+    except Exception as e:
+        print(f"❌ Collator test failed: {e}")
 
     # For a 4-example batch per PPO step: buffer_size=1 so config.batch_size = 4 * 1 = 4
 
@@ -454,16 +498,17 @@ def make_trainer(
     finetuning_args = FinetuningArguments(ppo_epochs=4, ppo_buffer_size=1)  # one 4-example buffer per step
     # For stability: use greedy decoding (disable sampling) to avoid invalid probabilities
     generating_args = GeneratingArguments(
-        do_sample=False,
-        max_new_tokens=512,
-        # temperature=0.7,
-        # top_k=50,
-        # top_p=0.95,
-        repetition_penalty=1.2,
+       do_sample=False,
+       temperature=None,
+       top_k=None,
+       top_p=None,
+       max_new_tokens=512,
     )
  
 
     logger.info("🚀 Starting PPO training...")
+    print(f"📦 Collator type: {type(collator)}")
+    assert collator is not None, "❌ Collator is None!"
     trainer: MyPPOTrainer = None
     try:
         trainer = MyPPOTrainer(
@@ -481,9 +526,7 @@ def make_trainer(
             train_dataset   = ds,
             ad_facts_list   = ad_facts_list,   
         )
-        # trainer.generation_config.top_p = None
-        # trainer.generation_config.top_k = None
-
+    
         # Make data_args accessible for run_ppo in main.py
         trainer.data_args = data_args
         # Expose full set of args and objects for run_ppo in main.py
