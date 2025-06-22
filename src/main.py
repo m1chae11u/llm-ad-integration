@@ -58,7 +58,9 @@ if __name__ == "__main__":
     # 3) Run PPO training loop
     print("⏱ Starting PPO training...")
     try:
-        trainer.ppo_train()
+        trainer.ppo_train(resume_from_checkpoint=ckpt_info.get("latest_checkpoint") if ckpt_info else None, 
+                         start_step=resume_step, 
+                         start_query_idx=resume_query_idx)
     except ValueError as e:
         if "will be supported in the future version" in str(e):
             print(f"⚠️ {e}. Running PPO without resume.")
@@ -67,7 +69,13 @@ if __name__ == "__main__":
             raise
     except KeyboardInterrupt:
         print("⚠️ Training interrupted. Saving checkpoint before exit…")
-        trainer.save_model()
+        try:
+            trainer.save_model()
+            last_pos = {"query_index": resume_query_idx}
+            with open(output_dir / "last_query_position.json", "w") as f:
+                json.dump(last_pos, f)
+        except Exception as e:
+            print(f"⚠️ Failed to save checkpoint: {e}")
         sys.exit(0)
     else:
         trainer.save_model()

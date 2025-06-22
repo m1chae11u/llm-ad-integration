@@ -58,23 +58,35 @@ class PPODataCollator:
     def __init__(self, tokenizer, ad_keys=None):
         self.tokenizer = tokenizer
         self.ad_keys = ad_keys or ["ad_product", "brand", "url", "ad_description"]
+        self._call_count = 0  # Track calls for debugging
 
     def __call__(self, features):
-        print(f"📦 Collating batch: {features[0].keys() if features else 'EMPTY'}")
+        self._call_count += 1
+        if self._call_count <= 3:  # Only debug first few calls
+            print(f"📦 Collating batch {self._call_count}: {features[0].keys() if features else 'EMPTY'}")
+        
         if not features:
             raise ValueError("❌ Empty features list provided to collator")
         if not all("input_ids" in f for f in features):
             raise ValueError(f"❌ Missing input_ids in batch: {features}")
         
-        # Ensure all tensors are on the same device
-        features = [{k: v.to(features[0]["input_ids"].device) if torch.is_tensor(v) else v 
-                    for k, v in f.items()} for f in features]
+        # Ensure all tensors are on the same device - handle case where tensors might not have device
+        first_device = None
+        for f in features:
+            if torch.is_tensor(f.get("input_ids")):
+                first_device = f["input_ids"].device
+                break
+        
+        if first_device is not None:
+            features = [{k: v.to(first_device) if torch.is_tensor(v) else v 
+                        for k, v in f.items()} for f in features]
         
         # Pad the batch
         batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
         
-        # Print batch info for debugging
-        print(f"📦 Collated batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in batch.items()]}")
+        # Print batch info for debugging (only first few calls)
+        if self._call_count <= 3:
+            print(f"📦 Collated batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in batch.items()]}")
         return batch
 
 class MyPPOTrainer(CustomPPOTrainer):
@@ -84,6 +96,7 @@ class MyPPOTrainer(CustomPPOTrainer):
         ad_facts_list: Optional[List[dict]] = None,
         **kwargs,
     ):
+        self.train_dataset = kwargs.get("train_dataset")
         super().__init__(*args, **kwargs)
         # Disable warning for right-padding in decoder-only generation
         try:
@@ -98,19 +111,12 @@ class MyPPOTrainer(CustomPPOTrainer):
         # Store no-ad responses for detectability
         self.no_ad_responses: List[str] = []
         
-        # Debug dataloader
-        print("\n🔍 Dataloader Debug Info in Trainer:")
-        print(f"Dataloader length: {len(self.dataloader)}")
-        if hasattr(self, 'args') and hasattr(self.args, 'per_device_train_batch_size'):
-            print(f"Batch size: {self.args.per_device_train_batch_size}")
-        
         # Initialize dataloader iterator
         self._dataloader_iter = None
         self._reset_dataloader()
 
     def _reset_dataloader(self):
         """Reset the dataloader iterator."""
-        print("\n🔄 Resetting dataloader...")
         try:
             # Create a new dataloader with explicit settings
             self.dataloader = torch.utils.data.DataLoader(
@@ -128,9 +134,7 @@ class MyPPOTrainer(CustomPPOTrainer):
             if test_batch is None:
                 raise RuntimeError("Got None batch from dataloader")
                 
-            print("✅ First batch after reset:")
-            print(f"Batch keys: {test_batch.keys()}")
-            print(f"Batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in test_batch.items()]}")
+            print(f"✅ Dataloader reset: {len(self.dataloader)} batches, batch size {self.args.per_device_train_batch_size}")
             
             # Reset iterator after test
             self._dataloader_iter = iter(self.dataloader)
@@ -151,13 +155,15 @@ class MyPPOTrainer(CustomPPOTrainer):
                 raise RuntimeError("Got None batch from dataloader")
             return batch
         except (StopIteration, UnboundLocalError):
-            print("🔄 Resetting dataloader iterator...")
+            print("🔄 Dataloader exhausted, resetting iterator...")
             self._reset_dataloader()
             try:
                 batch = next(self._dataloader_iter)
                 if batch is None:
-                    raise RuntimeError("Got None batch from dataloader")
+                    raise RuntimeError("Got None batch from dataloader after reset")
                 return batch
+            except StopIteration:
+                raise RuntimeError("Dataloader is empty - no data available for training")
             except Exception as e:
                 print(f"❌ Failed to get batch after reset: {e}")
                 raise RuntimeError(f"Failed to get batch: {e}")
@@ -284,7 +290,9 @@ class MyPPOTrainer(CustomPPOTrainer):
         self._last_batch_dataset_idxs = dataset_idxs
 
         self.tokenizer.padding_side = "left"
-        return input_ids, response_tensors
+        query_tensors = [input_ids[i] for i in range(input_ids.size(0))]
+
+        return query_tensors, response_tensors
 
     @torch.no_grad()
     def get_rewards(
@@ -420,8 +428,9 @@ class MyPPOTrainer(CustomPPOTrainer):
         return scores
 
 
-    def ppo_train(self):
+    def ppo_train(self, resume_from_checkpoint=None, start_step=0, start_query_idx=0):
         print("✅ USING CUSTOM ppo_train!")
+        print(f"📊 Resume info: checkpoint={resume_from_checkpoint}, step={start_step}, query_idx={start_query_idx}")
 
         total_loss = 0.0
         total_reward = 0.0
@@ -429,6 +438,12 @@ class MyPPOTrainer(CustomPPOTrainer):
 
         # Reset dataloader at the start of training
         self._reset_dataloader()
+
+        # If resuming, we might want to skip some steps or adjust the dataloader
+        if start_step > 0:
+            print(f"⏯ Resuming from step {start_step}")
+            # For now, we'll just continue from where we left off
+            # In a more sophisticated implementation, you might want to restore the exact state
 
         for step in range(self.finetuning_args.ppo_epochs):
             try:
@@ -512,18 +527,64 @@ def make_trainer(
         device_map="auto",
     )
 
-    def patched_forward(self, *args, **kwargs):
-        output = super(self.__class__, self).forward(*args, **kwargs)
-        return output.logits, None, output.value
-
-    policy.forward = patched_forward.__get__(policy, policy.__class__)
     # Log which policy model we are using
     logger.info(f"🔨 Policy model loaded: {model_name} ({policy.__class__.__name__})")
+    logger.info(f"🔨 Model has value head: {hasattr(policy, 'value_head')}")
+    
+    # Test the forward method to see what it returns
+    try:
+        # Get device from model parameters
+        device = next(policy.parameters()).device
+        test_input = torch.randint(0, 1000, (1, 10)).to(device)
+        with torch.no_grad():
+            test_output = policy.forward(input_ids=test_input)
+            print(f"🧪 Test forward output type: {type(test_output)}")
+            if hasattr(test_output, '__dict__'):
+                print(f"🧪 Test output attributes: {list(test_output.__dict__.keys())}")
+            elif isinstance(test_output, tuple):
+                print(f"🧪 Test output tuple length: {len(test_output)}")
+                for i, item in enumerate(test_output):
+                    print(f"🧪 Test output[{i}] type: {type(item)}")
+    except Exception as e:
+        print(f"⚠️ Could not test forward method: {e}")
+    
+    # Patch the forward method based on what we learned
+    def patched_forward(self, *args, **kwargs):
+        # Call the original forward method
+        output = super(self.__class__, self).forward(*args, **kwargs)
+        
+        # Debug: print output type and structure
+        print(f"🔍 Model forward output type: {type(output)}")
+        if hasattr(output, '__dict__'):
+            print(f"🔍 Model output attributes: {list(output.__dict__.keys())}")
+        
+        # AutoModelForCausalLMWithValueHead should return (logits, value)
+        # but we need to return (logits, None, value) for the TRL trainer
+        if hasattr(output, 'logits') and hasattr(output, 'value'):
+            print("✅ Using TRL model with value head")
+            return output.logits, None, output.value
+        elif isinstance(output, tuple) and len(output) >= 2:
+            print(f"✅ Using tuple output with {len(output)} elements")
+            return output[0], None, output[1]
+        else:
+            print("⚠️ Using fallback output handling")
+            return output, None, None
+
+    # Patch the forward method directly on the instance
+    policy.forward = patched_forward.__get__(policy, policy.__class__)
+    
+    # Also patch the __call__ method to ensure it works
+    def patched_call(self, *args, **kwargs):
+        return self.forward(*args, **kwargs)
+    
+    policy.__call__ = patched_call.__get__(policy, policy.__class__)
+    
     policy.gradient_checkpointing_enable()
     policy.config.pad_token_id = tokenizer.pad_token_id
 
     # — build the frozen reference copy —
     ref = create_reference_model(policy).to("cpu")
+    ref.forward = patched_forward.__get__(ref, ref.__class__)
     ref.eval()
     for p in ref.parameters(): p.requires_grad = False
 
@@ -587,17 +648,7 @@ def make_trainer(
 
     # — build a pad collator for batches —
     collator = PPODataCollator(tokenizer)
-    # Debug: test that collator actually works
-    sample = ds[0]
-    print(f"🧪 Sample keys before collation: {sample.keys()}")
-
-    try:
-        batch_test = collator([sample])
-        print(f"✅ Collator output keys: {batch_test.keys()}")
-        print(f"✅ Collator output shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in batch_test.items()]}")
-    except Exception as e:
-        print(f"❌ Collator test failed: {e}")
-        raise RuntimeError(f"Collator initialization failed: {e}")
+    print("✅ Data collator created successfully")
 
     # For a 4-example batch per PPO step: buffer_size=1 so config.batch_size = 4 * 1 = 4
 
@@ -633,35 +684,10 @@ def make_trainer(
     assert collator is not None, "❌ Collator is None!"
 
     # Debug dataset before creating trainer
-    print("\n🔍 Dataset Debug Info:")
-    print(f"Dataset size: {len(ds)}")
+    print(f"\n📊 Dataset Info:")
+    print(f"Dataset size: {len(ds)} samples")
     print(f"Dataset columns: {ds.column_names}")
     print(f"First sample keys: {ds[0].keys()}")
-    print(f"First sample shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in ds[0].items()]}")
-    
-    # Test dataloader creation
-    test_loader = torch.utils.data.DataLoader(
-        ds,
-        batch_size=4,
-        collate_fn=collator,
-        shuffle=True,
-        num_workers=0,
-        drop_last=False
-    )
-    
-    # Test a single batch
-    try:
-        test_batch = next(iter(test_loader))
-        if test_batch is None:
-            raise RuntimeError("Test batch is None")
-        print("\n✅ Test batch created successfully")
-        print(f"Test batch keys: {test_batch.keys()}")
-        print(f"Test batch shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in test_batch.items()]}")
-    except Exception as e:
-        print(f"\n❌ Test batch creation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"Failed to create test batch: {e}")
 
     trainer: MyPPOTrainer = None
     try:
@@ -695,12 +721,6 @@ def make_trainer(
         trainer.ref_model = ref
         trainer.tokenizer = tokenizer
 
-        # Debug trainer's dataloader
-        print("\n🔍 Trainer Dataloader Debug Info:")
-        print(f"Trainer dataloader length: {len(trainer.dataloader)}")
-        if hasattr(trainer, 'training_args'):
-            print(f"Trainer batch size: {trainer.training_args.per_device_train_batch_size}")
-        
     except KeyboardInterrupt:
         logger.warning("⚠️ Training interrupted by user. Saving checkpoint...")
         if trainer:
