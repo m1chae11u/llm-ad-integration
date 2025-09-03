@@ -5,5 +5,5 @@
   "eos_token_id": 128001,
   "temperature": 0.6,
   "top_p": 0.9,
-  "transformers_version": "4.49.0"
+  "transformers_version": "4.46.1"
 }

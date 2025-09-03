@@ -217,4 +217,3 @@ If you have to stop running, please save the following folders:
 
 When you start a new runtime, remember to delete the old ppo_manual folder (which was saved in git) and drop the new version in the checkpoints folder. 
 
-

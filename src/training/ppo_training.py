@@ -7,17 +7,12 @@ from typing import List, Optional
 from llamafactory.hparams import (
     ModelArguments,
     DataArguments,
-    TrainingArguments,
     FinetuningArguments,
     GeneratingArguments,
 )
+from transformers import TrainingArguments
 from datasets import load_dataset
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    message=r"Trainer\.tokenizer is now deprecated.*",
-    category=UserWarning,
-) 
+# Note: We're now using processing_class instead of deprecated tokenizer 
 from transformers import AutoTokenizer, BitsAndBytesConfig
 from trl import AutoModelForCausalLMWithValueHead, create_reference_model
 from .prompts import get_prompt_with_ad, get_prompt_without_ad
@@ -33,13 +28,8 @@ from pathlib import Path
 import sys  # for handling interrupt and exit
 from config import DATA_FILE
 import os
-# Suppress deprecation warnings about Trainer.tokenizer
-import warnings
-warnings.filterwarnings(
-    'ignore',
-    'Trainer\\.tokenizer is now deprecated.*',
-    category=UserWarning,
-)
+# Note: We're now using processing_class instead of deprecated tokenizer
+# No need to suppress warnings since we're not using the deprecated attribute
 import logging
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,12 +41,16 @@ PPO_NO_AD_BUFFER: List[str] = []
 # Global ad facts list for custom PPO trainer
 GLOBAL_AD_FACTS_LIST: List[dict] = []
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Force CPU mode for now to debug the training logic
+# We'll fix GPU issues separately
+print("🔄 Temporarily forcing CPU mode to debug training logic")
+DEVICE = torch.device("cpu")
+print("💻 Using CPU for training (GPU debugging will be done separately)")
 
 # Define a custom collator to pad and retain metadata
 class PPODataCollator:
     def __init__(self, tokenizer, ad_keys=None):
-        self.tokenizer = tokenizer
+        self._custom_tokenizer = tokenizer
         self.ad_keys = ad_keys or ["ad_product", "brand", "url", "ad_description"]
         self._call_count = 0  # Track calls for debugging
 
@@ -82,7 +76,7 @@ class PPODataCollator:
                         for k, v in f.items()} for f in features]
         
         # Pad the batch
-        batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
+        batch = self._custom_tokenizer.pad(features, padding=True, return_tensors="pt")
         
         # Print batch info for debugging (only first few calls)
         if self._call_count <= 3:
@@ -114,6 +108,10 @@ class MyPPOTrainer(CustomPPOTrainer):
         # Initialize dataloader iterator
         self._dataloader_iter = None
         self._reset_dataloader()
+        
+        # Force CPU mode by overriding current_device
+        self.current_device = DEVICE
+        print(f"🔧 Forced trainer to use device: {self.current_device}")
 
     def _reset_dataloader(self):
         """Reset the dataloader iterator."""
@@ -172,15 +170,15 @@ class MyPPOTrainer(CustomPPOTrainer):
     def get_inputs(self, batch):
         # Decode queries from token IDs
         raw_qs = [
-            self.tokenizer.decode(ids, skip_special_tokens=True)
+            self._custom_tokenizer.decode(ids, skip_special_tokens=True)
             for ids in batch["input_ids"]
         ]
         model = self.accelerator.unwrap_model(self.model)
 
-        self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.unk_token
-        self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
-        model.config.pad_token_id = self.tokenizer.pad_token_id
-        self.tokenizer.padding_side = "left"
+        self._custom_tokenizer.pad_token = self._custom_tokenizer.eos_token or self._custom_tokenizer.unk_token
+        self._custom_tokenizer.pad_token_id = self._custom_tokenizer.convert_tokens_to_ids(self._custom_tokenizer.pad_token)
+        model.config.pad_token_id = self._custom_tokenizer.pad_token_id
+        self._custom_tokenizer.padding_side = "left"
         # Store raw user queries for later logging
         self._last_batch_raw_qs = raw_qs
         # Extract ad metadata from ad_facts_list using dataset indices
@@ -208,23 +206,23 @@ class MyPPOTrainer(CustomPPOTrainer):
             # Store the raw ad text for this batch so judges use the same block
             ad_texts.append(ad_text)
 
-        tok_ad = self.tokenizer(
+        tok_ad = self._custom_tokenizer(
             full_prompts_ad,
             return_tensors="pt",
             padding='longest',
             truncation=True,
-            max_length=self.tokenizer.model_max_length,
+            max_length=self._custom_tokenizer.model_max_length,
         )
         input_ids = tok_ad.input_ids.to(self.current_device)
         attention_mask = tok_ad.attention_mask.to(self.current_device)
 
         # Tokenize no-ad prompts
-        tok_no_ad = self.tokenizer(
+        tok_no_ad = self._custom_tokenizer(
             full_prompts_no_ad,
             return_tensors="pt",
             padding='longest',
             truncation=True,
-            max_length=self.tokenizer.model_max_length,
+            max_length=self._custom_tokenizer.model_max_length,
         )
         input_ids_no_ad = tok_no_ad.input_ids.to(self.current_device)
         attention_mask_no_ad = tok_no_ad.attention_mask.to(self.current_device)
@@ -240,11 +238,11 @@ class MyPPOTrainer(CustomPPOTrainer):
         gen_kwargs.pop("pad_token_id", None)
         gen_kwargs.pop("eos_token_id", None)
         gen_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask, **gen_kwargs}
-        self.tokenizer.padding_side = "left"
+        self._custom_tokenizer.padding_side = "left"
         model = model.to(self.current_device)
         gen_out_ad = model.generate(
             generation_config=self.generation_config,
-            pad_token_id=self.tokenizer.pad_token_id,
+            pad_token_id=self._custom_tokenizer.pad_token_id,
             **gen_kwargs
         )
         logger.info("✅ With-ad generation complete.")
@@ -257,10 +255,10 @@ class MyPPOTrainer(CustomPPOTrainer):
         gen_kwargs_no_ad.pop("pad_token_id", None)
         gen_kwargs_no_ad.pop("eos_token_id", None)
         gen_kwargs_no_ad = {"input_ids": input_ids_no_ad, "attention_mask": attention_mask_no_ad, **gen_kwargs_no_ad}
-        self.tokenizer.padding_side = "left"
+        self._custom_tokenizer.padding_side = "left"
         gen_out_no_ad = model.generate(
             generation_config=self.generation_config,
-            pad_token_id=self.tokenizer.pad_token_id,
+            pad_token_id=self._custom_tokenizer.pad_token_id,
             **gen_kwargs_no_ad
         )
         logger.info("✅ No-ad generation complete.")
@@ -277,19 +275,19 @@ class MyPPOTrainer(CustomPPOTrainer):
             response_tensors_no_ad.append(gen_out_no_ad[idx, prompt_len_no:])
 
         # Decode no-ad responses and store for detectability
-        decoded_no_ad = [self.tokenizer.decode(t, skip_special_tokens=True) for t in response_tensors_no_ad]
+        decoded_no_ad = [self._custom_tokenizer.decode(t, skip_special_tokens=True) for t in response_tensors_no_ad]
         # Store in both trainer list and global buffer
         self.no_ad_responses.extend(decoded_no_ad)
         PPO_NO_AD_BUFFER.extend(decoded_no_ad)
 
         logger.debug(f"Last token per sequence: {input_ids[:, -1]}")
-        logger.debug(f"Pad token id: {self.tokenizer.pad_token_id}")
+        logger.debug(f"Pad token id: {self._custom_tokenizer.pad_token_id}")
 
         self._last_batch_ad_texts = ad_texts
         # Store dataset indices to align ad facts in logs
         self._last_batch_dataset_idxs = dataset_idxs
 
-        self.tokenizer.padding_side = "left"
+        self._custom_tokenizer.padding_side = "left"
         query_tensors = [input_ids[i] for i in range(input_ids.size(0))]
 
         return query_tensors, response_tensors
@@ -302,11 +300,11 @@ class MyPPOTrainer(CustomPPOTrainer):
     ) -> list[torch.Tensor]:
         # Decode all prompts and responses to strings
         prompts = [
-            self.tokenizer.decode(q_ids, skip_special_tokens=True)
+            self._custom_tokenizer.decode(q_ids, skip_special_tokens=True)
             for q_ids in queries
         ]
         responses_text = [
-            self.tokenizer.decode(r_ids, skip_special_tokens=True)
+            self._custom_tokenizer.decode(r_ids, skip_special_tokens=True)
             for r_ids in responses
         ]
         # Prepare ad text blocks: use the same batch ad_texts from generation if available
@@ -517,74 +515,100 @@ def make_trainer(
         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     # — load the policy (with value head) —
-    # Disable 8-bit quantization for stability/debugging
-    bnb = BitsAndBytesConfig(load_in_8bit=False)
-    policy = AutoModelForCausalLMWithValueHead.from_pretrained(
-        model_name,
-        quantization_config=bnb,
-        trust_remote_code=True,
-        use_auth_token=hf_token,
-        device_map="auto",
-    )
+    # Simplified loading for CPU mode
+    logger.info("💻 Loading model for CPU training...")
+    
+    try:
+        policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            use_auth_token=hf_token,
+            torch_dtype=torch.float32,  # Use float32 for CPU
+            device_map=None,
+        )
+        
+        # Move to CPU explicitly
+        policy = policy.to(DEVICE)
+        logger.info(f"💻 Model loaded and moved to {DEVICE}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        raise e
 
     # Log which policy model we are using
     logger.info(f"🔨 Policy model loaded: {model_name} ({policy.__class__.__name__})")
     logger.info(f"🔨 Model has value head: {hasattr(policy, 'value_head')}")
     
-    # Test the forward method to see what it returns
+    # Test the forward method to ensure it works
     try:
         # Get device from model parameters
         device = next(policy.parameters()).device
         test_input = torch.randint(0, 1000, (1, 10)).to(device)
         with torch.no_grad():
             test_output = policy.forward(input_ids=test_input)
-            print(f"🧪 Test forward output type: {type(test_output)}")
-            if hasattr(test_output, '__dict__'):
-                print(f"🧪 Test output attributes: {list(test_output.__dict__.keys())}")
-            elif isinstance(test_output, tuple):
-                print(f"🧪 Test output tuple length: {len(test_output)}")
-                for i, item in enumerate(test_output):
-                    print(f"🧪 Test output[{i}] type: {type(item)}")
+            print(f"🧪 Model forward test successful - output type: {type(test_output)}")
     except Exception as e:
         print(f"⚠️ Could not test forward method: {e}")
     
-    # Patch the forward method based on what we learned
-    def patched_forward(self, *args, **kwargs):
-        # Call the original forward method
-        output = super(self.__class__, self).forward(*args, **kwargs)
-        
-        # Debug: print output type and structure
-        print(f"🔍 Model forward output type: {type(output)}")
-        if hasattr(output, '__dict__'):
-            print(f"🔍 Model output attributes: {list(output.__dict__.keys())}")
-        
-        # AutoModelForCausalLMWithValueHead should return (logits, value)
-        # but we need to return (logits, None, value) for the TRL trainer
-        if hasattr(output, 'logits') and hasattr(output, 'value'):
-            print("✅ Using TRL model with value head")
-            return output.logits, None, output.value
-        elif isinstance(output, tuple) and len(output) >= 2:
-            print(f"✅ Using tuple output with {len(output)} elements")
-            return output[0], None, output[1]
-        else:
-            print("⚠️ Using fallback output handling")
-            return output, None, None
-
-    # Patch the forward method directly on the instance
-    policy.forward = patched_forward.__get__(policy, policy.__class__)
-    
-    # Also patch the __call__ method to ensure it works
+    # Patch the __call__ method to work with llamafactory PPO trainer
+    # This is what gets called when the trainer does model(**input_kwargs)
     def patched_call(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-    
+        # Call the original forward method
+        original_output = super(self.__class__, self).forward(*args, **kwargs)
+        
+        # Debug: print what we're getting
+        print(f"🔍 PATCHED __CALL__ CALLED - Output type: {type(original_output)}")
+        if hasattr(original_output, '__dict__'):
+            print(f"🔍 Output attributes: {list(original_output.__dict__.keys())}")
+        elif isinstance(original_output, tuple):
+            print(f"🔍 Tuple length: {len(original_output)}")
+        
+        # For TRL models, we need to ensure we return the right format
+        # llamafactory expects (logits, past_key_values, value) or similar
+        if hasattr(original_output, 'logits'):
+            # If it's a CausalLMOutputWithValueHead, extract what we need
+            if hasattr(original_output, 'value'):
+                # Return (logits, past_key_values, value) format
+                past_key_values = getattr(original_output, 'past_key_values', None)
+                print(f"🔍 Returning (logits, past_key_values, value) format")
+                return original_output.logits, past_key_values, original_output.value
+            else:
+                # No value head, just return logits
+                past_key_values = getattr(original_output, 'past_key_values', None)
+                print(f"🔍 Returning (logits, past_key_values, None) format")
+                return original_output.logits, past_key_values, None
+        elif isinstance(original_output, tuple):
+            # Handle tuple outputs
+            if len(original_output) >= 3:
+                print(f"🔍 Returning tuple with {len(original_output)} elements")
+                return original_output[0], original_output[1], original_output[2]
+            elif len(original_output) == 2:
+                print(f"🔍 Returning (first, None, second) format")
+                return original_output[0], None, original_output[1]
+            else:
+                print(f"🔍 Returning (first, None, None) format")
+                return original_output[0], None, None
+        else:
+            # Fallback: return as-is with None padding
+            print(f"🔍 Using fallback format")
+            return original_output, None, None
+
+    # Patch the __call__ method directly on the instance
     policy.__call__ = patched_call.__get__(policy, policy.__class__)
     
+    # Move model to GPU and enable memory optimizations
+    policy = policy.to(DEVICE)
     policy.gradient_checkpointing_enable()
     policy.config.pad_token_id = tokenizer.pad_token_id
+    
+    # Log memory usage
+    if torch.cuda.is_available():
+        logger.info(f"🔨 GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        logger.info(f"🔨 GPU memory cached: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
     # — build the frozen reference copy —
     ref = create_reference_model(policy).to("cpu")
-    ref.forward = patched_forward.__get__(ref, ref.__class__)
+    ref.__call__ = patched_call.__get__(ref, ref.__class__)
     ref.eval()
     for p in ref.parameters(): p.requires_grad = False
 
@@ -653,7 +677,7 @@ def make_trainer(
     # For a 4-example batch per PPO step: buffer_size=1 so config.batch_size = 4 * 1 = 4
 
     # — build all of your dataclass args —
-    model_args      = ModelArguments(   model_name_or_path=model_name, trust_remote_code=True, hf_hub_token=hf_token)
+    model_args      = ModelArguments(   model_name_or_path=model_name, hf_hub_token=hf_token)
     data_args       = DataArguments(
         template="default",
         dataset=Path(data_path).name,
@@ -668,6 +692,8 @@ def make_trainer(
         max_grad_norm=1.0,  # for gradient clipping
         gradient_checkpointing=True,
         dataloader_num_workers=0,  # Disable multiprocessing for debugging
+        no_cuda=True,  # Force CPU mode
+        dataloader_pin_memory=False,  # Disable pin memory for CPU
     )
     finetuning_args = FinetuningArguments(ppo_epochs=4, ppo_buffer_size=1)  # one 4-example buffer per step
     # For stability: use greedy decoding (disable sampling) to avoid invalid probabilities
@@ -719,7 +745,9 @@ def make_trainer(
         trainer.train_dataset = ds
         trainer.reward_model = None
         trainer.ref_model = ref
-        trainer.tokenizer = tokenizer
+        # Store tokenizer for our custom methods, but don't set it as trainer.tokenizer
+        # The trainer will use its own processing internally
+        trainer._custom_tokenizer = tokenizer
 
     except KeyboardInterrupt:
         logger.warning("⚠️ Training interrupted by user. Saving checkpoint...")

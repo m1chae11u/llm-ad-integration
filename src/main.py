@@ -36,7 +36,9 @@ if __name__ == "__main__":
     )
     model, tokenizer, ckpt_info = ckpt_mgr.load_latest_checkpoint()
     trainer.model = model
-    trainer.tokenizer = tokenizer
+    # Store tokenizer for our custom methods, but don't set it as trainer.tokenizer
+    # The trainer will use its own processing internally
+    trainer._custom_tokenizer = tokenizer
 
     if ckpt_info:
         print(f"⏯ Resuming from checkpoint at step {ckpt_info['step']}")
