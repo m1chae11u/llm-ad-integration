@@ -12,8 +12,21 @@ from training.ppo_training import make_trainer, TRAINING_LOGS
 
 if __name__ == "__main__":
     # 1) Read your CSV of queries + ad facts
-    df = pd.read_csv(DATA_FILE)
-    ad_facts_list = df[["ad_id", "ad_product", "brand", "url", "ad_description"]].to_dict("records")
+    try:
+        if not os.path.exists(DATA_FILE):
+            raise FileNotFoundError(f"Data file not found: {DATA_FILE}")
+        df = pd.read_csv(DATA_FILE)
+        required_columns = ["ad_id", "ad_product", "brand", "url", "ad_description"]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"Missing required columns in CSV: {missing_columns}")
+        if len(df) == 0:
+            raise ValueError(f"CSV file is empty: {DATA_FILE}")
+        ad_facts_list = df[required_columns].to_dict("records")
+        print(f"✅ Loaded {len(ad_facts_list)} ad facts from {DATA_FILE}")
+    except Exception as e:
+        print(f"❌ Failed to load data file: {e}")
+        sys.exit(1)
 
     # 2) Build the trainer
     trainer = make_trainer(

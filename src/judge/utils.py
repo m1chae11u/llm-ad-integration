@@ -135,32 +135,83 @@ def clear_caches():
     _embedding_cache.clear()
     _judge_cache.clear()
 
-async def call_gemini_api(prompt, keys):
-    """Call Gemini 1.5 Flash API and extract JSON response asynchronously."""
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = await asyncio.to_thread(
-            model.generate_content,
-            prompt,
-            generation_config={
-                "temperature": 0.1,
-                "top_p": 0.1,
-                "top_k": 1,
-            }
-        )
-        
-        # Extract JSON from response
-        text = response.text
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            result = json.loads(match.group(0))
-            for key in keys:
-                result.setdefault(key, None)
-            return result
-        return {key: None for key in keys}
-    except Exception as e:
-        print("Gemini API call failed:", e)
-        return {key: None for key in keys}
+async def call_gemini_api(prompt, keys, max_retries=3, backoff_factor=1.0):
+    """Call Gemini 1.5 Flash API and extract JSON response asynchronously with retry logic."""
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    for attempt in range(max_retries):
+        try:
+            response = await asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                generation_config={
+                    "temperature": 0.1,
+                    "top_p": 0.1,
+                    "top_k": 1,
+                }
+            )
+            
+            # Extract JSON from response with robust parsing
+            if not hasattr(response, 'text') or not response.text:
+                raise ValueError("Empty response from Gemini API")
+            
+            text = response.text.strip()
+            
+            # Try multiple JSON extraction strategies
+            result = None
+            
+            # Strategy 1: Look for JSON object in the text
+            match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+            if match:
+                try:
+                    result = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+            
+            # Strategy 2: Try parsing the entire text as JSON
+            if result is None:
+                try:
+                    result = json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+            
+            # Strategy 3: Look for JSON in code blocks
+            if result is None:
+                code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+                if code_block_match:
+                    try:
+                        result = json.loads(code_block_match.group(1))
+                    except json.JSONDecodeError:
+                        pass
+            
+            # If we got a result, validate and return it
+            if result is not None and isinstance(result, dict):
+                # Ensure all required keys exist with defaults
+                for key in keys:
+                    result.setdefault(key, None)
+                return result
+            
+            # If no valid JSON found, log and retry
+            if attempt < max_retries - 1:
+                wait_time = backoff_factor * (2 ** attempt)
+                print(f"⚠️ No valid JSON found in response (attempt {attempt+1}/{max_retries}). Retrying in {wait_time}s...")
+                print(f"   Response preview: {text[:200]}...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"⚠️ Failed to extract JSON after {max_retries} attempts. Response: {text[:500]}")
+                return {key: None for key in keys}
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = backoff_factor * (2 ** attempt)
+                print(f"⚠️ Gemini API call failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"❌ Gemini API call failed after {max_retries} attempts: {e}")
+                return {key: None for key in keys}
+    
+    # Fallback (should never reach here, but just in case)
+    return {key: None for key in keys}
 
 # Synchronous version for backward compatibility
 def call_gemini_and_extract_json(prompt, keys):

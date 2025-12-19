@@ -205,12 +205,13 @@ class MyPPOTrainer(CustomPPOTrainer):
         self._last_batch_dataset_idxs = dataset_idxs
 
         # --- Use collator for tokenization & padding ---
+        # Tokenize prompts explicitly for clarity and error handling
         batch_with_ad = self.data_collator([
-            {"input_ids": self._custom_tokenizer(prompt)["input_ids"], "dataset_idx": idx}
+            {"text": prompt, "dataset_idx": idx}
             for prompt, idx in zip(full_prompts_ad, dataset_idxs)
         ])
         batch_no_ad = self.data_collator([
-            {"input_ids": self._custom_tokenizer(prompt)["input_ids"], "dataset_idx": idx}
+            {"text": prompt, "dataset_idx": idx}
             for prompt, idx in zip(full_prompts_no_ad, dataset_idxs)
         ])
 
@@ -284,15 +285,24 @@ class MyPPOTrainer(CustomPPOTrainer):
             ad_texts = self._last_batch_ad_texts
         else:
             ad_texts = []
-            for i in range(len(prompts)):
-                ad = self.ad_facts_list[i]
-                ad_texts.append(
-                    f"Product: {ad['ad_product']}\n"
-                    f"Brand: {ad['brand']}\n"
-                    f"URL: {ad['url']}\n"
-                    f"Description: {ad['ad_description']}"
-                )
+            # Use dataset_idx from the batch, not batch index
+            dataset_idxs = getattr(self, '_last_batch_dataset_idxs', list(range(len(prompts))))
+            for i, idx in enumerate(dataset_idxs):
+                if idx < len(self.ad_facts_list):
+                    ad = self.ad_facts_list[idx]
+                    ad_texts.append(
+                        f"Product: {ad['ad_product']}\n"
+                        f"Brand: {ad['brand']}\n"
+                        f"URL: {ad['url']}\n"
+                        f"Description: {ad['ad_description']}"
+                    )
+                else:
+                    logger.warning(f"Dataset index {idx} out of range for ad_facts_list (len={len(self.ad_facts_list)})")
+                    ad_texts.append("")
         # Extract no-ad responses from buffer for detectability
+        # Ensure we have enough no-ad responses
+        if len(PPO_NO_AD_BUFFER) < len(responses_text):
+            logger.warning(f"⚠️ Not enough no-ad responses in buffer ({len(PPO_NO_AD_BUFFER)} < {len(responses_text)}). Using empty strings.")
         no_ads = [
             PPO_NO_AD_BUFFER.pop(0) if PPO_NO_AD_BUFFER else ""
             for _ in responses_text
@@ -350,15 +360,19 @@ class MyPPOTrainer(CustomPPOTrainer):
             logger.info(
                 f"   Detectability: detectability_cosine={det.get('detectability_cosine', None)}, similarity_cosine={det.get('similarity_cosine', None)}"
             )
+            # Handle detectability score with None safety
             det_cos = det.get("detectability_cosine", 0)
-            det_cos = max(min(det_cos, 1.0), -1.0)  # Clamp between -1 and 1
+            if det_cos is None:
+                logger.warning(f"⚠️ Detectability score is None for item {i}, using 0")
+                det_cos = 0
+            det_cos = max(min(float(det_cos), 1.0), -1.0)  # Clamp between -1 and 1
 
-            total = (
-                sc.get("Coherence Score", 0)
-                + sh.get("H1", 0)
-                + ss.get("Ad Salience Score", 0)
-                + det_cos
-            )
+            # Safely extract scores with defaults
+            coherence_score = float(sc.get("Coherence Score", 0) or 0)
+            helpfulness_score = float(sh.get("H1", 0) or 0)
+            salience_score = float(ss.get("Ad Salience Score", 0) or 0)
+            
+            total = coherence_score + helpfulness_score + salience_score + det_cos
             scores.append(torch.tensor(total, device=self.current_device))
             logger.info(f"✅ Judges complete for item {i}, total reward: {total:.4f}")
 
@@ -463,128 +477,128 @@ class MyPPOTrainer(CustomPPOTrainer):
             print("❌ PPO training ended with 0 valid steps.")
             sys.exit(1)
 
-    def make_trainer(
-        model_name: str,
-        hf_token: str,
-        data_path: str,
-        ad_facts_list: List[dict],
-    ):
-        global GLOBAL_AD_FACTS_LIST
-        GLOBAL_AD_FACTS_LIST = ad_facts_list
+def make_trainer(
+    model_name: str,
+    hf_token: str,
+    data_path: str,
+    ad_facts_list: List[dict],
+):
+    global GLOBAL_AD_FACTS_LIST
+    GLOBAL_AD_FACTS_LIST = ad_facts_list
 
-        # --- Load the tokenizer ---
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name, use_fast=True, trust_remote_code=True, use_auth_token=hf_token
-        )
+    # --- Load the tokenizer ---
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, use_fast=True, trust_remote_code=True, use_auth_token=hf_token
+    )
 
-        # ✅ Configure tokenizer once
-        tokenizer.padding_side = "left"
-        tokenizer.truncation_side = "right"
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
-        tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+    # ✅ Configure tokenizer once
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "right"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
-        # --- Load the policy (with value head) ---
-        logger.info("💻 Loading model for CPU training...")
-        try:
-            policy = AutoModelForCausalLMWithValueHead.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                use_auth_token=hf_token,
-                torch_dtype=torch.float32,  # CPU mode
-                device_map=None,
-            ).to(DEVICE)
-            logger.info(f"💻 Model loaded and moved to {DEVICE}")
-        except Exception as e:
-            logger.error(f"❌ Failed to load model: {e}")
-            raise e
+    # --- Load the policy (with value head) ---
+    logger.info("💻 Loading model for CPU training...")
+    try:
+        policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            use_auth_token=hf_token,
+            torch_dtype=torch.float32,  # CPU mode
+            device_map=None,
+        ).to(DEVICE)
+        logger.info(f"💻 Model loaded and moved to {DEVICE}")
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        raise e
 
-        # Patch model forward (__call__) for llamafactory PPO trainer
-        # def patched_call(self, *args, **kwargs):
-        #     original_output = super(self.__class__, self).forward(*args, **kwargs)
-        #     if hasattr(original_output, "logits"):
-        #         past_key_values = getattr(original_output, "past_key_values", None)
-        #         if hasattr(original_output, "value"):
-        #             return original_output.logits, past_key_values, original_output.value
-        #         return original_output.logits, past_key_values, None
-        #     elif isinstance(original_output, tuple):
-        #         return (original_output + (None,) * 3)[:3]
-        #     return original_output, None, None
+    # Patch model forward (__call__) for llamafactory PPO trainer
+    def patched_call(self, *args, **kwargs):
+        original_output = super(self.__class__, self).forward(*args, **kwargs)
+        if hasattr(original_output, "logits"):
+            past_key_values = getattr(original_output, "past_key_values", None)
+            if hasattr(original_output, "value"):
+                return original_output.logits, past_key_values, original_output.value
+            return original_output.logits, past_key_values, None
+        elif isinstance(original_output, tuple):
+            return (original_output + (None,) * 3)[:3]
+        return original_output, None, None
 
-        policy.__call__ = patched_call.__get__(policy, policy.__class__)
-        policy.gradient_checkpointing_enable()
-        policy.config.pad_token_id = tokenizer.pad_token_id
+    policy.__call__ = patched_call.__get__(policy, policy.__class__)
+    policy.gradient_checkpointing_enable()
+    policy.config.pad_token_id = tokenizer.pad_token_id
 
-        # --- Frozen reference model ---
-        ref = create_reference_model(policy).to("cpu")
-        ref.__call__ = patched_call.__get__(ref, ref.__class__)
-        ref.eval()
-        for p in ref.parameters():
-            p.requires_grad = False
+    # --- Frozen reference model ---
+    ref = create_reference_model(policy).to("cpu")
+    ref.__call__ = patched_call.__get__(ref, ref.__class__)
+    ref.eval()
+    for p in ref.parameters():
+        p.requires_grad = False
 
-        # --- Load & tokenize dataset ---
-        ds = load_dataset("csv", data_files={"train": data_path})["train"]
-        ds = ds.add_column("idx", list(range(len(ds))))
+    # --- Load & tokenize dataset ---
+    ds = load_dataset("csv", data_files={"train": data_path})["train"]
+    ds = ds.add_column("idx", list(range(len(ds))))
 
-        ds.set_format(type="torch", columns=["input_ids", "attention_mask", "dataset_idx"])
+    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "dataset_idx"])
 
-        # --- Collator (single source of truth) ---
-        collator = PPODataCollator(tokenizer)
+    # --- Collator (single source of truth) ---
+    collator = PPODataCollator(tokenizer)
 
-        # --- Trainer args ---
-        model_args      = ModelArguments(model_name_or_path=model_name, hf_hub_token=hf_token)
-        data_args       = DataArguments(
-            template="default",
-            dataset=Path(data_path).name,
-            dataset_dir=str(Path(data_path).parent),
-        )
-        training_args   = TrainingArguments(
-            output_dir="logs/ppo_run",
-            per_device_train_batch_size=4,
-            save_strategy="steps",
-            save_steps=1,
-            logging_steps=1,
-            max_grad_norm=1.0,
-            gradient_checkpointing=True,
-            dataloader_num_workers=0,
-            no_cuda=True,
-            dataloader_pin_memory=False,
-        )
-        finetuning_args = FinetuningArguments(ppo_epochs=4, ppo_buffer_size=1)
-        generating_args = GeneratingArguments(
-            do_sample=False,
-            temperature=None,
-            top_k=None,
-            top_p=None,
-            max_new_tokens=512,
-        )
+    # --- Trainer args ---
+    model_args      = ModelArguments(model_name_or_path=model_name, hf_hub_token=hf_token)
+    data_args       = DataArguments(
+        template="default",
+        dataset=Path(data_path).name,
+        dataset_dir=str(Path(data_path).parent),
+    )
+    training_args   = TrainingArguments(
+        output_dir="logs/ppo_run",
+        per_device_train_batch_size=4,
+        save_strategy="steps",
+        save_steps=1,
+        logging_steps=1,
+        max_grad_norm=1.0,
+        gradient_checkpointing=True,
+        dataloader_num_workers=0,
+        no_cuda=True,
+        dataloader_pin_memory=False,
+    )
+    finetuning_args = FinetuningArguments(ppo_epochs=4, ppo_buffer_size=1)
+    generating_args = GeneratingArguments(
+        do_sample=False,
+        temperature=None,
+        top_k=None,
+        top_p=None,
+        max_new_tokens=512,
+    )
 
-        # --- Build trainer ---
-        trainer = MyPPOTrainer(
-            model_args      = model_args,
-            training_args   = training_args,
-            finetuning_args = finetuning_args,
-            generating_args = generating_args,
-            callbacks       = None,
-            model           = policy,
-            reward_model    = None,
-            ref_model       = ref,
-            tokenizer       = tokenizer,
-            processor       = None,
-            data_collator   = collator,
-            train_dataset   = ds,
-            ad_facts_list   = ad_facts_list,
-        )
+    # --- Build trainer ---
+    trainer = MyPPOTrainer(
+        model_args      = model_args,
+        training_args   = training_args,
+        finetuning_args = finetuning_args,
+        generating_args = generating_args,
+        callbacks       = None,
+        model           = policy,
+        reward_model    = None,
+        ref_model       = ref,
+        tokenizer       = tokenizer,
+        processor       = None,
+        data_collator   = collator,
+        train_dataset   = ds,
+        ad_facts_list   = ad_facts_list,
+    )
 
-        # Expose args + objects
-        trainer.data_args = data_args
-        trainer.model_args = model_args
-        trainer.training_args = training_args
-        trainer.finetuning_args = finetuning_args
-        trainer.generating_args = generating_args
-        trainer.train_dataset = ds
-        trainer.ref_model = ref
-        trainer._custom_tokenizer = tokenizer  # still available, but collator is preferred
+    # Expose args + objects
+    trainer.data_args = data_args
+    trainer.model_args = model_args
+    trainer.training_args = training_args
+    trainer.finetuning_args = finetuning_args
+    trainer.generating_args = generating_args
+    trainer.train_dataset = ds
+    trainer.ref_model = ref
+    trainer._custom_tokenizer = tokenizer  # still available, but collator is preferred
 
-        return trainer
+    return trainer
 
