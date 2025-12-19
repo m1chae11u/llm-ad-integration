@@ -96,22 +96,30 @@ class MyPPOTrainer(CustomPPOTrainer):
         ad_facts_list: Optional[List[dict]] = None,
         **kwargs,
     ):
-        self.train_dataset = kwargs.get("train_dataset")
+        # Call super first to initialize self.args, self.tokenizer, etc.
+        # The parent class will handle train_dataset from kwargs
         super().__init__(*args, **kwargs)
+        
+        # Now safe to access self.args and other parent attributes
         # Disable warning for right-padding in decoder-only generation
         try:
             # Clear internal pad tensor so generation won't warn
             self.generation_config._pad_token_tensor = None
         except Exception:
             pass
+        
         # Use provided ad_facts_list or fallback to global
         if ad_facts_list is None:
             ad_facts_list = GLOBAL_AD_FACTS_LIST
         self.ad_facts_list = ad_facts_list
+        
         # Store no-ad responses for detectability
         self.no_ad_responses: List[str] = []
         
-        # Initialize dataloader iterator
+        # Initialize dataloader iterator (now safe since super().__init__ completed)
+        # Verify self.args exists before accessing it
+        if not hasattr(self, 'args'):
+            raise RuntimeError("self.args not initialized by parent class")
         self._dataloader_iter = None
         self._reset_dataloader()
         
@@ -564,7 +572,14 @@ def make_trainer(
         no_cuda=True,
         dataloader_pin_memory=False,
     )
-    finetuning_args = FinetuningArguments(ppo_epochs=4, ppo_buffer_size=1)
+    finetuning_args = FinetuningArguments(
+        ppo_epochs=4, 
+        ppo_buffer_size=1,
+        reward_model_type="api",  # Using custom get_rewards with API judges, not model-based
+        ppo_target=0.1,  # Default KL divergence target for PPO
+        ppo_score_norm=False,  # Disable score normalization (can enable if needed)
+        ppo_whiten_rewards=False,  # Disable reward whitening (can enable if needed)
+    )
     generating_args = GeneratingArguments(
         do_sample=False,
         temperature=None,
