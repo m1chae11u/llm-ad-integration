@@ -77,7 +77,9 @@ source venv/bin/activate
 ## 3. Install Requirements
 
 ```bash
+pip install wheel setuptools ninja
 pip install -r requirements.txt
+pip install flash-attn --no-build-isolation
 ```
 
 ---
