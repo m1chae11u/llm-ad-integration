@@ -21,9 +21,14 @@ class CheckpointManager:
         )
 
         for ckpt in checkpoints:
-            model_path = ckpt / "pytorch_model.bin"
+            # Check for both safetensors (modern) and pytorch_model.bin (legacy) formats
+            has_model = (
+                (ckpt / "model.safetensors.index.json").exists() or
+                (ckpt / "pytorch_model.bin").exists() or
+                any((ckpt / f).exists() for f in list(ckpt.glob("model-*.safetensors")))
+            )
             tokenizer_path = ckpt / "tokenizer_config.json"
-            if model_path.exists() and tokenizer_path.exists():
+            if has_model and tokenizer_path.exists():
                 model = AutoModelForCausalLM.from_pretrained(ckpt, use_auth_token=self.hf_token)
                 tokenizer = AutoTokenizer.from_pretrained(ckpt, use_auth_token=self.hf_token)
                 step = int(ckpt.name.split('-')[-1])

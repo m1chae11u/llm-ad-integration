@@ -85,12 +85,37 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("⚠️ Training interrupted. Saving checkpoint before exit…")
         try:
-            trainer.save_model()
-            last_pos = {"query_index": resume_query_idx}
+            # Save in checkpoint format that CheckpointManager can recognize
+            import torch
+            from pathlib import Path
+            
+            # Get the current step from trainer if available
+            current_step = getattr(trainer, '_current_step', 0)
+            if hasattr(trainer, 'total_steps'):
+                current_step = trainer.total_steps
+            
+            checkpoint_dir = output_dir / f"checkpoint-{current_step}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save model and tokenizer
+            trainer.model.save_pretrained(checkpoint_dir)
+            if hasattr(trainer, '_custom_tokenizer') and trainer._custom_tokenizer:
+                trainer._custom_tokenizer.save_pretrained(checkpoint_dir)
+            
+            # Save optimizer state if available
+            if hasattr(trainer, 'optimizer') and trainer.optimizer:
+                torch.save(trainer.optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+            
+            # Save training position
+            last_pos = {"query_index": current_step}
             with open(output_dir / "last_query_position.json", "w") as f:
                 json.dump(last_pos, f)
+            
+            print(f"✅ Checkpoint saved to {checkpoint_dir}")
         except Exception as e:
             print(f"⚠️ Failed to save checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
         sys.exit(0)
     else:
         trainer.save_model()

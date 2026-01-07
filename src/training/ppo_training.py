@@ -3,7 +3,9 @@ _wf.create_reward_model = lambda model, model_args, finetuning_args: None
 from llamafactory.train.ppo.workflow import CustomPPOTrainer
 import torch
 import asyncio
+import time
 from typing import List, Optional
+from datetime import datetime, timedelta
 from llamafactory.hparams import (
     ModelArguments,
     DataArguments,
@@ -26,6 +28,7 @@ from torch.utils.data import DataLoader
 import pandas as pd
 from pathlib import Path
 import sys  # for handling interrupt and exit
+import json
 from config import DATA_FILE
 import os
 # Note: We're now using processing_class instead of deprecated tokenizer
@@ -41,11 +44,17 @@ PPO_NO_AD_BUFFER: List[str] = []
 # Global ad facts list for custom PPO trainer
 GLOBAL_AD_FACTS_LIST: List[dict] = []
 
-# Force CPU mode for now to debug the training logic
-# We'll fix GPU issues separately
-print("🔄 Temporarily forcing CPU mode to debug training logic")
-DEVICE = torch.device("cpu")
-print("💻 Using CPU for training (GPU debugging will be done separately)")
+# Auto-detect device (GPU if available, otherwise CPU)
+# Set memory fragmentation optimization for CUDA
+if torch.cuda.is_available():
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    DEVICE = torch.device("cuda")
+    print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+    print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    print(f"🔧 CUDA memory optimization enabled")
+else:
+    DEVICE = torch.device("cpu")
+    print("⚠️ No GPU detected, using CPU (training will be slower)")
 
 # Define a custom collator to pad and retain metadata
 class PPODataCollator:
@@ -63,30 +72,51 @@ class PPODataCollator:
 
     def __call__(self, features):
         self._call_count += 1
-        if self._call_count <= 3:
-            print(f"📦 Collating batch {self._call_count}: {features[0].keys() if features else 'EMPTY'}")
-
+        
         if not features:
             raise ValueError("❌ Empty features list provided to collator")
+        
+        # Convert Arrow format to dict if needed (datasets library returns Arrow format)
+        if hasattr(features[0], 'keys'):
+            # Already a dict-like object
+            first_item = features[0]
+        else:
+            # Might be Arrow format, convert to dict
+            first_item = dict(features[0]) if not isinstance(features[0], dict) else features[0]
+            features = [dict(f) if not isinstance(f, dict) else f for f in features]
+        
+        if self._call_count <= 3:
+            print(f"📦 Collating batch {self._call_count}: {list(first_item.keys()) if hasattr(first_item, 'keys') else type(first_item)}")
 
-        # Extract texts for tokenization
-        texts = [f.get("text", "") for f in features]
-        batch = self.tokenizer(
-            texts,
-            truncation=True,
-            padding=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-
-        # Preserve ad metadata
-        for key in self.ad_keys:
-            if key in features[0]:
-                batch[key] = [f.get(key, None) for f in features]
+        # Check if this is a raw dataset item (has vague_query) or a prompt item (has text)
+        if "text" in first_item:
+            # Tokenize prompts (used in get_inputs)
+            texts = [f.get("text", "") if isinstance(f, dict) else getattr(f, "text", "") for f in features]
+            batch = self.tokenizer(
+                texts,
+                truncation=True,
+                padding=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            # Preserve dataset_idx if present
+            if "dataset_idx" in first_item:
+                batch["dataset_idx"] = [f.get("dataset_idx") if isinstance(f, dict) else getattr(f, "dataset_idx", None) for f in features]
+        else:
+            # Raw dataset items - just preserve all fields without tokenization
+            # The dataloader should pass raw items, tokenization happens in get_inputs
+            batch = {}
+            # Preserve all fields from the dataset
+            keys = first_item.keys() if hasattr(first_item, 'keys') else []
+            for key in keys:
+                batch[key] = [
+                    f.get(key, None) if isinstance(f, dict) else getattr(f, key, None)
+                    for f in features
+                ]
 
         if self._call_count <= 3:
             print(f"📦 Collated batch shapes: {[(k, (v.shape if hasattr(v, 'shape') else type(v))) for k, v in batch.items()]}")
-
+        
         return batch
 
 class MyPPOTrainer(CustomPPOTrainer):
@@ -96,9 +126,20 @@ class MyPPOTrainer(CustomPPOTrainer):
         ad_facts_list: Optional[List[dict]] = None,
         **kwargs,
     ):
+        # Extract data_collator from kwargs before passing to super
+        # We need to ensure our custom collator is used
+        custom_collator = kwargs.get('data_collator', None)
+        
         # Call super first to initialize self.args, self.tokenizer, etc.
         # The parent class will handle train_dataset from kwargs
         super().__init__(*args, **kwargs)
+        
+        # Ensure our custom collator is used (parent might have created a default one)
+        if custom_collator is not None:
+            self.data_collator = custom_collator
+            print(f"✅ Using custom data collator: {type(self.data_collator).__name__}")
+        else:
+            print(f"⚠️ No custom collator provided, using: {type(self.data_collator).__name__}")
         
         # Now safe to access self.args and other parent attributes
         # Disable warning for right-padding in decoder-only generation
@@ -121,7 +162,13 @@ class MyPPOTrainer(CustomPPOTrainer):
         if not hasattr(self, 'args'):
             raise RuntimeError("self.args not initialized by parent class")
         self._dataloader_iter = None
-        self._reset_dataloader()
+        
+        # train_dataset might be set by parent class or will be set later in make_trainer
+        # So we'll initialize the dataloader lazily when needed
+        if hasattr(self, 'train_dataset') and self.train_dataset is not None:
+            self._reset_dataloader()
+        else:
+            print("⚠️ train_dataset not yet available, will initialize dataloader when needed")
         
         # Force CPU mode by overriding current_device
         self.current_device = DEVICE
@@ -130,25 +177,34 @@ class MyPPOTrainer(CustomPPOTrainer):
     def _reset_dataloader(self):
         """Reset the dataloader iterator."""
         try:
+            # Check if train_dataset is available
+            if not hasattr(self, 'train_dataset') or self.train_dataset is None:
+                raise RuntimeError("train_dataset not available. It should be set before calling _reset_dataloader()")
+            
+            # Verify we have a collator
+            if not hasattr(self, 'data_collator') or self.data_collator is None:
+                raise RuntimeError("data_collator not available")
+            
+            print(f"📦 Using collator: {type(self.data_collator).__name__}")
+            
             # Create a new dataloader with explicit settings
+            # Use our custom collator explicitly
+            collate_fn = self.data_collator
+            print(f"📦 Creating dataloader with collator: {type(collate_fn).__name__}")
+            
             self.dataloader = torch.utils.data.DataLoader(
                 self.train_dataset,
                 batch_size=self.args.per_device_train_batch_size,
-                collate_fn=self.data_collator,
+                collate_fn=collate_fn,
                 shuffle=True,
-                num_workers=0,  # Disable multiprocessing for debugging
-                drop_last=False  # Keep all samples
+                num_workers=2 if torch.cuda.is_available() else 0,  # Enable workers on GPU
+                drop_last=False,  # Keep all samples
+                pin_memory=torch.cuda.is_available()  # Pin memory on GPU
             )
-            self._dataloader_iter = iter(self.dataloader)
             
-            # Test first batch
-            test_batch = next(self._dataloader_iter)
-            if test_batch is None:
-                raise RuntimeError("Got None batch from dataloader")
-                
-            print(f"✅ Dataloader reset: {len(self.dataloader)} batches, batch size {self.args.per_device_train_batch_size}")
+            print(f"✅ Dataloader created: {len(self.dataloader)} batches, batch size {self.args.per_device_train_batch_size}")
             
-            # Reset iterator after test
+            # Initialize iterator (don't test batch here to avoid errors)
             self._dataloader_iter = iter(self.dataloader)
             
         except Exception as e:
@@ -182,6 +238,17 @@ class MyPPOTrainer(CustomPPOTrainer):
 
     @torch.no_grad()
     def get_inputs(self, batch):
+        """Generate responses with and without ads."""
+        # Handle both list-of-dicts and batched-dict formats from DataLoader
+        if isinstance(batch, dict) and "vague_query" in batch:
+            # Batched dict format - convert to list of dicts
+            batch_size = len(batch["vague_query"])
+            batch = [
+                {key: batch[key][i] if isinstance(batch[key], (list, tuple)) else batch[key]
+                 for key in batch.keys()}
+                for i in range(batch_size)
+            ]
+        
         # Decode raw queries for logging
         raw_qs = [ex["vague_query"] for ex in batch]
         self._last_batch_raw_qs = raw_qs
@@ -223,19 +290,65 @@ class MyPPOTrainer(CustomPPOTrainer):
             for prompt, idx in zip(full_prompts_no_ad, dataset_idxs)
         ])
 
-        # Move to device
-        input_ids_ad = batch_with_ad["input_ids"].to(self.current_device)
-        attention_mask_ad = batch_with_ad["attention_mask"].to(self.current_device)
-        input_ids_no_ad = batch_no_ad["input_ids"].to(self.current_device)
-        attention_mask_no_ad = batch_no_ad["attention_mask"].to(self.current_device)
-
-        model = self.accelerator.unwrap_model(self.model).to(self.current_device)
+        # Get model - CRITICAL: Don't move it! It's already on the correct device.
+        # Moving causes OOM because PyTorch creates a duplicate copy in memory.
+        model = self.accelerator.unwrap_model(self.model)
+        
+        # Determine model's actual device
+        # With device_map="auto", model should be on GPU
+        # Check base model first (value head might be on different device)
+        try:
+            # Try to get device from base model (more reliable)
+            if hasattr(model, 'pretrained_model'):
+                # This is a model with value head - check base model
+                base_model = model.pretrained_model
+                model_device = next(base_model.parameters()).device
+            elif hasattr(model, 'model'):
+                # Some models wrap in .model attribute
+                model_device = next(model.model.parameters()).device
+            else:
+                # Check multiple parameters to find the actual device
+                devices = set()
+                param_count = 0
+                for param in model.parameters():
+                    devices.add(param.device)
+                    param_count += 1
+                    if param_count >= 20:  # Check more parameters
+                        break
+                
+                # Prefer GPU if available
+                if torch.cuda.is_available() and any(d.type == "cuda" for d in devices):
+                    model_device = torch.device("cuda")
+                elif len(devices) == 1:
+                    model_device = devices.pop()
+                else:
+                    # Use first GPU device found, or first device
+                    cuda_devices = [d for d in devices if d.type == "cuda"]
+                    model_device = cuda_devices[0] if cuda_devices else next(iter(devices))
+        except (StopIteration, AttributeError, RuntimeError) as e:
+            # Fallback: if GPU available, use GPU; otherwise CPU
+            model_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.debug(f"Device detection fallback: {e}")
+        
+        # Debug: log device info (only first time)
+        if not hasattr(self, '_device_logged'):
+            logger.info(f"🔧 Model device: {model_device}, Current device: {self.current_device}")
+            if model_device.type == "cpu" and torch.cuda.is_available():
+                logger.warning(f"⚠️ Model is on CPU but GPU is available - this will be very slow!")
+            self._device_logged = True
+        
+        # Move inputs to model's device (not self.current_device which might be wrong)
+        input_ids_ad = batch_with_ad["input_ids"].to(model_device)
+        attention_mask_ad = batch_with_ad["attention_mask"].to(model_device)
+        input_ids_no_ad = batch_no_ad["input_ids"].to(model_device)
+        attention_mask_no_ad = batch_no_ad["attention_mask"].to(model_device)
 
         # --- Generate responses ---
         gen_kwargs = self.generation_config.to_dict()
         for k in ["skip_special_tokens", "max_length", "pad_token_id", "eos_token_id"]:
             gen_kwargs.pop(k, None)
 
+        # Generate with ads
         gen_out_ad = model.generate(
             generation_config=self.generation_config,
             input_ids=input_ids_ad,
@@ -244,6 +357,7 @@ class MyPPOTrainer(CustomPPOTrainer):
             **gen_kwargs,
         )
 
+        # Generate without ads
         gen_out_no_ad = model.generate(
             generation_config=self.generation_config,
             input_ids=input_ids_no_ad,
@@ -421,66 +535,193 @@ class MyPPOTrainer(CustomPPOTrainer):
 
 
     def ppo_train(self, resume_from_checkpoint=None, start_step=0, start_query_idx=0):
+        # Clear GPU cache at start to free up memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+            allocated_mem = torch.cuda.memory_allocated(0)
+            free_mem = (total_mem - allocated_mem) / 1e9  # Convert bytes to GB
+            print(f"🧹 Cleared GPU cache. Free memory: {free_mem:.2f} GB")
+        
         print("✅ USING CUSTOM ppo_train!")
         print(f"📊 Resume info: checkpoint={resume_from_checkpoint}, step={start_step}, query_idx={start_query_idx}")
 
         total_loss = 0.0
         total_reward = 0.0
         total_steps = 0
+        
+        # Calculate total steps for progress tracking
+        total_epochs = self.finetuning_args.ppo_epochs
+        batches_per_epoch = len(self.dataloader)
+        total_batches = total_epochs * batches_per_epoch
+        
+        print(f"📈 Training plan: {total_epochs} epochs × {batches_per_epoch} batches = {total_batches} total batches")
+        print(f"⏰ Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Reset dataloader at the start of training
         self._reset_dataloader()
+        
+        # Time tracking
+        training_start_time = time.time()
+        step_times = []
+        
+        # Track current step for checkpoint saving
+        self._current_step = start_step
+        self.total_steps = 0  # Track total completed steps
 
-        # If resuming, we might want to skip some steps or adjust the dataloader
+        # If resuming, calculate which epoch and batch to start from
+        start_epoch = 0
+        start_batch_idx = 0
         if start_step > 0:
-            print(f"⏯ Resuming from step {start_step}")
-            # For now, we'll just continue from where we left off
-            # In a more sophisticated implementation, you might want to restore the exact state
+            start_epoch = start_step // batches_per_epoch
+            start_batch_idx = start_step % batches_per_epoch
+            print(f"⏯ Resuming from step {start_step} (epoch {start_epoch + 1}, batch {start_batch_idx + 1})")
+            # Skip batches in the dataloader to get to the right position
+            if start_batch_idx > 0:
+                # Reset and skip to the right position
+                self._reset_dataloader()
+                for _ in range(start_batch_idx):
+                    try:
+                        next(self._dataloader_iter)
+                    except StopIteration:
+                        self._reset_dataloader()
+                        break
 
-        for step in range(self.finetuning_args.ppo_epochs):
-            try:
-                batch = self._make_batch()
-                if not batch:
-                    print(f"⚠️ Skipping step {step}: empty batch")
-                    continue
-
-                print(f"🔁 PPO Step {step}")
-                self.model.eval()
+        for epoch in range(start_epoch, self.finetuning_args.ppo_epochs):
+            print(f"\n{'='*60}")
+            print(f"📚 EPOCH {epoch + 1}/{total_epochs}")
+            print(f"{'='*60}")
+            
+            # Determine starting batch index for this epoch
+            batch_start = start_batch_idx if epoch == start_epoch else 0
+            
+            for batch_idx in range(batch_start, batches_per_epoch):
+                step = epoch * batches_per_epoch + batch_idx
+                step_start_time = time.time()
                 
-                # Ensure batch is on the correct device
-                batch = {k: v.to(self.current_device) if isinstance(v, torch.Tensor) else v 
-                        for k, v in batch.items()}
-                
-                queries, responses = self.get_inputs(batch)
-                rewards = self.get_rewards(queries, responses)
+                try:
+                    batch = self._make_batch()
+                    if not batch:
+                        print(f"⚠️ Skipping step {step}: empty batch")
+                        continue
 
-                if not rewards:
-                    print(f"⚠️ Step {step}: No rewards returned, skipping optimization")
-                    continue
+                    # Progress indicator
+                    progress = (step + 1) / total_batches * 100
+                    print(f"\n🔁 Step {step + 1}/{total_batches} ({progress:.1f}%) | Epoch {epoch + 1}/{total_epochs} | Batch {batch_idx + 1}/{batches_per_epoch}")
+                    print(f"⏱️  Time: {datetime.now().strftime('%H:%M:%S')}")
+                    
+                    self.model.eval()
+                    
+                    # Batch from dataloader contains lists (raw data), not tensors
+                    # No need to move to device - get_inputs will handle tokenization and device placement
+                    
+                    print("  📝 Generating responses...")
+                    gen_start = time.time()
+                    queries, responses = self.get_inputs(batch)
+                    gen_time = time.time() - gen_start
+                    print(f"  ✅ Generation complete ({gen_time:.1f}s)")
+                    
+                    print("  🧐 Calling judges...")
+                    judge_start = time.time()
+                    rewards = self.get_rewards(queries, responses)
+                    judge_time = time.time() - judge_start
+                    print(f"  ✅ Judging complete ({judge_time:.1f}s)")
 
-                self.model.train()
-                stats = self.step(queries, responses, rewards)
+                    if not rewards:
+                        print(f"  ⚠️ No rewards returned, skipping optimization")
+                        continue
 
-                step_loss = float(stats.get("ppo/loss/total", 0.0))
-                step_reward = torch.stack(rewards).mean().item()
+                    print("  🔄 Updating model...")
+                    self.model.train()
+                    update_start = time.time()
+                    stats = self.step(queries, responses, rewards)
+                    update_time = time.time() - update_start
 
-                total_loss += step_loss
-                total_reward += step_reward
-                total_steps += 1
+                    step_loss = float(stats.get("ppo/loss/total", 0.0))
+                    step_reward = torch.stack(rewards).mean().item()
 
-                print(f"✅ Step {step} — Loss: {step_loss:.4f}, Reward: {step_reward:.4f}")
+                    total_loss += step_loss
+                    total_reward += step_reward
+                    total_steps += 1
+                    self.total_steps = total_steps  # Update for interruption handling
+                    self._current_step = step + 1  # Update current step
+                    
+                    step_time = time.time() - step_start_time
+                    step_times.append(step_time)
+                    
+                    # Calculate ETA
+                    avg_step_time = sum(step_times[-10:]) / min(10, len(step_times))  # Average of last 10 steps
+                    remaining_steps = total_batches - (step + 1)
+                    eta_seconds = avg_step_time * remaining_steps
+                    eta = timedelta(seconds=int(eta_seconds))
 
-            except Exception as e:
-                print(f"❌ Step {step} failed due to: {e}")
-                import traceback
-                traceback.print_exc()
-                print("❌ Exiting due to error in PPO training")
-                sys.exit(1)
+                    print(f"  ✅ Step complete — Loss: {step_loss:.4f}, Reward: {step_reward:.4f}")
+                    print(f"  ⏱️  Step time: {step_time:.1f}s (Gen: {gen_time:.1f}s, Judge: {judge_time:.1f}s, Update: {update_time:.1f}s)")
+                    print(f"  📊 Avg step time: {avg_step_time:.1f}s | ETA: {eta}")
+                    print(f"  📈 Progress: {len(TRAINING_LOGS)} total judge entries")
+                    
+                    # Save logs incrementally every 50 steps to avoid losing progress
+                    if (step + 1) % 50 == 0:
+                        try:
+                            log_path = Path(self.training_args.output_dir) / "ppo_judging_log.csv"
+                            pd.DataFrame(TRAINING_LOGS).to_csv(log_path, index=False)
+                            elapsed = time.time() - training_start_time
+                            elapsed_str = str(timedelta(seconds=int(elapsed)))
+                            print(f"  💾 Saved incremental logs: {len(TRAINING_LOGS)} entries | Elapsed: {elapsed_str}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Failed to save incremental logs: {e}")
+                    
+                    # Save model checkpoint every 100 steps (configurable via save_steps)
+                    save_steps = getattr(self.training_args, 'save_steps', 100)
+                    if (step + 1) % save_steps == 0:
+                        try:
+                            print(f"  💾 Saving checkpoint at step {step + 1}...")
+                            # Save using trainer's save_model which creates checkpoint-* directories
+                            checkpoint_dir = Path(self.training_args.output_dir) / f"checkpoint-{step + 1}"
+                            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                            
+                            # Save model and tokenizer
+                            self.model.save_pretrained(checkpoint_dir)
+                            if hasattr(self, '_custom_tokenizer') and self._custom_tokenizer:
+                                self._custom_tokenizer.save_pretrained(checkpoint_dir)
+                            
+                            # Save optimizer state if available
+                            if hasattr(self, 'optimizer') and self.optimizer:
+                                torch.save(self.optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+                            
+                            # Save training position
+                            last_pos = {"query_index": step + 1}
+                            with open(Path(self.training_args.output_dir) / "last_query_position.json", "w") as f:
+                                json.dump(last_pos, f)
+                            
+                            print(f"  ✅ Checkpoint saved to {checkpoint_dir}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Failed to save checkpoint: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+                except Exception as e:
+                    print(f"  ❌ Step {step} failed due to: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("❌ Exiting due to error in PPO training")
+                    sys.exit(1)
 
         if total_steps > 0:
             avg_loss = total_loss / total_steps
             avg_reward = total_reward / total_steps
-            print(f"🏁 PPO Training Complete — Avg Loss: {avg_loss:.4f}, Avg Reward: {avg_reward:.4f}")
+            total_time = time.time() - training_start_time
+            total_time_str = str(timedelta(seconds=int(total_time)))
+            print(f"\n{'='*60}")
+            print(f"🏁 PPO Training Complete!")
+            print(f"{'='*60}")
+            print(f"📊 Total steps: {total_steps}")
+            print(f"📈 Avg Loss: {avg_loss:.4f}")
+            print(f"🎯 Avg Reward: {avg_reward:.4f}")
+            print(f"⏱️  Total time: {total_time_str}")
+            print(f"💾 Total judge entries: {len(TRAINING_LOGS)}")
+            print(f"{'='*60}\n")
         else:
             print("❌ PPO training ended with 0 valid steps.")
             sys.exit(1)
@@ -507,16 +748,53 @@ def make_trainer(
     tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     # --- Load the policy (with value head) ---
-    logger.info("💻 Loading model for CPU training...")
+    device_str = "GPU" if torch.cuda.is_available() else "CPU"
+    logger.info(f"💻 Loading model for {device_str} training...")
     try:
-        policy = AutoModelForCausalLMWithValueHead.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            use_auth_token=hf_token,
-            torch_dtype=torch.float32,  # CPU mode
-            device_map=None,
-        ).to(DEVICE)
-        logger.info(f"💻 Model loaded and moved to {DEVICE}")
+        if torch.cuda.is_available():
+            # Use float16 on GPU for speed and memory efficiency
+            # NOTE: Cannot use device_map="auto" with ValueHead models (they don't support CPU/disk offloading)
+            # Try device_map="cuda:0" first (forces GPU, no offloading)
+            # If that fails, fall back to loading to CPU then moving to GPU
+            try:
+                logger.info("📥 Loading model directly to GPU (device_map='cuda:0')...")
+                policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    use_auth_token=hf_token,
+                    torch_dtype=torch.float16,  # Use float16 on GPU
+                    device_map="cuda:0",  # Force GPU, no offloading
+                    low_cpu_mem_usage=True,  # Reduce memory usage during loading
+                )
+                logger.info("✅ Model loaded directly to GPU")
+            except (RuntimeError, ValueError) as e:
+                if "out of memory" in str(e).lower() or "offload" in str(e).lower():
+                    logger.warning(f"⚠️ Direct GPU loading failed: {e}")
+                    logger.info("📥 Falling back to CPU loading then GPU move...")
+                    # Fallback: load to CPU first, then move to GPU
+                    policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+                        model_name,
+                        trust_remote_code=True,
+                        use_auth_token=hf_token,
+                        torch_dtype=torch.float16,
+                        device_map=None,  # Load to CPU
+                        low_cpu_mem_usage=True,
+                    )
+                    logger.info("🚀 Moving model to GPU...")
+                    policy = policy.to("cuda")
+                    logger.info("✅ Model loaded and moved to GPU")
+                else:
+                    raise
+        else:
+            # Use float32 on CPU
+            policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                use_auth_token=hf_token,
+                torch_dtype=torch.float32,  # CPU mode
+                device_map=None,
+            ).to(DEVICE)
+        logger.info(f"💻 Model loaded on {DEVICE}")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         raise e
@@ -538,17 +816,21 @@ def make_trainer(
     policy.config.pad_token_id = tokenizer.pad_token_id
 
     # --- Frozen reference model ---
-    ref = create_reference_model(policy).to("cpu")
+    # Always keep reference model on CPU to save GPU memory (it doesn't need gradients)
+    ref = create_reference_model(policy)
+    ref = ref.to("cpu")  # Always CPU to save GPU memory
     ref.__call__ = patched_call.__get__(ref, ref.__class__)
     ref.eval()
     for p in ref.parameters():
         p.requires_grad = False
 
-    # --- Load & tokenize dataset ---
+    # --- Load dataset (keep in raw format, tokenization happens in collator) ---
     ds = load_dataset("csv", data_files={"train": data_path})["train"]
-    ds = ds.add_column("idx", list(range(len(ds))))
-
-    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "dataset_idx"])
+    ds = ds.add_column("dataset_idx", list(range(len(ds))))
+    
+    # Set format to python dicts (not Arrow) so our collator can work with it
+    # Keep dataset in raw format - the collator will handle tokenization
+    ds.set_format(type="python")  # Use python format, not torch or arrow
 
     # --- Collator (single source of truth) ---
     collator = PPODataCollator(tokenizer)
@@ -560,20 +842,28 @@ def make_trainer(
         dataset=Path(data_path).name,
         dataset_dir=str(Path(data_path).parent),
     )
+    # Speed optimization: Allow configurable batch size and epochs via environment variables
+    # Reduced GPU batch size from 8 to 4 to avoid OOM errors
+    batch_size = int(os.getenv("PPO_BATCH_SIZE", "4" if torch.cuda.is_available() else "4"))
+    ppo_epochs = int(os.getenv("PPO_EPOCHS", "2" if torch.cuda.is_available() else "1"))  # Reduced from 4
+    max_new_tokens = int(os.getenv("MAX_NEW_TOKENS", "256" if torch.cuda.is_available() else "128"))  # Reduced from 512
+    
+    print(f"⚙️ Training config: batch_size={batch_size}, epochs={ppo_epochs}, max_new_tokens={max_new_tokens}")
+    
     training_args   = TrainingArguments(
         output_dir="logs/ppo_run",
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=batch_size,
         save_strategy="steps",
-        save_steps=1,
-        logging_steps=1,
+        save_steps=100,  # Save less frequently to reduce I/O
+        logging_steps=10,  # Log less frequently
         max_grad_norm=1.0,
         gradient_checkpointing=True,
-        dataloader_num_workers=0,
-        no_cuda=True,
-        dataloader_pin_memory=False,
+        dataloader_num_workers=2 if torch.cuda.is_available() else 0,  # Enable workers on GPU
+        no_cuda=not torch.cuda.is_available(),  # Auto-detect
+        dataloader_pin_memory=torch.cuda.is_available(),  # Pin memory on GPU
     )
     finetuning_args = FinetuningArguments(
-        ppo_epochs=4, 
+        ppo_epochs=ppo_epochs, 
         ppo_buffer_size=1,
         reward_model_type="api",  # Using custom get_rewards with API judges, not model-based
         ppo_target=0.1,  # Default KL divergence target for PPO
@@ -585,7 +875,7 @@ def make_trainer(
         temperature=None,
         top_k=None,
         top_p=None,
-        max_new_tokens=512,
+        max_new_tokens=max_new_tokens,
     )
 
     # --- Build trainer ---
@@ -614,6 +904,10 @@ def make_trainer(
     trainer.train_dataset = ds
     trainer.ref_model = ref
     trainer._custom_tokenizer = tokenizer  # still available, but collator is preferred
+    
+    # Now that train_dataset is set, initialize the dataloader if it wasn't done in __init__
+    if trainer._dataloader_iter is None:
+        trainer._reset_dataloader()
 
     return trainer
 

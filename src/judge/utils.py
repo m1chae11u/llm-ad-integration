@@ -13,9 +13,18 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import dotenv
-import google.generativeai as genai
+import google.generativeai as genai  # For Gemini judge API
 import asyncio
 import aiohttp
+
+# Try to import new Google GenAI client for embeddings
+try:
+    from google import genai as google_genai
+    from google.genai import types as genai_types
+    HAS_NEW_GENAI = True
+except ImportError:
+    HAS_NEW_GENAI = False
+    print("⚠️ New google.genai package not found, will use REST API for embeddings")
 
 
 # Load environment variables
@@ -25,14 +34,25 @@ dotenv.load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable is not set")
+# OpenAI API key is now optional (used as fallback only)
+# Google API key is required for embeddings and Gemini
 if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable is not set")
+    raise ValueError("GOOGLE_API_KEY environment variable is not set (required for embeddings and Gemini API)")
 
 # Initialize clients
-embedding_client = OpenAI(api_key=OPENAI_API_KEY)
-genai.configure(api_key=GOOGLE_API_KEY)
+# Use Google embeddings instead of OpenAI to avoid rate limits
+# Keep OpenAI client as optional fallback
+embedding_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+genai.configure(api_key=GOOGLE_API_KEY)  # For Gemini judge API
+
+# Initialize Google GenAI client for embeddings (new API)
+google_embedding_client = None
+if HAS_NEW_GENAI and GOOGLE_API_KEY:
+    try:
+        google_embedding_client = google_genai.Client(api_key=GOOGLE_API_KEY)
+    except Exception as e:
+        print(f"⚠️ Failed to initialize Google GenAI client: {e}")
+        HAS_NEW_GENAI = False
 
 # Cache for embeddings and judge results
 _embedding_cache = {}
@@ -49,30 +69,81 @@ adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_max
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-def get_embedding(text: str, model: str = "text-embedding-ada-002") -> np.ndarray:
-    """Get embedding for a single text using OpenAI's API, retrying on rate limits."""
-    # Throttle requests to avoid hitting API rate limits
-    time.sleep(0.2)
+def get_embedding(text: str, model: str = None) -> np.ndarray:
+    """Get embedding for a single text using Google's Gemini Embedding API."""
+    # Use Google's gemini-embedding-001 model
+    # Supports output_dimensionality: 768, 1536, or 3072 (we use 1536 to match existing code)
+    
     max_retries = 5
     backoff = 1.0
+    
     for attempt in range(max_retries):
         try:
-            response = embedding_client.embeddings.create(
-                model=model,
-                input=[text]
-            )
-            return np.array(response.data[0].embedding)
-        except RateLimitError as e:
-            print(f"Rate limit exceeded, retrying in {backoff}s... (attempt {attempt+1}/{max_retries})")
-            time.sleep(backoff)
-            backoff *= 2
-        except OpenAIError as e:
-            print(f"OpenAI API error: {e}")
-            break
+            # Try new Google GenAI client first (recommended)
+            if HAS_NEW_GENAI and google_embedding_client:
+                result = google_embedding_client.models.embed_content(
+                    model="gemini-embedding-001",
+                    contents=text,
+                    config=genai_types.EmbedContentConfig(
+                        output_dimensionality=1536,  # Match existing code dimension
+                        task_type="SEMANTIC_SIMILARITY"  # Good for similarity comparisons
+                    )
+                )
+                # Extract embedding values
+                embedding = np.array(result.embeddings[0].values)
+                
+            else:
+                # Fallback: Use REST API directly
+                import requests
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+                headers = {
+                    "x-goog-api-key": GOOGLE_API_KEY,
+                    "Content-Type": "application/json"
+                }
+                data = {
+                    "content": {"parts": [{"text": text}]},
+                    "output_dimensionality": 1536,
+                    "task_type": "SEMANTIC_SIMILARITY"
+                }
+                response = requests.post(url, headers=headers, json=data, timeout=30)
+                response.raise_for_status()
+                result = response.json()
+                embedding = np.array(result['embedding']['values'])
+            
+            # Normalize embedding for better similarity calculations (recommended for non-3072 dims)
+            embedding = embedding / np.linalg.norm(embedding)
+            
+            # Ensure it's exactly 1536 dimensions
+            if len(embedding) != 1536:
+                if len(embedding) < 1536:
+                    # Pad with zeros (shouldn't happen with output_dimensionality=1536)
+                    padding = np.zeros(1536 - len(embedding))
+                    embedding = np.concatenate([embedding, padding])
+                else:
+                    embedding = embedding[:1536]
+            
+            return embedding
+            
         except Exception as e:
-            print(f"Unexpected error getting embedding: {e}")
-            break
-    # Fallback to random vector to avoid blocking downstream logic
+            if attempt < max_retries - 1:
+                print(f"Google embedding API error (attempt {attempt+1}/{max_retries}): {e}")
+                time.sleep(backoff)
+                backoff *= 2
+            else:
+                print(f"Google embedding API failed after {max_retries} attempts: {e}")
+                # Fallback to OpenAI if available
+                if embedding_client:
+                    try:
+                        response = embedding_client.embeddings.create(
+                            model="text-embedding-ada-002",
+                            input=[text]
+                        )
+                        return np.array(response.data[0].embedding)
+                    except Exception as openai_error:
+                        print(f"OpenAI fallback also failed: {openai_error}")
+    
+    # Final fallback to random vector to avoid blocking downstream logic
+    print("⚠️ All embedding APIs failed, using random vector fallback")
     return np.random.randn(1536) / np.sqrt(1536)
 
 def get_cache_key(func_name: str, *args, **kwargs) -> str:
@@ -136,8 +207,32 @@ def clear_caches():
     _judge_cache.clear()
 
 async def call_gemini_api(prompt, keys, max_retries=3, backoff_factor=1.0):
-    """Call Gemini 1.5 Flash API and extract JSON response asynchronously with retry logic."""
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    """Call Gemini API and extract JSON response asynchronously with retry logic."""
+    # Recommended models for judging (in order of preference):
+    # 1. gemini-2.5-flash: Stable, best price-performance, fast, supports structured outputs
+    # 2. gemini-3-flash-preview: Latest and fastest, but preview (may have issues)
+    # 3. gemini-2.5-pro: Better quality but slower/expensive
+    # 4. gemini-2.0-flash: Older but stable fallback
+    model_names = [
+        'gemini-2.5-flash',        # Best choice: stable, fast, cost-effective
+        'gemini-3-flash-preview',  # Latest preview (fastest, newest)
+        'gemini-2.5-pro',          # Higher quality but slower
+        'gemini-2.0-flash',        # Stable fallback
+    ]
+    
+    model = None
+    for model_name in model_names:
+        try:
+            model = genai.GenerativeModel(model_name)
+            # Test if model is accessible
+            break
+        except Exception as e:
+            continue
+    
+    if model is None:
+        # Final fallback
+        print(f"⚠️ Warning: Could not initialize any Gemini model. Using 'gemini-2.5-flash' as fallback...")
+        model = genai.GenerativeModel('gemini-2.5-flash')
     
     for attempt in range(max_retries):
         try:
