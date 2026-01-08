@@ -1070,18 +1070,18 @@ class MyPPOTrainer(CustomPPOTrainer):
         # The parent class will use these directly, so they must be on the same device as the model
         import torch
         
-        # Get model device
-        if hasattr(self, 'accelerator') and self.accelerator is not None:
-            model_device = self.accelerator.device
-        elif model is not None:
-            if hasattr(model, 'device'):
-                model_device = model.device
+        # Get model device from the passed model (unwrap if needed) to avoid mismatches
+        if model is not None:
+            target_model = self.accelerator.unwrap_model(model) if hasattr(self, 'accelerator') and self.accelerator is not None else model
+            if hasattr(target_model, 'device'):
+                model_device = target_model.device
             else:
-                model_device = next(model.parameters()).device
+                model_device = next(target_model.parameters()).device
         else:
+            # Fallback to self.model if model is None
             model_device = next(self.model.parameters()).device
         
-        # Move queries to model device
+        # Move queries to model device (if tensors)
         if queries is not None:
             device_fixed_queries = []
             for q in queries:
@@ -1091,7 +1091,7 @@ class MyPPOTrainer(CustomPPOTrainer):
                     device_fixed_queries.append(q)
             queries = device_fixed_queries
         
-        # Move responses to model device
+        # Move responses to model device (if tensors)
         if responses is not None:
             device_fixed_responses = []
             for r in responses:
