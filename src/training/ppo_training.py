@@ -198,30 +198,73 @@ class MyPPOTrainer(CustomPPOTrainer):
             
             # Check if the model's forward is already patched (has our special attribute)
             if not hasattr(unwrapped_model, '_patched_forward_log_count'):
-                # Model forward is not patched, apply the patch
+                # Model forward is not patched, apply the patch using the same logic as make_trainer
                 import types
                 original_forward = unwrapped_model.forward
                 original_call = unwrapped_model.__call__
                 
-                # Use the same patching logic as in make_trainer
+                # Use the EXACT same patching logic as in make_trainer (copy from there)
                 def make_patched_forward_local(original_forward_func):
                     def patched_forward(self, *args, **kwargs):
+                        # Extract return_dict from kwargs (default True for llamafactory)
                         return_dict = kwargs.pop('return_dict', True)
+                        
+                        # Call original forward
                         if isinstance(original_forward_func, types.MethodType):
                             original_output = original_forward_func(*args, return_dict=return_dict, **kwargs)
                         else:
                             original_output = original_forward_func(self, *args, return_dict=return_dict, **kwargs)
                         
-                        # Convert ModelOutput to tuple
+                        # Convert ModelOutput to tuple format expected by llamafactory
                         if hasattr(original_output, "logits"):
+                            # ModelOutput object - extract logits, past_key_values, and value
                             past_key_values = getattr(original_output, "past_key_values", None)
-                            value = getattr(original_output, "value", None) if hasattr(original_output, "value") else None
-                            return (original_output.logits, past_key_values, value)
+                            
+                            # Try to get value from value head (for PPO models)
+                            value = None
+                            if hasattr(original_output, "value"):
+                                value = original_output.value
+                            elif hasattr(original_output, "values"):  # Sometimes it's "values" (plural)
+                                values = original_output.values
+                                if values is not None and len(values) > 0:
+                                    value = values[0] if isinstance(values, (list, tuple)) else values
+                            # Try to get value from model's value head if available
+                            elif hasattr(self, 'v_head') and self.v_head is not None:
+                                try:
+                                    # Compute value from value head using last hidden state
+                                    if hasattr(original_output, "hidden_states") and original_output.hidden_states:
+                                        hidden_states = original_output.hidden_states[-1] if isinstance(original_output.hidden_states, (list, tuple)) else original_output.hidden_states
+                                        if hidden_states is not None:
+                                            value = self.v_head(hidden_states).squeeze(-1)
+                                    elif hasattr(original_output, "last_hidden_state"):
+                                        last_hidden = original_output.last_hidden_state
+                                        if last_hidden is not None:
+                                            value = self.v_head(last_hidden.mean(dim=1))
+                                except Exception as e:
+                                    logger.debug(f"Could not compute value from value head: {e}")
+                            
+                            result = (original_output.logits, past_key_values, value)
+                            # Track patch usage
+                            if not hasattr(self, '_patched_forward_log_count'):
+                                self._patched_forward_log_count = 0
+                            self._patched_forward_log_count += 1
+                            if self._patched_forward_log_count <= 3:
+                                logger.info(f"🔧 patched_forward returning: logits shape={original_output.logits.shape if hasattr(original_output.logits, 'shape') else 'N/A'}, value={value is not None}")
+                            return result
                         elif isinstance(original_output, tuple):
-                            return original_output[:3] if len(original_output) >= 3 else (original_output + (None,) * 3)[:3]
+                            # Already a tuple, pad to 3 elements if needed
+                            if len(original_output) >= 3:
+                                return original_output[:3]
+                            else:
+                                return (original_output + (None,) * 3)[:3]
                         elif isinstance(original_output, dict):
-                            return (original_output.get("logits"), original_output.get("past_key_values"), original_output.get("value"))
+                            # Dict output
+                            logits = original_output.get("logits", None)
+                            past_key_values = original_output.get("past_key_values", None)
+                            value = original_output.get("value", original_output.get("values", None))
+                            return logits, past_key_values, value
                         else:
+                            logger.warning(f"⚠️ Unexpected model output type: {type(original_output)}")
                             return (original_output, None, None)
                     return patched_forward
                 
@@ -234,7 +277,22 @@ class MyPPOTrainer(CustomPPOTrainer):
                 patched_call_local = types.MethodType(make_patched_call_local(patched_forward_local), unwrapped_model)
                 unwrapped_model.forward = patched_forward_local
                 unwrapped_model.__call__ = patched_call_local
+                unwrapped_model._patched_forward_log_count = 0  # Mark as patched
                 logger.info("✅ Re-applied forward/__call__ patch to model in trainer __init__")
+                
+                # CRITICAL: Also patch the wrapped model (self.model) if it's different from unwrapped
+                # The accelerator wrapper might call self.model directly, so we need both patched
+                if hasattr(self, 'accelerator') and hasattr(self, 'model') and self.model is not unwrapped_model:
+                    # Try to patch the wrapped model as well
+                    try:
+                        # The wrapped model should delegate to unwrapped, but let's be safe
+                        if hasattr(self.model, 'forward'):
+                            self.model.forward = patched_forward_local
+                        if hasattr(self.model, '__call__'):
+                            self.model.__call__ = patched_call_local
+                        logger.info("✅ Also patched wrapped model (accelerator wrapper)")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not patch wrapped model: {e}")
         
         # Ensure our custom collator is used (parent might have created a default one)
         if custom_collator is not None:
@@ -791,6 +849,29 @@ class MyPPOTrainer(CustomPPOTrainer):
             logger.info(f"🧮 PPO reward distribution: {[r.item() for r in scores]}")
         return scores
 
+    def batched_forward_pass(self, queries, responses, model_inputs=None):
+        """
+        Override batched_forward_pass to ensure model output is converted to tuple format.
+        The parent class expects (logits, past_key_values, values) but our model returns ModelOutput.
+        """
+        # Ensure model is patched before calling parent's batched_forward_pass
+        # The parent will call model(**input_kwargs, return_dict=True, use_cache=False)
+        # and expects a 3-tuple, but our model returns ModelOutput
+        if hasattr(self, 'model') and self.model is not None:
+            # Get unwrapped model
+            if hasattr(self, 'accelerator'):
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+            else:
+                unwrapped_model = self.model
+            
+            # Verify patch is applied (check for the attribute we set)
+            if not hasattr(unwrapped_model, '_patched_forward_log_count'):
+                logger.warning("⚠️ Model not patched in batched_forward_pass, this should not happen!")
+                # The patch should have been applied in __init__, but if not, we'll let parent handle it
+                # and it will fail with the error we're seeing
+        
+        # Call parent's batched_forward_pass - the patched forward/__call__ should handle the conversion
+        return super().batched_forward_pass(queries, responses, model_inputs)
 
     def ppo_train(self, resume_from_checkpoint=None, start_step=0, start_query_idx=0):
         # Clear GPU cache at start to free up memory
