@@ -14,6 +14,11 @@ Test judge integration:
 python3 tests/test_judge_integration.py
 ```
 
+Test training step:
+```bash
+python3 tests/test_training_step.py
+```
+
 ## Test Files
 
 ### `test_components.py`
@@ -30,6 +35,27 @@ Tests all 4 judges working together:
 - Helpfulness judge
 - Ad Salience judge
 - Detectability judge
+
+### `test_training_step.py`
+Unit tests for the PPO training step (`step()` method):
+- **Basic step test** - Validates that `step()` can be called and returns expected stats
+- **Multi-sample test** - Tests step with batch size > 1
+- **Input validation** - Tests that step validates input shapes and types
+- **Model updates** - Verifies that step actually updates model parameters
+- **Edge cases** - Tests with very short sequences, zero/negative rewards
+
+These tests validate the core PPO optimization step without running the full training loop.
+
+**Note:** Requires GPU and HF_TOKEN. Tests will be skipped if these are not available.
+
+### `test_training_integration.py`
+End-to-end integration test for the full training pipeline:
+- Model generation with and without ads
+- Judge evaluation of generated responses
+- Reward calculation
+- Ad injection validation
+
+This tests the complete flow from data → generation → judging → reward calculation.
 
 ## Expected Results
 

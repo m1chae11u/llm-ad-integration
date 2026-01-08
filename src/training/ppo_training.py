@@ -130,9 +130,111 @@ class MyPPOTrainer(CustomPPOTrainer):
         # We need to ensure our custom collator is used
         custom_collator = kwargs.get('data_collator', None)
         
+        # CRITICAL: Extract and preserve train_dataset before parent __init__
+        # The parent class might filter or transform it, so we need to ensure it's preserved
+        train_dataset = kwargs.get('train_dataset', None)
+        if train_dataset is not None:
+            # Store original dataset length for verification
+            original_len = len(train_dataset)
+            logger.info(f"📊 Preserving train_dataset with {original_len} rows before parent __init__")
+            
+            # CRITICAL: Store original dataset BEFORE calling super().__init__()
+            # This is needed because prepare_dataloader is called during super().__init__()
+            # and we need _original_train_dataset to be available then
+            self._original_train_dataset = train_dataset
+            
+            # NOTE: Do NOT add 'dataset' to kwargs - parent class doesn't accept it
+            # The parent will get dataset from train_dataset and may filter it
+        else:
+            self._original_train_dataset = None
+        
         # Call super first to initialize self.args, self.tokenizer, etc.
         # The parent class will handle train_dataset from kwargs
         super().__init__(*args, **kwargs)
+        
+        # CRITICAL: Restore dataset if parent filtered it (double-check after init)
+        if train_dataset is not None:
+            # Check if dataset was filtered by parent
+            if hasattr(self, 'dataset') and len(self.dataset) == 0 and original_len > 0:
+                logger.warning(f"⚠️ Parent class filtered dataset from {original_len} to 0 rows. Restoring...")
+                self.dataset = train_dataset
+                if hasattr(self, 'train_dataset'):
+                    self.train_dataset = train_dataset
+                # Also need to recreate dataloader if it was created with empty dataset
+                if hasattr(self, 'dataloader'):
+                    logger.info("🔄 Recreating dataloader with restored dataset")
+                    try:
+                        self.dataloader = self.prepare_dataloader(self.dataset, self.data_collator)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to recreate dataloader: {e}")
+            
+            # Also ensure train_dataset is set if parent didn't set it
+            if not hasattr(self, 'train_dataset') or self.train_dataset is None:
+                self.train_dataset = train_dataset
+                if hasattr(self, 'dataset'):
+                    self.dataset = train_dataset
+            
+            # Verify dataset has data after parent init
+            if hasattr(self, 'dataset') and len(self.dataset) == 0:
+                logger.error(f"❌ Dataset is empty after parent __init__! Original had {original_len} rows")
+                # Force restore
+                self.dataset = train_dataset
+                if hasattr(self, 'train_dataset'):
+                    self.train_dataset = train_dataset
+                # Recreate dataloader
+                if hasattr(self, 'dataloader'):
+                    try:
+                        self.dataloader = self.prepare_dataloader(self.dataset, self.data_collator)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to recreate dataloader: {e}")
+            elif hasattr(self, 'dataset'):
+                logger.info(f"✅ Dataset preserved: {len(self.dataset)} rows after parent __init__")
+        
+        # CRITICAL: Re-apply the forward/__call__ patch to self.model in case it was wrapped
+        # The model might be wrapped by accelerator, so we need to ensure the patch is on the actual model
+        if hasattr(self, 'model') and self.model is not None:
+            # Get the unwrapped model (in case accelerator wrapped it)
+            unwrapped_model = self.accelerator.unwrap_model(self.model) if hasattr(self, 'accelerator') else self.model
+            
+            # Check if the model's forward is already patched (has our special attribute)
+            if not hasattr(unwrapped_model, '_patched_forward_log_count'):
+                # Model forward is not patched, apply the patch
+                import types
+                original_forward = unwrapped_model.forward
+                original_call = unwrapped_model.__call__
+                
+                # Use the same patching logic as in make_trainer
+                def make_patched_forward_local(original_forward_func):
+                    def patched_forward(self, *args, **kwargs):
+                        return_dict = kwargs.pop('return_dict', True)
+                        if isinstance(original_forward_func, types.MethodType):
+                            original_output = original_forward_func(*args, return_dict=return_dict, **kwargs)
+                        else:
+                            original_output = original_forward_func(self, *args, return_dict=return_dict, **kwargs)
+                        
+                        # Convert ModelOutput to tuple
+                        if hasattr(original_output, "logits"):
+                            past_key_values = getattr(original_output, "past_key_values", None)
+                            value = getattr(original_output, "value", None) if hasattr(original_output, "value") else None
+                            return (original_output.logits, past_key_values, value)
+                        elif isinstance(original_output, tuple):
+                            return original_output[:3] if len(original_output) >= 3 else (original_output + (None,) * 3)[:3]
+                        elif isinstance(original_output, dict):
+                            return (original_output.get("logits"), original_output.get("past_key_values"), original_output.get("value"))
+                        else:
+                            return (original_output, None, None)
+                    return patched_forward
+                
+                def make_patched_call_local(patched_forward_func):
+                    def patched_call(self, *args, **kwargs):
+                        return patched_forward_func(self, *args, **kwargs)
+                    return patched_call
+                
+                patched_forward_local = types.MethodType(make_patched_forward_local(original_forward), unwrapped_model)
+                patched_call_local = types.MethodType(make_patched_call_local(patched_forward_local), unwrapped_model)
+                unwrapped_model.forward = patched_forward_local
+                unwrapped_model.__call__ = patched_call_local
+                logger.info("✅ Re-applied forward/__call__ patch to model in trainer __init__")
         
         # Ensure our custom collator is used (parent might have created a default one)
         if custom_collator is not None:
@@ -173,6 +275,42 @@ class MyPPOTrainer(CustomPPOTrainer):
         # Force CPU mode by overriding current_device
         self.current_device = DEVICE
         print(f"🔧 Forced trainer to use device: {self.current_device}")
+
+    def prepare_dataloader(self, dataset, data_collator):
+        """Override prepare_dataloader to bypass parent's filtering.
+        
+        The parent PPOTrainer.prepare_dataloader calls _remove_unused_columns which
+        filters our raw dataset (that doesn't match template format), leaving it empty.
+        We bypass this by creating our own dataloader directly.
+        """
+        import torch.utils.data
+        
+        # Always use original dataset if available to bypass parent's filtering
+        if hasattr(self, '_original_train_dataset') and self._original_train_dataset is not None:
+            original_len = len(self._original_train_dataset)
+            if original_len > 0:
+                logger.info(f"🔧 Using original dataset ({original_len} rows) to bypass parent filtering")
+                dataset = self._original_train_dataset
+                # Update self.dataset to prevent parent from using filtered version
+                self.dataset = dataset
+                if hasattr(self, 'train_dataset'):
+                    self.train_dataset = dataset
+        
+        dataset_len = len(dataset) if dataset is not None else 0
+        if dataset_len == 0:
+            raise ValueError(f"❌ Cannot create dataloader with empty dataset! Original had {len(self._original_train_dataset) if hasattr(self, '_original_train_dataset') and self._original_train_dataset is not None else 'unknown'} rows")
+        
+        # Create dataloader directly without calling parent (which would filter)
+        # This matches the parent's implementation but skips _remove_unused_columns
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            collate_fn=data_collator,
+            shuffle=True,
+            drop_last=True,
+        )
+        logger.info(f"✅ Created dataloader with {dataset_len} rows, batch_size={self.config.batch_size}")
+        return dataloader
 
     def _reset_dataloader(self):
         """Reset the dataloader iterator."""
@@ -920,66 +1058,146 @@ def make_trainer(
         raise e
 
     # Patch model forward (__call__) for llamafactory PPO trainer
-    def patched_call(self, *args, **kwargs):
-        # Call forward method (forward handles return_dict internally)
-        original_output = super(self.__class__, self).forward(*args, **kwargs)
-        
-        # Debug: log output type (only first few times to avoid spam)
-        if not hasattr(self, '_patched_call_log_count'):
-            self._patched_call_log_count = 0
-        if self._patched_call_log_count < 3:
-            logger.info(f"🔧 patched_call output type: {type(original_output)}, has logits: {hasattr(original_output, 'logits')}, has value: {hasattr(original_output, 'value')}")
-            self._patched_call_log_count += 1
-        
-        # Handle ModelOutput object (when return_dict=True)
-        if hasattr(original_output, "logits"):
-            past_key_values = getattr(original_output, "past_key_values", None)
-            # For ValueHead models, check for value in the output
-            # The value might be in the output directly or as an attribute
-            if hasattr(original_output, "value"):
-                value = original_output.value
-            elif isinstance(original_output, dict) and "value" in original_output:
-                value = original_output["value"]
+    # This ensures the model always returns (logits, past_key_values, value) tuple
+    import types
+    
+    # Store original methods
+    original_forward_policy = policy.forward
+    original_call_policy = policy.__call__
+    
+    def make_patched_forward(original_forward_func):
+        """Create a patched forward method that converts ModelOutput to tuple."""
+        def patched_forward(self, *args, **kwargs):
+            # Extract return_dict from kwargs (default True for llamafactory)
+            return_dict = kwargs.pop('return_dict', True)
+            
+            # Call the original forward method
+            # original_forward_func is a bound method, so we can call it directly
+            # But we need to make sure it's called with the right self
+            if isinstance(original_forward_func, types.MethodType):
+                # It's already a bound method, call it directly
+                original_output = original_forward_func(*args, return_dict=return_dict, **kwargs)
             else:
+                # It's an unbound method, call with self
+                original_output = original_forward_func(self, *args, return_dict=return_dict, **kwargs)
+            
+            # Debug: log output type (only first few times to avoid spam)
+            if not hasattr(self, '_patched_forward_log_count'):
+                self._patched_forward_log_count = 0
+            if self._patched_forward_log_count < 3:
+                logger.info(f"🔧 patched_forward output type: {type(original_output)}, has logits: {hasattr(original_output, 'logits')}, has value: {hasattr(original_output, 'value')}")
+                # Check all attributes
+                if hasattr(original_output, '__dict__'):
+                    logger.info(f"🔧 patched_forward output keys: {list(original_output.__dict__.keys())[:10]}")
+                elif hasattr(original_output, '__class__'):
+                    logger.info(f"🔧 patched_forward output class: {original_output.__class__.__name__}")
+                self._patched_forward_log_count += 1
+            
+            # Handle ModelOutput object (when return_dict=True)
+            if hasattr(original_output, "logits"):
+                past_key_values = getattr(original_output, "past_key_values", None)
+                # For ValueHead models, check for value in the output
+                # The value might be in the output directly or as an attribute
                 value = None
-            result = (original_output.logits, past_key_values, value)
-            if self._patched_call_log_count <= 3:
-                logger.info(f"🔧 patched_call returning: logits shape={original_output.logits.shape if hasattr(original_output.logits, 'shape') else 'N/A'}, value={value is not None}")
-            return result
-        # Handle tuple output (when return_dict=False)
-        elif isinstance(original_output, tuple):
-            # If it's already a tuple, pad to 3 elements if needed
-            if len(original_output) >= 3:
-                return original_output[:3]
+                if hasattr(original_output, "value"):
+                    value = original_output.value
+                elif hasattr(original_output, "values"):  # Sometimes it's "values" (plural)
+                    values = original_output.values
+                    if values is not None and len(values) > 0:
+                        value = values[0] if isinstance(values, (list, tuple)) else values
+                elif isinstance(original_output, dict) and "value" in original_output:
+                    value = original_output["value"]
+                elif isinstance(original_output, dict) and "values" in original_output:
+                    values = original_output["values"]
+                    if values is not None and len(values) > 0:
+                        value = values[0] if isinstance(values, (list, tuple)) else values
+                
+                # If value is still None, try to get it from hidden states via value head
+                if value is None and hasattr(self, 'v_head') and hasattr(original_output, 'hidden_states'):
+                    try:
+                        # Get last hidden state
+                        hidden_states = original_output.hidden_states[-1] if isinstance(original_output.hidden_states, (list, tuple)) else original_output.hidden_states
+                        if hidden_states is not None:
+                            # Value head expects specific input format
+                            value = self.v_head(hidden_states).squeeze(-1)
+                    except Exception as e:
+                        logger.debug(f"Could not compute value from value head: {e}")
+                
+                result = (original_output.logits, past_key_values, value)
+                if self._patched_forward_log_count <= 3:
+                    logger.info(f"🔧 patched_forward returning: logits shape={original_output.logits.shape if hasattr(original_output.logits, 'shape') else 'N/A'}, value={value is not None if value is not None else 'None'}")
+                return result
+            # Handle tuple output (when return_dict=False)
+            elif isinstance(original_output, tuple):
+                # If it's already a tuple, pad to 3 elements if needed
+                if len(original_output) >= 3:
+                    return original_output[:3]
+                else:
+                    return (original_output + (None,) * 3)[:3]
+            # Handle dict output
+            elif isinstance(original_output, dict):
+                logits = original_output.get("logits", None)
+                past_key_values = original_output.get("past_key_values", None)
+                value = original_output.get("value", original_output.get("values", None))
+                return logits, past_key_values, value
+            # Fallback: if it's a single value, wrap it
             else:
-                return (original_output + (None,) * 3)[:3]
-        # Handle dict output
-        elif isinstance(original_output, dict):
-            logits = original_output.get("logits", None)
-            past_key_values = original_output.get("past_key_values", None)
-            value = original_output.get("value", None)
-            return logits, past_key_values, value
-        # Fallback: if it's a single value, wrap it
-        else:
-            logger.warning(f"⚠️ Unexpected model output type: {type(original_output)}, dir: {dir(original_output)[:10]}")
-            # Try to extract logits if it's a ModelOutput-like object
-            if hasattr(original_output, '__dict__'):
-                attrs = original_output.__dict__
-                logits = attrs.get('logits', None)
-                value = attrs.get('value', None)
-                if logits is not None:
-                    return logits, None, value
-            return original_output, None, None
-
-    policy.__call__ = patched_call.__get__(policy, policy.__class__)
+                logger.warning(f"⚠️ Unexpected model output type: {type(original_output)}, dir: {dir(original_output)[:10]}")
+                # Try to extract logits if it's a ModelOutput-like object
+                if hasattr(original_output, '__dict__'):
+                    attrs = original_output.__dict__
+                    logits = attrs.get('logits', None)
+                    value = attrs.get('value', attrs.get('values', None))
+                    if logits is not None:
+                        return logits, None, value
+                # Last resort: return as tuple with None placeholders
+                logger.error(f"❌ Cannot extract logits from output type {type(original_output)}")
+                return original_output, None, None
+        return patched_forward
+    
+    def make_patched_call(patched_forward_func):
+        """Create a patched __call__ method that routes through patched_forward."""
+        def patched_call(self, *args, **kwargs):
+            # __call__ typically calls forward, so we route through patched_forward
+            return patched_forward_func(self, *args, **kwargs)
+        return patched_call
+    
+    # Create patched methods bound to policy
+    patched_forward_policy = types.MethodType(make_patched_forward(original_forward_policy), policy)
+    patched_call_policy = types.MethodType(make_patched_call(patched_forward_policy), policy)
+    
+    # Patch both forward and __call__ to ensure all code paths work
+    policy.forward = patched_forward_policy
+    policy.__call__ = patched_call_policy
     policy.gradient_checkpointing_enable()
     policy.config.pad_token_id = tokenizer.pad_token_id
+    
+    # Debug: Verify patch is applied
+    logger.info(f"✅ Patched model forward method: {type(policy.forward)}")
+    logger.info(f"✅ Patched model __call__ method: {type(policy.__call__)}")
+    # Test the patch works
+    try:
+        test_input = tokenizer("test", return_tensors="pt").to(next(policy.parameters()).device)
+        test_result = policy(**test_input, return_dict=True, use_cache=False)
+        if isinstance(test_result, tuple) and len(test_result) == 3:
+            logger.info(f"✅ Patch verification: Model returns tuple format correctly")
+        else:
+            logger.warning(f"⚠️ Patch verification FAILED: Model returns {type(test_result)}, length {len(test_result) if isinstance(test_result, (tuple, list)) else 'N/A'}")
+    except Exception as e:
+        logger.warning(f"⚠️ Patch verification test failed: {e}")
 
     # --- Frozen reference model ---
     # Always keep reference model on CPU to save GPU memory (it doesn't need gradients)
     ref = create_reference_model(policy)
     ref = ref.to("cpu")  # Always CPU to save GPU memory
-    ref.__call__ = patched_call.__get__(ref, ref.__class__)
+    
+    # Patch reference model with the same forward/call methods
+    original_forward_ref = ref.forward
+    patched_forward_ref = types.MethodType(make_patched_forward(original_forward_ref), ref)
+    patched_call_ref = types.MethodType(make_patched_call(patched_forward_ref), ref)
+    ref.forward = patched_forward_ref
+    ref.__call__ = patched_call_ref
+    
     ref.eval()
     for p in ref.parameters():
         p.requires_grad = False

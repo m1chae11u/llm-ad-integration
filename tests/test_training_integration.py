@@ -14,6 +14,15 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+env_path = Path(__file__).parent.parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+else:
+    # Try loading from current directory
+    load_dotenv()
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -31,11 +40,11 @@ from judge import (
 from judge.utils import get_embedding
 import numpy as np
 
-# Environment setup
+# Environment setup - load from .env or use defaults
 os.environ.setdefault("HF_TOKEN", os.getenv("HF_TOKEN", ""))
 os.environ.setdefault("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
-os.environ.setdefault("BASE_MODEL", "meta-llama/Llama-3.1-8B")
-os.environ.setdefault("DATA_FILE", "data/merged_queries_ads.csv")
+os.environ.setdefault("BASE_MODEL", os.getenv("BASE_MODEL", "meta-llama/Llama-3.1-8B"))
+os.environ.setdefault("DATA_FILE", os.getenv("DATA_FILE", "data/merged_queries_ads.csv"))
 
 def test_training_pipeline():
     """Test the full training pipeline: generation -> judging -> reward calculation."""
