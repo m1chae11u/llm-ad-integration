@@ -223,25 +223,71 @@ class MyPPOTrainer(CustomPPOTrainer):
                             # Try to get value from value head (for PPO models)
                             value = None
                             if hasattr(original_output, "value"):
-                                value = original_output.value
+                                value_attr = getattr(original_output, "value", None)
+                                # Check if it's actually data (not a method)
+                                if value_attr is not None and not callable(value_attr):
+                                    value = value_attr
                             elif hasattr(original_output, "values"):  # Sometimes it's "values" (plural)
-                                values = original_output.values
-                                if values is not None and len(values) > 0:
-                                    value = values[0] if isinstance(values, (list, tuple)) else values
+                                values_attr = getattr(original_output, "values", None)
+                                # Check if it's actually data (not a method like dict.values())
+                                if values_attr is not None and not callable(values_attr):
+                                    if isinstance(values_attr, (list, tuple)) and len(values_attr) > 0:
+                                        value = values_attr[0]
+                                    elif not isinstance(values_attr, (list, tuple)):
+                                        value = values_attr
                             # Try to get value from model's value head if available
-                            elif hasattr(self, 'v_head') and self.v_head is not None:
-                                try:
-                                    # Compute value from value head using last hidden state
-                                    if hasattr(original_output, "hidden_states") and original_output.hidden_states:
-                                        hidden_states = original_output.hidden_states[-1] if isinstance(original_output.hidden_states, (list, tuple)) else original_output.hidden_states
-                                        if hidden_states is not None:
-                                            value = self.v_head(hidden_states).squeeze(-1)
-                                    elif hasattr(original_output, "last_hidden_state"):
-                                        last_hidden = original_output.last_hidden_state
+                            # For AutoModelForCausalLMWithValueHead, the value head is at self.v_head
+                            if value is None:
+                                # Check if model has v_head
+                                has_v_head = hasattr(self, 'v_head') and self.v_head is not None
+                                if not has_v_head:
+                                    # Try to access via pretrained_model if it's wrapped
+                                    if hasattr(self, 'pretrained_model') and hasattr(self.pretrained_model, 'v_head'):
+                                        v_head = self.pretrained_model.v_head
+                                        has_v_head = v_head is not None
+                                    else:
+                                        v_head = None
+                                else:
+                                    v_head = self.v_head
+                                
+                                if has_v_head and v_head is not None:
+                                    try:
+                                        # Try to get hidden states from output
+                                        last_hidden = None
+                                        if hasattr(original_output, "hidden_states") and original_output.hidden_states:
+                                            hidden_states = original_output.hidden_states[-1] if isinstance(original_output.hidden_states, (list, tuple)) else original_output.hidden_states
+                                            if hidden_states is not None:
+                                                last_hidden = hidden_states
+                                        elif hasattr(original_output, "last_hidden_state"):
+                                            last_hidden = original_output.last_hidden_state
+                                        
                                         if last_hidden is not None:
-                                            value = self.v_head(last_hidden.mean(dim=1))
-                                except Exception as e:
-                                    logger.debug(f"Could not compute value from value head: {e}")
+                                            # Value head expects [batch_size, seq_len, hidden_size]
+                                            # We need to take the mean over sequence length or use the last token
+                                            # For PPO, typically we use the last token's hidden state
+                                            if len(last_hidden.shape) == 3:  # [batch, seq, hidden]
+                                                # Use mean pooling or last token - try mean first
+                                                pooled = last_hidden.mean(dim=1)  # [batch, hidden]
+                                                value = v_head(pooled)  # [batch, 1] or [batch]
+                                                if len(value.shape) > 1 and value.shape[-1] == 1:
+                                                    value = value.squeeze(-1)
+                                            else:
+                                                # Already pooled or different shape
+                                                value = v_head(last_hidden)
+                                    except Exception as e:
+                                        logger.warning(f"Could not compute value from value head: {e}")
+                                        import traceback
+                                        logger.debug(traceback.format_exc())
+                                
+                                # CRITICAL: If value is still None, create a zero tensor as fallback
+                                # The parent class expects a tensor, not None (it tries to torch.cat values)
+                                if value is None and hasattr(original_output, "logits"):
+                                    # Create a zero tensor with shape [batch_size] matching logits batch size
+                                    batch_size = original_output.logits.shape[0]
+                                    import torch
+                                    value = torch.zeros(batch_size, device=original_output.logits.device, dtype=original_output.logits.dtype)
+                                    if not hasattr(self, '_patched_forward_log_count') or self._patched_forward_log_count <= 3:
+                                        logger.warning(f"⚠️ Value is None, creating zero tensor with shape {value.shape} as fallback")
                             
                             result = (original_output.logits, past_key_values, value)
                             # Track patch usage
@@ -849,29 +895,156 @@ class MyPPOTrainer(CustomPPOTrainer):
             logger.info(f"🧮 PPO reward distribution: {[r.item() for r in scores]}")
         return scores
 
-    def batched_forward_pass(self, queries, responses, model_inputs=None):
+    def batched_forward_pass(self, model, queries, responses, model_inputs, return_logits=False, response_masks=None):
         """
         Override batched_forward_pass to ensure model output is converted to tuple format.
         The parent class expects (logits, past_key_values, values) but our model returns ModelOutput.
+        Matches parent class signature exactly: (self, model, queries, responses, model_inputs, return_logits=False, response_masks=None)
         """
         # Ensure model is patched before calling parent's batched_forward_pass
         # The parent will call model(**input_kwargs, return_dict=True, use_cache=False)
         # and expects a 3-tuple, but our model returns ModelOutput
-        if hasattr(self, 'model') and self.model is not None:
+        if model is not None:
             # Get unwrapped model
             if hasattr(self, 'accelerator'):
-                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_model = self.accelerator.unwrap_model(model)
             else:
-                unwrapped_model = self.model
+                unwrapped_model = model
             
-            # Verify patch is applied (check for the attribute we set)
+            # CRITICAL: Apply patch if not already patched
+            # The model passed here might be a different instance or wrapped differently
             if not hasattr(unwrapped_model, '_patched_forward_log_count'):
-                logger.warning("⚠️ Model not patched in batched_forward_pass, this should not happen!")
-                # The patch should have been applied in __init__, but if not, we'll let parent handle it
-                # and it will fail with the error we're seeing
+                logger.warning("⚠️ Model not patched in batched_forward_pass, applying patch now...")
+                import types
+                original_forward = unwrapped_model.forward
+                original_call = unwrapped_model.__call__
+                
+                # Use the same patching logic as in __init__
+                def make_patched_forward_local(original_forward_func):
+                    def patched_forward(self, *args, **kwargs):
+                        # Extract return_dict from kwargs (default True for llamafactory)
+                        return_dict = kwargs.pop('return_dict', True)
+                        
+                        # Call original forward
+                        if isinstance(original_forward_func, types.MethodType):
+                            original_output = original_forward_func(*args, return_dict=return_dict, **kwargs)
+                        else:
+                            original_output = original_forward_func(self, *args, return_dict=return_dict, **kwargs)
+                        
+                        # Convert ModelOutput to tuple format expected by llamafactory
+                        if hasattr(original_output, "logits"):
+                            # ModelOutput object - extract logits, past_key_values, and value
+                            past_key_values = getattr(original_output, "past_key_values", None)
+                            
+                            # Try to get value from value head (for PPO models)
+                            value = None
+                            if hasattr(original_output, "value"):
+                                value_attr = getattr(original_output, "value", None)
+                                # Check if it's actually data (not a method)
+                                if value_attr is not None and not callable(value_attr):
+                                    value = value_attr
+                            elif hasattr(original_output, "values"):
+                                values_attr = getattr(original_output, "values", None)
+                                # Check if it's actually data (not a method)
+                                if values_attr is not None and not callable(values_attr):
+                                    if isinstance(values_attr, (list, tuple)) and len(values_attr) > 0:
+                                        value = values_attr[0]
+                                    elif not isinstance(values_attr, (list, tuple)):
+                                        value = values_attr
+                            # Try to get value from model's value head if available
+                            # For AutoModelForCausalLMWithValueHead, the value head is at self.v_head
+                            if value is None:
+                                # Check if model has v_head
+                                has_v_head = hasattr(self, 'v_head') and self.v_head is not None
+                                if not has_v_head:
+                                    # Try to access via pretrained_model if it's wrapped
+                                    if hasattr(self, 'pretrained_model') and hasattr(self.pretrained_model, 'v_head'):
+                                        v_head = self.pretrained_model.v_head
+                                        has_v_head = v_head is not None
+                                    else:
+                                        v_head = None
+                                else:
+                                    v_head = self.v_head
+                                
+                                if has_v_head and v_head is not None:
+                                    try:
+                                        # Try to get hidden states from output
+                                        last_hidden = None
+                                        if hasattr(original_output, "hidden_states") and original_output.hidden_states:
+                                            hidden_states = original_output.hidden_states[-1] if isinstance(original_output.hidden_states, (list, tuple)) else original_output.hidden_states
+                                            if hidden_states is not None:
+                                                last_hidden = hidden_states
+                                        elif hasattr(original_output, "last_hidden_state"):
+                                            last_hidden = original_output.last_hidden_state
+                                        
+                                        if last_hidden is not None:
+                                            # Value head expects [batch_size, seq_len, hidden_size]
+                                            # We need to take the mean over sequence length or use the last token
+                                            # For PPO, typically we use the last token's hidden state
+                                            if len(last_hidden.shape) == 3:  # [batch, seq, hidden]
+                                                # Use mean pooling or last token - try mean first
+                                                pooled = last_hidden.mean(dim=1)  # [batch, hidden]
+                                                value = v_head(pooled)  # [batch, 1] or [batch]
+                                                if len(value.shape) > 1 and value.shape[-1] == 1:
+                                                    value = value.squeeze(-1)
+                                            else:
+                                                # Already pooled or different shape
+                                                value = v_head(last_hidden)
+                                    except Exception as e:
+                                        logger.warning(f"Could not compute value from value head: {e}")
+                                        import traceback
+                                        logger.debug(traceback.format_exc())
+                                
+                                # CRITICAL: If value is still None, create a zero tensor as fallback
+                                # The parent class expects a tensor, not None (it tries to torch.cat values)
+                                if value is None and hasattr(original_output, "logits"):
+                                    # Create a zero tensor with shape [batch_size] matching logits batch size
+                                    batch_size = original_output.logits.shape[0]
+                                    import torch
+                                    value = torch.zeros(batch_size, device=original_output.logits.device, dtype=original_output.logits.dtype)
+                                    if not hasattr(self, '_patched_forward_log_count') or self._patched_forward_log_count <= 3:
+                                        logger.warning(f"⚠️ Value is None, creating zero tensor with shape {value.shape} as fallback")
+                            
+                            result = (original_output.logits, past_key_values, value)
+                            # Track patch usage
+                            if not hasattr(self, '_patched_forward_log_count'):
+                                self._patched_forward_log_count = 0
+                            self._patched_forward_log_count += 1
+                            if self._patched_forward_log_count <= 3:
+                                logger.info(f"🔧 patched_forward (batched_forward_pass) returning: logits shape={original_output.logits.shape if hasattr(original_output.logits, 'shape') else 'N/A'}, value={value is not None}")
+                            return result
+                        elif isinstance(original_output, tuple):
+                            # Already a tuple, pad to 3 elements if needed
+                            if len(original_output) >= 3:
+                                return original_output[:3]
+                            else:
+                                return (original_output + (None,) * 3)[:3]
+                        elif isinstance(original_output, dict):
+                            # Dict output
+                            logits = original_output.get("logits", None)
+                            past_key_values = original_output.get("past_key_values", None)
+                            value = original_output.get("value", original_output.get("values", None))
+                            return logits, past_key_values, value
+                        else:
+                            logger.warning(f"⚠️ Unexpected model output type: {type(original_output)}")
+                            return (original_output, None, None)
+                    return patched_forward
+                
+                def make_patched_call_local(patched_forward_func):
+                    def patched_call(self, *args, **kwargs):
+                        return patched_forward_func(self, *args, **kwargs)
+                    return patched_call
+                
+                patched_forward_local = types.MethodType(make_patched_forward_local(original_forward), unwrapped_model)
+                patched_call_local = types.MethodType(make_patched_call_local(patched_forward_local), unwrapped_model)
+                unwrapped_model.forward = patched_forward_local
+                unwrapped_model.__call__ = patched_call_local
+                unwrapped_model._patched_forward_log_count = 0  # Mark as patched
+                logger.info("✅ Applied forward/__call__ patch to model in batched_forward_pass")
         
         # Call parent's batched_forward_pass - the patched forward/__call__ should handle the conversion
-        return super().batched_forward_pass(queries, responses, model_inputs)
+        # Pass through all arguments exactly as parent expects
+        return super().batched_forward_pass(model, queries, responses, model_inputs, return_logits=return_logits, response_masks=response_masks)
 
     def ppo_train(self, resume_from_checkpoint=None, start_step=0, start_query_idx=0):
         # Clear GPU cache at start to free up memory
@@ -1183,26 +1356,63 @@ def make_trainer(
                 if hasattr(original_output, "value"):
                     value = original_output.value
                 elif hasattr(original_output, "values"):  # Sometimes it's "values" (plural)
-                    values = original_output.values
-                    if values is not None and len(values) > 0:
-                        value = values[0] if isinstance(values, (list, tuple)) else values
+                    values_attr = getattr(original_output, "values", None)
+                    # Check if it's actually data (not a method like dict.values())
+                    if values_attr is not None and not callable(values_attr):
+                        if isinstance(values_attr, (list, tuple)) and len(values_attr) > 0:
+                            value = values_attr[0]
+                        elif not isinstance(values_attr, (list, tuple)):
+                            value = values_attr
                 elif isinstance(original_output, dict) and "value" in original_output:
                     value = original_output["value"]
                 elif isinstance(original_output, dict) and "values" in original_output:
                     values = original_output["values"]
-                    if values is not None and len(values) > 0:
-                        value = values[0] if isinstance(values, (list, tuple)) else values
+                    # Check if it's actually data (not a method)
+                    if values is not None and not callable(values):
+                        if isinstance(values, (list, tuple)) and len(values) > 0:
+                            value = values[0]
+                        elif not isinstance(values, (list, tuple)):
+                            value = values
                 
                 # If value is still None, try to get it from hidden states via value head
-                if value is None and hasattr(self, 'v_head') and hasattr(original_output, 'hidden_states'):
-                    try:
-                        # Get last hidden state
-                        hidden_states = original_output.hidden_states[-1] if isinstance(original_output.hidden_states, (list, tuple)) else original_output.hidden_states
-                        if hidden_states is not None:
-                            # Value head expects specific input format
-                            value = self.v_head(hidden_states).squeeze(-1)
-                    except Exception as e:
-                        logger.debug(f"Could not compute value from value head: {e}")
+                if value is None:
+                    # Check if model has v_head
+                    has_v_head = hasattr(self, 'v_head') and self.v_head is not None
+                    if not has_v_head:
+                        # Try to access via pretrained_model if it's wrapped
+                        if hasattr(self, 'pretrained_model') and hasattr(self.pretrained_model, 'v_head'):
+                            v_head = self.pretrained_model.v_head
+                            has_v_head = v_head is not None
+                        else:
+                            v_head = None
+                    else:
+                        v_head = self.v_head
+                    
+                    if has_v_head and v_head is not None and hasattr(original_output, 'hidden_states'):
+                        try:
+                            # Get last hidden state
+                            hidden_states = original_output.hidden_states[-1] if isinstance(original_output.hidden_states, (list, tuple)) else original_output.hidden_states
+                            if hidden_states is not None:
+                                # Value head expects specific input format
+                                if len(hidden_states.shape) == 3:  # [batch, seq, hidden]
+                                    pooled = hidden_states.mean(dim=1)  # [batch, hidden]
+                                    value = v_head(pooled)  # [batch, 1] or [batch]
+                                    if len(value.shape) > 1 and value.shape[-1] == 1:
+                                        value = value.squeeze(-1)
+                                else:
+                                    value = v_head(hidden_states).squeeze(-1)
+                        except Exception as e:
+                            logger.debug(f"Could not compute value from value head: {e}")
+                    
+                    # CRITICAL: If value is still None, create a zero tensor as fallback
+                    # The parent class expects a tensor, not None (it tries to torch.cat values)
+                    if value is None and hasattr(original_output, "logits"):
+                        # Create a zero tensor with shape [batch_size] matching logits batch size
+                        batch_size = original_output.logits.shape[0]
+                        import torch
+                        value = torch.zeros(batch_size, device=original_output.logits.device, dtype=original_output.logits.dtype)
+                        if self._patched_forward_log_count <= 3:
+                            logger.warning(f"⚠️ Value is None, creating zero tensor with shape {value.shape} as fallback")
                 
                 result = (original_output.logits, past_key_values, value)
                 if self._patched_forward_log_count <= 3:
