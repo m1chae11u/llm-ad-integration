@@ -5,6 +5,7 @@ Test the full judge integration - all 4 judges working together.
 
 import sys
 import asyncio
+import pytest
 from pathlib import Path
 
 # Add src to path
@@ -12,6 +13,7 @@ src_dir = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(src_dir))
 
 
+@pytest.mark.asyncio
 async def test_all_judges():
     """Test all 4 judges."""
     print("\n" + "="*60)

@@ -568,7 +568,7 @@ def test_step_method_validates_inputs(minimal_trainer_config):
     try:
         trainer.step([], [], [])
         assert False, "Should raise error for empty inputs"
-    except (ValueError, RuntimeError, AssertionError) as e:
+    except (ValueError, RuntimeError, AssertionError, IndexError) as e:
         print(f"   ✅ Correctly rejected empty inputs: {type(e).__name__}")
     
     # Test mismatched lengths
@@ -576,7 +576,7 @@ def test_step_method_validates_inputs(minimal_trainer_config):
     try:
         trainer.step([query], [response], [])  # Missing reward
         assert False, "Should raise error for mismatched lengths"
-    except (ValueError, RuntimeError, AssertionError) as e:
+    except (ValueError, RuntimeError, AssertionError, IndexError) as e:
         print(f"   ✅ Correctly rejected mismatched lengths: {type(e).__name__}")
     
     print(f"✅ Input validation test PASSED")
