@@ -868,9 +868,12 @@ class MyPPOTrainer(CustomPPOTrainer):
             helpfulness_score = float(sh.get("H1", 0) or 0)
             salience_score = float(ss.get("Ad Salience Score", 0) or 0)
             
-            total = coherence_score + helpfulness_score + salience_score + det_cos
+            # IMPORTANT: Subtract detectability since lower is better (less detectable = better)
+            # detectability_cosine ranges from -1 (very different) to 1 (very similar)
+            # Lower detectability means the ad is less obvious, so we reward lower values
+            total = coherence_score + helpfulness_score + salience_score - det_cos
             scores.append(torch.tensor(total, device=self.current_device))
-            logger.info(f"✅ Judges complete for item {i}, total reward: {total:.4f}")
+            logger.info(f"✅ Judges complete for item {i}, total reward: {total:.4f} (coherence={coherence_score:.2f}, helpfulness={helpfulness_score:.2f}, salience={salience_score:.2f}, detectability_penalty={-det_cos:.4f})")
 
             TRAINING_LOGS.append({
                 "query_idx": idx,
@@ -906,6 +909,79 @@ class MyPPOTrainer(CustomPPOTrainer):
             })
             logger.info(f"🧮 PPO reward distribution: {[r.item() for r in scores]}")
         return scores
+
+    def compute_rewards(
+        self,
+        scores: torch.FloatTensor,
+        logprobs: torch.FloatTensor,
+        ref_logprobs: torch.FloatTensor,
+        masks: torch.LongTensor,
+    ):
+        """
+        Override compute_rewards to ensure device consistency and allow penalty customization.
+        
+        Args:
+            scores: Reward scores from judges, shape (batch_size)
+            logprobs: Log probabilities from policy model, shape (batch_size, response_length)
+            ref_logprobs: Log probabilities from reference model, shape (batch_size, response_length)
+            masks: Attention masks, shape (batch_size, response_length)
+        
+        Returns:
+            rewards: Per-token rewards, shape (batch_size, response_length)
+            non_score_reward: KL penalty per token, shape (batch_size, response_length)
+            kls: KL divergence per token, shape (batch_size, response_length)
+        """
+        import torch
+        
+        # CRITICAL: Ensure all tensors are on the same device
+        # Get device from logprobs (policy model output, should be on CUDA)
+        target_device = logprobs.device
+        
+        # Move ref_logprobs to same device as logprobs if needed
+        if ref_logprobs.device != target_device:
+            ref_logprobs = ref_logprobs.to(target_device)
+        
+        # Move scores and masks to same device if needed
+        if scores.device != target_device:
+            scores = scores.to(target_device)
+        if masks.device != target_device:
+            masks = masks.to(target_device)
+        
+        # Call parent's compute_rewards with device-consistent tensors
+        # This will compute: rewards = scores - kl_penalty_coef * kl_penalty
+        rewards, non_score_reward, kls = super().compute_rewards(
+            scores=scores,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            masks=masks,
+        )
+        
+        # Log KL penalty statistics for monitoring
+        # non_score_reward is the KL penalty per token (negative because it's subtracted)
+        # kls is the raw KL divergence per token
+        if kls.numel() > 0:
+            # Get KL penalty coefficient from config (default 0.1)
+            kl_coef = getattr(self.config, 'kl_penalty_coef', 0.1) if hasattr(self, 'config') else 0.1
+            
+            # Compute statistics (only for non-masked tokens)
+            masked_kls = kls[masks.bool()]
+            if masked_kls.numel() > 0:
+                mean_kl = masked_kls.mean().item()
+                max_kl = masked_kls.max().item()
+                mean_kl_penalty = (-non_score_reward[masks.bool()]).mean().item()  # non_score_reward is negative
+                
+                # Log every few steps to avoid spam
+                if not hasattr(self, '_kl_log_counter'):
+                    self._kl_log_counter = 0
+                self._kl_log_counter += 1
+                
+                if self._kl_log_counter % 10 == 1:  # Log every 10th call
+                    logger.info(
+                        f"📊 KL Penalty Stats: mean_kl={mean_kl:.4f}, max_kl={max_kl:.4f}, "
+                        f"mean_penalty={mean_kl_penalty:.4f}, kl_coef={kl_coef:.3f}"
+                    )
+        
+        return rewards, non_score_reward, kls
 
     def batched_forward_pass(self, model, queries, responses, model_inputs, return_logits=False, response_masks=None):
         """
@@ -1122,7 +1198,48 @@ class MyPPOTrainer(CustomPPOTrainer):
         
         # Call parent's batched_forward_pass - the patched forward/__call__ should handle the conversion
         # Pass through all arguments exactly as parent expects
-        return super().batched_forward_pass(model, queries, responses, model_inputs, return_logits=return_logits, response_masks=response_masks)
+        result = super().batched_forward_pass(model, queries, responses, model_inputs, return_logits=return_logits, response_masks=response_masks)
+        
+        # CRITICAL: If any tensors in result are on CPU (from reference model), move them to policy model's device
+        # This ensures ref_logprobs are on the same device as logprobs for reward computation
+        if hasattr(self, 'model'):
+            # Get policy model device
+            try:
+                policy_device = next(self.model.parameters()).device
+            except StopIteration:
+                policy_device = torch.device('cuda:0')  # Fallback
+            
+            # Only move if policy is on CUDA and result contains CPU tensors
+            if str(policy_device) != 'cpu' and isinstance(result, tuple):
+                def move_to_device(obj, device):
+                    """Recursively move tensors to device"""
+                    if isinstance(obj, torch.Tensor):
+                        if str(obj.device) == 'cpu':
+                            return obj.to(device)
+                        return obj
+                    elif isinstance(obj, (list, tuple)):
+                        return type(obj)(move_to_device(item, device) for item in obj)
+                    else:
+                        return obj
+                
+                # Check if any tensor is on CPU
+                has_cpu_tensors = False
+                for item in result:
+                    if isinstance(item, torch.Tensor) and str(item.device) == 'cpu':
+                        has_cpu_tensors = True
+                        break
+                    elif isinstance(item, (list, tuple)):
+                        for subitem in item:
+                            if isinstance(subitem, torch.Tensor) and str(subitem.device) == 'cpu':
+                                has_cpu_tensors = True
+                                break
+                        if has_cpu_tensors:
+                            break
+                
+                if has_cpu_tensors:
+                    result = tuple(move_to_device(item, policy_device) for item in result)
+        
+        return result
 
     def ppo_train(self, resume_from_checkpoint=None, start_step=0, start_query_idx=0):
         # Clear GPU cache at start to free up memory
