@@ -384,8 +384,128 @@ class MyPPOTrainer(CustomPPOTrainer):
         PPO_NO_AD_BUFFER.extend(decoded_no_ad)
 
         # Return query tensors (with-ad prompts) and response tensors
-        query_tensors = [input_ids_ad[i] for i in range(input_ids_ad.size(0))]
-        return query_tensors, response_tensors_ad
+        # Ensure they are lists of tensors (not batched tensors)
+        query_tensors = [input_ids_ad[i].clone() for i in range(input_ids_ad.size(0))]
+        response_tensors = [r.clone() for r in response_tensors_ad]
+        return query_tensors, response_tensors
+
+    def prepare_model_inputs(self, queries: List[torch.Tensor], responses: List[torch.Tensor]):
+        """
+        Override to ensure queries and responses are properly formatted and on the correct device.
+        Returns a dict with input_ids and attention_mask that are already on the correct device.
+        """
+        logger.info("🔧 Using CUSTOM prepare_model_inputs override")
+        # Ensure queries and responses are lists of tensors (not dicts)
+        if not queries or not responses:
+            raise ValueError("Queries and responses cannot be empty")
+        
+        if len(queries) != len(responses):
+            raise ValueError(f"Queries ({len(queries)}) and responses ({len(responses)}) must have the same length")
+        
+        # Convert to tensors if they're not already, and ensure they're 1D
+        query_tensors = []
+        for q in queries:
+            if isinstance(q, torch.Tensor):
+                # Ensure it's 1D (flatten if needed)
+                if q.dim() > 1:
+                    q = q.flatten()
+                query_tensors.append(q)
+            elif isinstance(q, (list, tuple)):
+                query_tensors.append(torch.tensor(q, dtype=torch.long))
+            elif isinstance(q, dict):
+                # If it's a dict, extract input_ids
+                if "input_ids" in q:
+                    q_tensor = q["input_ids"]
+                    if isinstance(q_tensor, torch.Tensor):
+                        if q_tensor.dim() > 1:
+                            q_tensor = q_tensor.flatten()
+                        query_tensors.append(q_tensor)
+                    else:
+                        query_tensors.append(torch.tensor(q_tensor, dtype=torch.long))
+                else:
+                    raise ValueError(f"Dict query missing 'input_ids': {list(q.keys())}")
+            else:
+                raise ValueError(f"Unexpected query type: {type(q)}")
+        
+        response_tensors = []
+        for r in responses:
+            if isinstance(r, torch.Tensor):
+                # Ensure it's 1D (flatten if needed)
+                if r.dim() > 1:
+                    r = r.flatten()
+                response_tensors.append(r)
+            elif isinstance(r, (list, tuple)):
+                response_tensors.append(torch.tensor(r, dtype=torch.long))
+            elif isinstance(r, dict):
+                # If it's a dict, extract input_ids or the tensor itself
+                if "input_ids" in r:
+                    r_tensor = r["input_ids"]
+                    if isinstance(r_tensor, torch.Tensor):
+                        if r_tensor.dim() > 1:
+                            r_tensor = r_tensor.flatten()
+                        response_tensors.append(r_tensor)
+                    else:
+                        response_tensors.append(torch.tensor(r_tensor, dtype=torch.long))
+                else:
+                    raise ValueError(f"Dict response missing 'input_ids': {list(r.keys())}")
+            else:
+                raise ValueError(f"Unexpected response type: {type(r)}")
+        
+        # Get the model device
+        model_device = next(self.model.parameters()).device
+        
+        # Concatenate queries and responses to create full sequences
+        # Format: [query_1, response_1, query_2, response_2, ...]
+        input_ids_list = []
+        attention_mask_list = []
+        
+        for query, response in zip(query_tensors, response_tensors):
+            # Ensure tensors are on the correct device
+            query = query.to(model_device)
+            response = response.to(model_device)
+            
+            # Concatenate query + response
+            full_sequence = torch.cat([query, response])
+            input_ids_list.append(full_sequence)
+            
+            # Create attention mask (all ones for the full sequence)
+            attention_mask = torch.ones_like(full_sequence, dtype=torch.long)
+            attention_mask_list.append(attention_mask)
+        
+        # Pad sequences to the same length
+        max_length = max(len(seq) for seq in input_ids_list)
+        # Get pad_token_id from tokenizer (fallback to eos_token_id or 0)
+        if hasattr(self, '_custom_tokenizer') and self._custom_tokenizer.pad_token_id is not None:
+            pad_token_id = self._custom_tokenizer.pad_token_id
+        elif hasattr(self, 'tokenizer') and self.tokenizer.pad_token_id is not None:
+            pad_token_id = self.tokenizer.pad_token_id
+        elif hasattr(self, 'tokenizer') and self.tokenizer.eos_token_id is not None:
+            pad_token_id = self.tokenizer.eos_token_id
+        else:
+            pad_token_id = 0  # Final fallback
+        
+        padded_input_ids = []
+        padded_attention_mask = []
+        
+        for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
+            # Pad to max_length
+            pad_length = max_length - len(input_ids)
+            if pad_length > 0:
+                input_ids = torch.cat([input_ids, torch.full((pad_length,), pad_token_id, dtype=torch.long, device=model_device)])
+                attention_mask = torch.cat([attention_mask, torch.zeros(pad_length, dtype=torch.long, device=model_device)])
+            
+            padded_input_ids.append(input_ids)
+            padded_attention_mask.append(attention_mask)
+        
+        # Stack into batch tensors
+        input_ids = torch.stack(padded_input_ids)
+        attention_mask = torch.stack(padded_attention_mask)
+        
+        # Return dict with tensors already on the correct device
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
 
     @torch.no_grad()
     def get_rewards(
@@ -801,15 +921,55 @@ def make_trainer(
 
     # Patch model forward (__call__) for llamafactory PPO trainer
     def patched_call(self, *args, **kwargs):
+        # Call forward method (forward handles return_dict internally)
         original_output = super(self.__class__, self).forward(*args, **kwargs)
+        
+        # Debug: log output type (only first few times to avoid spam)
+        if not hasattr(self, '_patched_call_log_count'):
+            self._patched_call_log_count = 0
+        if self._patched_call_log_count < 3:
+            logger.info(f"🔧 patched_call output type: {type(original_output)}, has logits: {hasattr(original_output, 'logits')}, has value: {hasattr(original_output, 'value')}")
+            self._patched_call_log_count += 1
+        
+        # Handle ModelOutput object (when return_dict=True)
         if hasattr(original_output, "logits"):
             past_key_values = getattr(original_output, "past_key_values", None)
+            # For ValueHead models, check for value in the output
+            # The value might be in the output directly or as an attribute
             if hasattr(original_output, "value"):
-                return original_output.logits, past_key_values, original_output.value
-            return original_output.logits, past_key_values, None
+                value = original_output.value
+            elif isinstance(original_output, dict) and "value" in original_output:
+                value = original_output["value"]
+            else:
+                value = None
+            result = (original_output.logits, past_key_values, value)
+            if self._patched_call_log_count <= 3:
+                logger.info(f"🔧 patched_call returning: logits shape={original_output.logits.shape if hasattr(original_output.logits, 'shape') else 'N/A'}, value={value is not None}")
+            return result
+        # Handle tuple output (when return_dict=False)
         elif isinstance(original_output, tuple):
-            return (original_output + (None,) * 3)[:3]
-        return original_output, None, None
+            # If it's already a tuple, pad to 3 elements if needed
+            if len(original_output) >= 3:
+                return original_output[:3]
+            else:
+                return (original_output + (None,) * 3)[:3]
+        # Handle dict output
+        elif isinstance(original_output, dict):
+            logits = original_output.get("logits", None)
+            past_key_values = original_output.get("past_key_values", None)
+            value = original_output.get("value", None)
+            return logits, past_key_values, value
+        # Fallback: if it's a single value, wrap it
+        else:
+            logger.warning(f"⚠️ Unexpected model output type: {type(original_output)}, dir: {dir(original_output)[:10]}")
+            # Try to extract logits if it's a ModelOutput-like object
+            if hasattr(original_output, '__dict__'):
+                attrs = original_output.__dict__
+                logits = attrs.get('logits', None)
+                value = attrs.get('value', None)
+                if logits is not None:
+                    return logits, None, value
+            return original_output, None, None
 
     policy.__call__ = patched_call.__get__(policy, policy.__class__)
     policy.gradient_checkpointing_enable()
