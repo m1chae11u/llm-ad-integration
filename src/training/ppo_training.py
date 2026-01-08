@@ -218,6 +218,7 @@ class MyPPOTrainer(CustomPPOTrainer):
                         # Convert ModelOutput to tuple format expected by llamafactory
                         if hasattr(original_output, "logits"):
                             # ModelOutput object - extract logits, past_key_values, and value
+                            logits = original_output.logits
                             past_key_values = getattr(original_output, "past_key_values", None)
                             
                             # Try to get value from value head (for PPO models)
@@ -269,8 +270,6 @@ class MyPPOTrainer(CustomPPOTrainer):
                                                 # Use mean pooling or last token - try mean first
                                                 pooled = last_hidden.mean(dim=1)  # [batch, hidden]
                                                 value = v_head(pooled)  # [batch, 1] or [batch]
-                                                if len(value.shape) > 1 and value.shape[-1] == 1:
-                                                    value = value.squeeze(-1)
                                             else:
                                                 # Already pooled or different shape
                                                 value = v_head(last_hidden)
@@ -281,15 +280,28 @@ class MyPPOTrainer(CustomPPOTrainer):
                                 
                                 # CRITICAL: If value is still None, create a zero tensor as fallback
                                 # The parent class expects a tensor, not None (it tries to torch.cat values)
-                                if value is None and hasattr(original_output, "logits"):
-                                    # Create a zero tensor with shape [batch_size] matching logits batch size
-                                    batch_size = original_output.logits.shape[0]
+                                if value is None:
                                     import torch
-                                    value = torch.zeros(batch_size, device=original_output.logits.device, dtype=original_output.logits.dtype)
+                                    batch_size = logits.shape[0]
+                                    seq_len = logits.shape[1] if logits.dim() > 1 else 1
+                                    value = torch.zeros(batch_size, seq_len, device=logits.device, dtype=logits.dtype)
                                     if not hasattr(self, '_patched_forward_log_count') or self._patched_forward_log_count <= 3:
                                         logger.warning(f"⚠️ Value is None, creating zero tensor with shape {value.shape} as fallback")
                             
-                            result = (original_output.logits, past_key_values, value)
+                            # Ensure value shape matches what LlamaFactory expects: [batch, seq_len]
+                            if value is not None:
+                                import torch
+                                if isinstance(value, torch.Tensor):
+                                    if value.dim() == 1:
+                                        # [batch] -> [batch, seq_len]
+                                        seq_len = logits.shape[1] if logits.dim() > 1 else 1
+                                        value = value.unsqueeze(1).expand(-1, seq_len)
+                                    elif value.dim() == 2 and value.shape[1] == 1 and logits.dim() > 1:
+                                        # [batch, 1] -> [batch, seq_len]
+                                        seq_len = logits.shape[1]
+                                        value = value.expand(-1, seq_len)
+                            
+                            result = (logits, past_key_values, value)
                             # Track patch usage
                             if not hasattr(self, '_patched_forward_log_count'):
                                 self._patched_forward_log_count = 0
@@ -934,6 +946,7 @@ class MyPPOTrainer(CustomPPOTrainer):
                         # Convert ModelOutput to tuple format expected by llamafactory
                         if hasattr(original_output, "logits"):
                             # ModelOutput object - extract logits, past_key_values, and value
+                            logits = original_output.logits
                             past_key_values = getattr(original_output, "past_key_values", None)
                             
                             # Try to get value from value head (for PPO models)
@@ -985,8 +998,6 @@ class MyPPOTrainer(CustomPPOTrainer):
                                                 # Use mean pooling or last token - try mean first
                                                 pooled = last_hidden.mean(dim=1)  # [batch, hidden]
                                                 value = v_head(pooled)  # [batch, 1] or [batch]
-                                                if len(value.shape) > 1 and value.shape[-1] == 1:
-                                                    value = value.squeeze(-1)
                                             else:
                                                 # Already pooled or different shape
                                                 value = v_head(last_hidden)
@@ -997,15 +1008,28 @@ class MyPPOTrainer(CustomPPOTrainer):
                                 
                                 # CRITICAL: If value is still None, create a zero tensor as fallback
                                 # The parent class expects a tensor, not None (it tries to torch.cat values)
-                                if value is None and hasattr(original_output, "logits"):
-                                    # Create a zero tensor with shape [batch_size] matching logits batch size
-                                    batch_size = original_output.logits.shape[0]
+                                if value is None:
                                     import torch
-                                    value = torch.zeros(batch_size, device=original_output.logits.device, dtype=original_output.logits.dtype)
+                                    batch_size = logits.shape[0]
+                                    seq_len = logits.shape[1] if logits.dim() > 1 else 1
+                                    value = torch.zeros(batch_size, seq_len, device=logits.device, dtype=logits.dtype)
                                     if not hasattr(self, '_patched_forward_log_count') or self._patched_forward_log_count <= 3:
                                         logger.warning(f"⚠️ Value is None, creating zero tensor with shape {value.shape} as fallback")
                             
-                            result = (original_output.logits, past_key_values, value)
+                            # Ensure value shape matches what LlamaFactory expects: [batch, seq_len]
+                            if value is not None:
+                                import torch
+                                if isinstance(value, torch.Tensor):
+                                    if value.dim() == 1:
+                                        # [batch] -> [batch, seq_len]
+                                        seq_len = logits.shape[1] if logits.dim() > 1 else 1
+                                        value = value.unsqueeze(1).expand(-1, seq_len)
+                                    elif value.dim() == 2 and value.shape[1] == 1 and logits.dim() > 1:
+                                        # [batch, 1] -> [batch, seq_len]
+                                        seq_len = logits.shape[1]
+                                        value = value.expand(-1, seq_len)
+                            
+                            result = (logits, past_key_values, value)
                             # Track patch usage
                             if not hasattr(self, '_patched_forward_log_count'):
                                 self._patched_forward_log_count = 0
@@ -1041,6 +1065,60 @@ class MyPPOTrainer(CustomPPOTrainer):
                 unwrapped_model.__call__ = patched_call_local
                 unwrapped_model._patched_forward_log_count = 0  # Mark as patched
                 logger.info("✅ Applied forward/__call__ patch to model in batched_forward_pass")
+        
+        # CRITICAL: Ensure all inputs are on the correct device
+        # The parent class will use these directly, so they must be on the same device as the model
+        import torch
+        
+        # Get model device
+        if hasattr(self, 'accelerator') and self.accelerator is not None:
+            model_device = self.accelerator.device
+        elif model is not None:
+            if hasattr(model, 'device'):
+                model_device = model.device
+            else:
+                model_device = next(model.parameters()).device
+        else:
+            model_device = next(self.model.parameters()).device
+        
+        # Move queries to model device
+        if queries is not None:
+            device_fixed_queries = []
+            for q in queries:
+                if isinstance(q, torch.Tensor):
+                    device_fixed_queries.append(q.to(model_device))
+                else:
+                    device_fixed_queries.append(q)
+            queries = device_fixed_queries
+        
+        # Move responses to model device
+        if responses is not None:
+            device_fixed_responses = []
+            for r in responses:
+                if isinstance(r, torch.Tensor):
+                    device_fixed_responses.append(r.to(model_device))
+                else:
+                    device_fixed_responses.append(r)
+            responses = device_fixed_responses
+        
+        # Move all tensors in model_inputs to the model device
+        if model_inputs is not None and isinstance(model_inputs, dict):
+            device_fixed_inputs = {}
+            for key, value in model_inputs.items():
+                if isinstance(value, torch.Tensor):
+                    device_fixed_inputs[key] = value.to(model_device)
+                elif isinstance(value, (list, tuple)):
+                    # Handle lists/tuples of tensors
+                    device_fixed_list = []
+                    for item in value:
+                        if isinstance(item, torch.Tensor):
+                            device_fixed_list.append(item.to(model_device))
+                        else:
+                            device_fixed_list.append(item)
+                    device_fixed_inputs[key] = type(value)(device_fixed_list)
+                else:
+                    device_fixed_inputs[key] = value
+            model_inputs = device_fixed_inputs
         
         # Call parent's batched_forward_pass - the patched forward/__call__ should handle the conversion
         # Pass through all arguments exactly as parent expects
@@ -1349,6 +1427,7 @@ def make_trainer(
             
             # Handle ModelOutput object (when return_dict=True)
             if hasattr(original_output, "logits"):
+                logits = original_output.logits
                 past_key_values = getattr(original_output, "past_key_values", None)
                 # For ValueHead models, check for value in the output
                 # The value might be in the output directly or as an attribute
@@ -1406,15 +1485,28 @@ def make_trainer(
                     
                     # CRITICAL: If value is still None, create a zero tensor as fallback
                     # The parent class expects a tensor, not None (it tries to torch.cat values)
-                    if value is None and hasattr(original_output, "logits"):
-                        # Create a zero tensor with shape [batch_size] matching logits batch size
-                        batch_size = original_output.logits.shape[0]
+                    if value is None:
                         import torch
-                        value = torch.zeros(batch_size, device=original_output.logits.device, dtype=original_output.logits.dtype)
+                        batch_size = logits.shape[0]
+                        seq_len = logits.shape[1] if logits.dim() > 1 else 1
+                        value = torch.zeros(batch_size, seq_len, device=logits.device, dtype=logits.dtype)
                         if self._patched_forward_log_count <= 3:
                             logger.warning(f"⚠️ Value is None, creating zero tensor with shape {value.shape} as fallback")
                 
-                result = (original_output.logits, past_key_values, value)
+                # Ensure value shape matches what LlamaFactory expects: [batch, seq_len]
+                if value is not None:
+                    import torch
+                    if isinstance(value, torch.Tensor):
+                        if value.dim() == 1:
+                            # [batch] -> [batch, seq_len]
+                            seq_len = logits.shape[1] if logits.dim() > 1 else 1
+                            value = value.unsqueeze(1).expand(-1, seq_len)
+                        elif value.dim() == 2 and value.shape[1] == 1 and logits.dim() > 1:
+                            # [batch, 1] -> [batch, seq_len]
+                            seq_len = logits.shape[1]
+                            value = value.expand(-1, seq_len)
+                
+                result = (logits, past_key_values, value)
                 if self._patched_forward_log_count <= 3:
                     logger.info(f"🔧 patched_forward returning: logits shape={original_output.logits.shape if hasattr(original_output.logits, 'shape') else 'N/A'}, value={value is not None if value is not None else 'None'}")
                 return result
