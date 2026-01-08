@@ -29,8 +29,8 @@ class CheckpointManager:
             )
             tokenizer_path = ckpt / "tokenizer_config.json"
             if has_model and tokenizer_path.exists():
-                model = AutoModelForCausalLM.from_pretrained(ckpt, use_auth_token=self.hf_token)
-                tokenizer = AutoTokenizer.from_pretrained(ckpt, use_auth_token=self.hf_token)
+                model = AutoModelForCausalLM.from_pretrained(ckpt, token=self.hf_token)
+                tokenizer = AutoTokenizer.from_pretrained(ckpt, token=self.hf_token)
                 step = int(ckpt.name.split('-')[-1])
                 return model, tokenizer, {
                     "step": step,
@@ -38,8 +38,8 @@ class CheckpointManager:
                 }
 
         # No checkpoint found, load base model and tokenizer
-        model = AutoModelForCausalLM.from_pretrained(self.base_model_name, use_auth_token=self.hf_token)
-        tokenizer = AutoTokenizer.from_pretrained(self.base_model_name, use_auth_token=self.hf_token)
+        model = AutoModelForCausalLM.from_pretrained(self.base_model_name, token=self.hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(self.base_model_name, token=self.hf_token)
         return model, tokenizer, None
 
     def save_checkpoint(self, step):

@@ -35,8 +35,10 @@ LLM Response:
 {response}
 """
     result = call_gemini_and_extract_json(prompt, keys=["H1", "explanation"])
+    h1_score = result.get("H1", 0)
     return {
-        "H1": result.get("H1", 0),
+        "H1": h1_score,
+        "Helpfulness Score": h1_score,  # Add for consistency with other judges
         "Helpfulness Explanation": result.get("explanation", "")
     }
 
@@ -75,7 +77,9 @@ LLM Response:
 {response}
 """
     result = await call_gemini_api(prompt, keys=["H1", "explanation"])
+    h1_score = result.get("H1", 0)
     return {
-        "H1": result.get("H1", 0),
+        "H1": h1_score,
+        "Helpfulness Score": h1_score,  # Add for consistency with other judges
         "Helpfulness Explanation": result.get("explanation", "")
     }

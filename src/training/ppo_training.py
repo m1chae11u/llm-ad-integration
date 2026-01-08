@@ -737,7 +737,7 @@ def make_trainer(
 
     # --- Load the tokenizer ---
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name, use_fast=True, trust_remote_code=True, use_auth_token=hf_token
+        model_name, use_fast=True, trust_remote_code=True, token=hf_token
     )
 
     # ✅ Configure tokenizer once
@@ -761,7 +761,7 @@ def make_trainer(
                 policy = AutoModelForCausalLMWithValueHead.from_pretrained(
                     model_name,
                     trust_remote_code=True,
-                    use_auth_token=hf_token,
+                    token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
                     torch_dtype=torch.float16,  # Use float16 on GPU
                     device_map="cuda:0",  # Force GPU, no offloading
                     low_cpu_mem_usage=True,  # Reduce memory usage during loading
@@ -775,7 +775,7 @@ def make_trainer(
                     policy = AutoModelForCausalLMWithValueHead.from_pretrained(
                         model_name,
                         trust_remote_code=True,
-                        use_auth_token=hf_token,
+                        token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
                         torch_dtype=torch.float16,
                         device_map=None,  # Load to CPU
                         low_cpu_mem_usage=True,
@@ -790,7 +790,7 @@ def make_trainer(
             policy = AutoModelForCausalLMWithValueHead.from_pretrained(
                 model_name,
                 trust_remote_code=True,
-                use_auth_token=hf_token,
+                token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
                 torch_dtype=torch.float32,  # CPU mode
                 device_map=None,
             ).to(DEVICE)

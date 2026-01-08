@@ -24,7 +24,10 @@ try:
     HAS_NEW_GENAI = True
 except ImportError:
     HAS_NEW_GENAI = False
-    print("⚠️ New google.genai package not found, will use REST API for embeddings")
+    # Only print warning if actually needed (suppress if package is installed but import fails for other reasons)
+    import sys
+    if "--verbose" in sys.argv or os.getenv("VERBOSE", "").lower() == "true":
+        print("⚠️ New google.genai package not found, will use REST API for embeddings")
 
 
 # Load environment variables
@@ -49,9 +52,12 @@ genai.configure(api_key=GOOGLE_API_KEY)  # For Gemini judge API
 google_embedding_client = None
 if HAS_NEW_GENAI and GOOGLE_API_KEY:
     try:
+        # The new google.genai.Client can be initialized with api_key parameter
         google_embedding_client = google_genai.Client(api_key=GOOGLE_API_KEY)
+        print("✅ Google GenAI client initialized for embeddings")
     except Exception as e:
         print(f"⚠️ Failed to initialize Google GenAI client: {e}")
+        print(f"   Will use REST API fallback for embeddings")
         HAS_NEW_GENAI = False
 
 # Cache for embeddings and judge results
@@ -100,15 +106,65 @@ def get_embedding(text: str, model: str = None) -> np.ndarray:
                     "x-goog-api-key": GOOGLE_API_KEY,
                     "Content-Type": "application/json"
                 }
+                
+                # Try with minimal format first (required fields only)
                 data = {
-                    "content": {"parts": [{"text": text}]},
-                    "output_dimensionality": 1536,
-                    "task_type": "SEMANTIC_SIMILARITY"
+                    "content": {"parts": [{"text": text}]}
                 }
+                
                 response = requests.post(url, headers=headers, json=data, timeout=30)
+                
+                # If 403, try with model in data (some APIs require it)
+                if response.status_code == 403:
+                    data = {
+                        "model": "models/gemini-embedding-001",
+                        "content": {"parts": [{"text": text}]}
+                    }
+                    response = requests.post(url, headers=headers, json=data, timeout=30)
+                
+                # If still fails, try with optional params
+                if response.status_code == 403:
+                    data = {
+                        "model": "models/gemini-embedding-001",
+                        "content": {"parts": [{"text": text}]},
+                        "output_dimensionality": 1536
+                    }
+                    response = requests.post(url, headers=headers, json=data, timeout=30)
+                
+                # Check response - 403 means permission issue
+                if response.status_code == 403:
+                    error_detail = ""
+                    try:
+                        error_json = response.json()
+                        error_detail = error_json.get('error', {}).get('message', response.text)
+                    except:
+                        error_detail = response.text[:200]  # First 200 chars
+                    
+                    print(f"⚠️  Google Embedding API returned 403 Forbidden")
+                    print(f"   This usually means:")
+                    print(f"   1. Embedding API not enabled in Google Cloud Console")
+                    print(f"   2. API key doesn't have embedding permissions")
+                    print(f"   3. API key is invalid or expired")
+                    print(f"   Error details: {error_detail}")
+                    print(f"   Falling back to OpenAI embeddings...")
+                    raise Exception("Google Embedding API 403 - using fallback")
+                
                 response.raise_for_status()
                 result = response.json()
-                embedding = np.array(result['embedding']['values'])
+                
+                # Handle different response formats
+                if 'embedding' in result:
+                    if 'values' in result['embedding']:
+                        embedding = np.array(result['embedding']['values'])
+                    else:
+                        embedding = np.array(result['embedding'])
+                elif 'embeddings' in result and len(result['embeddings']) > 0:
+                    if 'values' in result['embeddings'][0]:
+                        embedding = np.array(result['embeddings'][0]['values'])
+                    else:
+                        embedding = np.array(result['embeddings'][0])
+                else:
+                    raise ValueError(f"Unexpected response format: {result}")
             
             # Normalize embedding for better similarity calculations (recommended for non-3072 dims)
             embedding = embedding / np.linalg.norm(embedding)
