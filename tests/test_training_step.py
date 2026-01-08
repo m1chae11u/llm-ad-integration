@@ -15,19 +15,24 @@ You don't need different models for different tests - one model works for all.
 
 OPTIONS FOR RUNNING TESTS:
 --------------------------
-1. Use 8B model with 8-bit quantization (recommended for testing with production model):
+1. Use TinyLlama (RECOMMENDED - open model, no auth needed, fast):
+   export TEST_MODEL="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+   pytest tests/test_training_step.py
+   # Memory: ~6GB needed ✅
+
+2. Use 8B model with 8-bit quantization (for testing with production model):
    export USE_8BIT=true
    pytest tests/test_training_step.py
    # Memory: ~25GB needed (8GB weights + 16GB gradients + optimizer + activations)
 
-2. Use smaller model (fastest, recommended for CI/quick tests):
-   export TEST_MODEL="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-   pytest tests/test_training_step.py
-   # Memory: ~6GB needed
-
 3. Use 8B model without quantization (will OOM on 40GB GPU):
    pytest tests/test_training_step.py
    # Memory: ~67GB needed ❌ (will fail)
+
+NOTE: Meta Llama models (meta-llama/*) are GATED and require:
+- Accepting license on HuggingFace
+- Valid HF_TOKEN with access
+Use TinyLlama for easier testing without authentication.
 """
 
 import pytest
@@ -65,9 +70,10 @@ from llamafactory.hparams import (
 os.environ.setdefault("HF_TOKEN", os.getenv("HF_TOKEN", ""))
 # Default to 8B model, but recommend using TEST_MODEL env var for smaller model
 os.environ.setdefault("BASE_MODEL", os.getenv("BASE_MODEL", "meta-llama/Llama-3.1-8B"))
-# Recommended TEST_MODEL values:
-# - "TinyLlama/TinyLlama-1.1B-Chat-v1.0" (1.1B, ~6GB needed)
-# - "microsoft/phi-2" (2.7B but efficient, ~8GB needed)
+# Recommended TEST_MODEL values (use non-gated models for easier testing):
+# - "TinyLlama/TinyLlama-1.1B-Chat-v1.0" (1.1B, ~6GB needed, OPEN, no auth needed) ✅ RECOMMENDED
+# - "microsoft/phi-2" (2.7B but efficient, ~8GB needed, OPEN)
+# - "meta-llama/Llama-3.2-1B-Instruct" (1B, ~6GB needed, GATED - requires HuggingFace license acceptance)
 # - Any 1B-2B model should work fine for these tests
 
 # Set PyTorch CUDA allocator config to reduce fragmentation
@@ -115,8 +121,14 @@ def sample_dataset():
 def minimal_trainer_config(sample_ad_facts, sample_dataset):
     """Create minimal configuration for trainer."""
     # Allow override with TEST_MODEL env var for smaller models
-    default_model = os.getenv("BASE_MODEL", "meta-llama/Llama-3.1-8B")
-    test_model = os.getenv("TEST_MODEL", default_model)
+    # Default to TinyLlama for testing (fits in 40GB GPU without quantization)
+    # IMPORTANT: TEST_MODEL takes precedence over BASE_MODEL for tests
+    default_test_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Small, open model for testing
+    base_model = os.getenv("BASE_MODEL", "meta-llama/Llama-3.1-8B")  # For production (not used if TEST_MODEL not set)
+    # Always prefer TEST_MODEL, fallback to TinyLlama (NOT BASE_MODEL) for tests
+    test_model = os.getenv("TEST_MODEL")
+    if test_model is None:
+        test_model = default_test_model  # Use TinyLlama, not BASE_MODEL
     model_name = test_model
     hf_token = os.getenv("HF_TOKEN")
     
@@ -279,7 +291,14 @@ def minimal_trainer_config(sample_ad_facts, sample_dataset):
                 torch.cuda.empty_cache()
                 print(f"🧹 Cleared CUDA cache in fixture cleanup")
     except Exception as e:
-        pytest.skip(f"Failed to load model for testing: {e}")
+        import traceback
+        error_msg = str(e)
+        full_traceback = traceback.format_exc()
+        print(f"\n❌ Failed to load model '{model_name}':")
+        print(f"   Error: {error_msg}")
+        print(f"\n   Full traceback:")
+        print(full_traceback)
+        pytest.skip(f"Failed to load model for testing: {error_msg}")
 
 
 def test_step_method_basic(minimal_trainer_config):
