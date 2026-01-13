@@ -154,9 +154,40 @@ class MyPPOTrainer(CustomPPOTrainer):
                 
         # Call super first to initialize self.args, self.tokenizer, etc.
         # The parent class will handle train_dataset from kwargs
+        self._policy_with_vhead = kwargs.get("model", None)
         super().__init__(*args, **kwargs)
-        
-        
+        self._ref_model = getattr(self, "_ref_model", None) or getattr(self, "ref_model", None)
+        u = self.accelerator.unwrap_model(self.model)
+        if not hasattr(u, "v_head") or u.v_head is None:
+            logger.warning("⚠️ Parent replaced policy with base model (no v_head). Restoring ValueHead policy...")
+
+            if self._policy_with_vhead is None:
+                raise RuntimeError("No saved ValueHead policy to restore from.")
+
+            # restore model
+            self.model = self._policy_with_vhead
+
+            # move model to accelerator device
+            dev = self.accelerator.device
+            self.model = force_valuehead_all_cuda(self.model, str(dev))
+
+            # IMPORTANT: rebuild optimizer to match restored parameters
+            lr = getattr(self.args, "learning_rate", 5e-5)
+            wd = getattr(self.args, "weight_decay", 0.0)
+            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
+
+            # prepare BOTH together so accelerate wraps consistently
+            self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+
+            # sanity print
+            uu = self.accelerator.unwrap_model(self.model)
+            bb = getattr(uu, "pretrained_model", uu)
+            logger.info(
+            f"✅ Restored base device: {next(bb.parameters()).device}, "
+            f"v_head device: {next(uu.v_head.parameters()).device if hasattr(uu,'v_head') and uu.v_head is not None else None}"
+            )
+                
+                
         # CRITICAL: Restore dataset if parent filtered it (double-check after init)
         if train_dataset is not None:
             # Check if dataset was filtered by parent
@@ -230,6 +261,9 @@ class MyPPOTrainer(CustomPPOTrainer):
             self._reset_dataloader()
         else:
             print("⚠️ train_dataset not yet available, will initialize dataloader when needed")
+        u = self.accelerator.unwrap_model(self.model)
+        u = self.accelerator.unwrap_model(self.model)
+        logger.info(f"🔥 Final policy device: {next(u.parameters()).device}")
         
     @staticmethod
     def ensure_llamafactory_tuple_output(model, logger):
@@ -409,9 +443,16 @@ class MyPPOTrainer(CustomPPOTrainer):
         ])
 
       
-        model = self.accelerator.unwrap_model(self.model)
-        policy_u = self.accelerator.unwrap_model(self.model)
-        model_device = next(self.accelerator.unwrap_model(self.model).parameters()).device
+        model = self.model  # possibly wrapped
+        u = self.accelerator.unwrap_model(model)
+        base = getattr(u, "pretrained_model", u)
+        model_device = next(base.parameters()).device
+
+        if model_device.type != "cuda":
+            raise RuntimeError(
+                f"Generation is on {model_device} — should be cuda. "
+                "Accelerate did not place model on GPU."
+            )
 
         
     
@@ -499,9 +540,10 @@ class MyPPOTrainer(CustomPPOTrainer):
         import torch
 
         # ✅ policy device (works with accelerate wrappers)
-        policy_model = self.accelerator.unwrap_model(self.model) if hasattr(self, "accelerator") else self.model
-        policy_device = next(policy_model.parameters()).device
-
+        u = self.accelerator.unwrap_model(self.model)
+        base = getattr(u, "pretrained_model", u)
+        policy_device = next(base.parameters()).device
+        
         # Defensive: allow single tensors too
         if isinstance(queries, torch.Tensor):
             queries = [queries]
@@ -749,18 +791,26 @@ class MyPPOTrainer(CustomPPOTrainer):
         return_logits: bool = False,
         response_masks=None,
     ):
-        if not hasattr(self, "_vh_debugged"):
-            print("BFP model type:", type(model))
-            uw = self.accelerator.unwrap_model(model)
-            print("unwrapped type:", type(uw))
-            print("has v_head on model:", hasattr(model, "v_head"))
-            print("has v_head on unwrapped:", hasattr(uw, "v_head"))
-            self._vh_debugged = True
-        if not hasattr(self, "_bfp_seen"):
-            print("✅ USING MyPPOTrainer.batched_forward_pass")
-            self._bfp_seen = True
+        def _unwrap(m):
+            return self.accelerator.unwrap_model(m) if m is not None else None
 
-        # LlamaFactory uses mini_batch_size from config
+        um = _unwrap(model)
+        u_ref = _unwrap(getattr(self, "ref_model", None))
+
+        is_ref = (model is None) or (u_ref is not None and um is u_ref)
+        if um is not None and next(getattr(um, "pretrained_model", um).parameters()).device.type == "cpu":
+            is_ref = True
+
+        if is_ref:
+            m_u = _unwrap(self._ref_model) or self._ref_model
+            base = getattr(m_u, "pretrained_model", m_u)
+        else:
+            m_u = self.accelerator.unwrap_model(self.model)
+            base = getattr(m_u, "pretrained_model", m_u)
+        # device where this forward will run
+        model_device = next(base.parameters()).device
+
+        # LlamaFactory mini-batching
         bs = len(queries)
         fbs = getattr(self.config, "mini_batch_size", bs)
 
@@ -771,87 +821,48 @@ class MyPPOTrainer(CustomPPOTrainer):
             query_batch = queries[i * fbs : (i + 1) * fbs]
             response_batch = responses[i * fbs : (i + 1) * fbs]
 
-            unwrapped = self.accelerator.unwrap_model(model)
-            model_device = next(unwrapped.parameters()).device
-
-            # move tensors
+            # move inputs to model_device (CUDA for policy; CPU for ref if you keep ref on CPU)
             for k, v in list(input_kwargs.items()):
                 if torch.is_tensor(v) and v.device != model_device:
                     input_kwargs[k] = v.to(model_device)
-
-            # ✅ IMPORTANT: rebind AFTER move (so these are CUDA tensors)
-            input_ids = input_kwargs["input_ids"]
-            attention_mask = input_kwargs["attention_mask"]
-
-            # dtype hygiene
-            if "attention_mask" in input_kwargs and input_kwargs["attention_mask"].dtype != torch.long:
+            if "attention_mask" in input_kwargs:
                 input_kwargs["attention_mask"] = input_kwargs["attention_mask"].long()
-                attention_mask = input_kwargs["attention_mask"]
+
+            input_ids = input_kwargs["input_ids"]
+            attention_mask = input_kwargs.get("attention_mask", None)
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=model_device)
+                input_kwargs["attention_mask"] = attention_mask
+            elif attention_mask.dtype != torch.long:
+                attention_mask = attention_mask.long()
+                input_kwargs["attention_mask"] = attention_mask
+
+            # if this model has v_head, we need hidden states to compute values
+            need_values = hasattr(m_u, "v_head") and m_u.v_head is not None
 
             with self.amp_context:
-                out = unwrapped(**input_kwargs, return_dict=True, use_cache=False)
+                out = base(
+                    **input_kwargs,
+                    return_dict=True,
+                    use_cache=False,
+                    output_hidden_states=need_values,
+                )
 
-            values = None  
+            logits = out.logits  # [B,T,V]
 
-            # ---- extract logits/values from first pass ----
-            if isinstance(out, tuple):
-                # (logits, pkv, values) from your patch
-                if len(out) == 3 and torch.is_tensor(out[0]) and torch.is_tensor(out[2]):
-                    logits, _, values = out
-                # TRL style: (lm_out, values)
-                elif len(out) >= 2 and hasattr(out[0], "logits") and torch.is_tensor(out[1]):
-                    logits = out[0].logits
-                    values = out[1]
-                else:
-                    raise TypeError(f"Unexpected tuple forward output: {[type(x) for x in out]}")
+            # values:
+            if need_values:
+                hs = out.hidden_states[-1]     # [B,T,H]
+                values = m_u.v_head(hs).squeeze(-1)  # [B,T]
             else:
-                if not hasattr(out, "logits"):
-                    raise TypeError(f"Forward output has no logits: {type(out)}")
-                logits = out.logits
-                if hasattr(out, "value") and torch.is_tensor(out.value):
-                    values = out.value
+                # reference model: values not used; return zeros with correct shape
+                values = torch.zeros(
+                    logits.shape[0], logits.shape[1],
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
 
-            # ---- if values still missing, rerun with hidden states ----
-            if values is None:
-                with self.amp_context:
-                    out_hs = unwrapped(
-                        **input_kwargs,
-                        return_dict=True,
-                        use_cache=False,
-                        output_hidden_states=True,
-                    )
-
-                logits = out_hs.logits
-                hs = out_hs.hidden_states[-1]  # [B,T,H]
-
-                vh = getattr(unwrapped, "v_head", None) or getattr(model, "v_head", None)
-                if vh is None:
-                    values = torch.zeros(
-                        hs.shape[0], hs.shape[1],
-                        device=logits.device,
-                        dtype=hs.dtype,
-                    )
-                else:
-                    values = vh(hs).squeeze(-1)
-
-            # values must exist now
-            if not torch.is_tensor(values):
-                raise TypeError(f"values is not a tensor: {type(values)}")
-
-            logits_s = logits[:, :-1, :]
-            labels   = input_ids[:, 1:]
-            logp = torch.log_softmax(logits_s, dim=-1)
-            if not hasattr(self, "_devcheck"):
-                print("logits:", logits.device, "input_ids:", input_ids.device, "labels:", labels.device)
-                self._devcheck = True
-            logprobs = logp.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
-
-            if not torch.is_tensor(logprobs):
-                raise TypeError(f"logprobs is not a Tensor: {type(logprobs)}")
-
-            values = values.to(logits.device)
-
-            # normalize values to [B, T]
+            # normalize values to [B,T]
             if values.dim() == 1:
                 values = values.unsqueeze(1).expand(-1, logits.shape[1])
             elif values.dim() == 2 and values.shape[1] == 1:
@@ -859,37 +870,34 @@ class MyPPOTrainer(CustomPPOTrainer):
             elif values.dim() == 3 and values.shape[-1] == 1:
                 values = values.squeeze(-1)
 
-            # build masks (same as TRL/LF)
+            # logprobs for shifted labels
+            logits_s = logits[:, :-1, :]
+            labels = input_ids[:, 1:]
+            logp = torch.log_softmax(logits_s, dim=-1)
+            logprobs = logp.gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # [B,T-1]
+
+            # masks (shifted)
             masks = torch.zeros_like(attention_mask)
             masks[:, :-1] = attention_mask[:, 1:]
 
+            # mask to response region
             for j in range(len(query_batch)):
                 start = max(0, len(query_batch[j]) - 1)
-                end = start + len(response_batch[j])
-                end = min(end, masks.shape[1])
-
+                end = min(start + len(response_batch[j]), masks.shape[1])
                 masks[j, :start] = 0
                 masks[j, end:] = 0
 
                 if response_masks is not None:
                     rm = response_masks[i * fbs : (i + 1) * fbs][j]
-
-                    if torch.is_tensor(rm):
-                        rm = rm.to(model_device)
-                    else:
-                        rm = torch.tensor(rm, device=model_device)
-
-                    rm = rm.long().view(-1)  # [resp_len] ideally
-
+                    rm = rm.to(model_device) if torch.is_tensor(rm) else torch.tensor(rm, device=model_device)
+                    rm = rm.long().view(-1)
                     resp_len = end - start
                     if rm.numel() != resp_len:
-                        # robust fallback: trim or pad with ones
-                        if rm.numel() > resp_len:
-                            rm = rm[:resp_len]
-                        else:
-                            rm = torch.cat([rm, torch.ones(resp_len - rm.numel(), device=model_device, dtype=rm.dtype)])
-
+                        rm = rm[:resp_len] if rm.numel() > resp_len else torch.cat(
+                            [rm, torch.ones(resp_len - rm.numel(), device=model_device, dtype=rm.dtype)]
+                        )
                     masks[j, start:end] = masks[j, start:end] * rm
+
             all_logprobs.append(logprobs)
             all_values.append(values)
             all_masks.append(masks)
@@ -897,13 +905,41 @@ class MyPPOTrainer(CustomPPOTrainer):
                 all_logits.append(logits)
 
         return (
-            torch.cat(all_logprobs),
-            torch.cat(all_logits)[:, :-1] if return_logits else None,
-            torch.cat(all_values)[:, :-1],
-            torch.cat(all_masks)[:, :-1],
+            torch.cat(all_logprobs, dim=0),
+            torch.cat(all_logits, dim=0)[:, :-1] if return_logits else None,
+            torch.cat(all_values, dim=0)[:, :-1],
+            torch.cat(all_masks, dim=0)[:, :-1],
         )
 
     def ppo_train(self, resume_from_checkpoint=None, start_step=0, start_query_idx=0):
+        u = self.accelerator.unwrap_model(self.model)
+        base = getattr(u, "pretrained_model", u)
+        if (not hasattr(u, "v_head")) or (u.v_head is None) or (next(base.parameters()).device.type != "cuda"):
+
+            print("🧯 Restoring ValueHead policy onto CUDA (self.model was overwritten)...")
+
+            if not hasattr(self, "_policy_with_vhead") or self._policy_with_vhead is None:
+                raise RuntimeError("Missing self._policy_with_vhead to restore from.")
+
+            # restore correct model object
+            self.model = self._policy_with_vhead
+
+            # move to accelerator device (cuda)
+            dev = str(self.accelerator.device)  # e.g. 'cuda'
+            self.model = force_valuehead_all_cuda(self.model, dev)
+
+            # IMPORTANT: re-create optimizer over restored parameters if needed
+            if not hasattr(self, "optimizer") or self.optimizer is None:
+                lr = getattr(self.args, "learning_rate", 5e-5)
+                wd = getattr(self.args, "weight_decay", 0.0)
+                self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
+
+            # prepare together so accelerate wraps consistently
+            self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+
+            u2 = self.accelerator.unwrap_model(self.model)
+            print("✅ Restored model type:", type(u2), "has v_head:", hasattr(u2, "v_head"),
+                "device:", next(u2.parameters()).device)
         # Clear GPU cache at start to free up memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1093,29 +1129,39 @@ class MyPPOTrainer(CustomPPOTrainer):
             sys.exit(1)
 
 
-def force_valuehead_all_cuda(m, device="cuda"):
+def force_valuehead_all_cuda(m, device="cuda:0"):
     import torch
 
+    # normalize "cuda" -> "cuda:0"
+    if device == "cuda":
+        device = f"cuda:{torch.cuda.current_device()}"
+
     dev = torch.device(device)
+
+    # IMPORTANT: don't re-move if already on CUDA (prevents tiny alloc OOMs)
+    try:
+        u = m.pretrained_model if hasattr(m, "pretrained_model") else m
+        pdev = next(u.parameters()).device
+        if pdev.type == "cuda":
+            # still ensure v_head is on cuda
+            if hasattr(m, "v_head") and m.v_head is not None:
+                m.v_head = m.v_head.to(dev)
+            return m
+    except StopIteration:
+        pass
+
     m = m.to(dev)
 
-    # TRL ValueHead wrapper: base model sits here
     if hasattr(m, "pretrained_model") and m.pretrained_model is not None:
         m.pretrained_model = m.pretrained_model.to(dev)
 
-    # Value head
     if hasattr(m, "v_head") and m.v_head is not None:
         m.v_head = m.v_head.to(dev)
 
-    # ✅ Hard check:
-    # If dev is "cuda" (no index), accept ANY cuda:{i}.
-    if dev.type == "cuda" and dev.index is None:
-        bad = [(n, p.device) for n, p in m.named_parameters() if p.device.type != "cuda"]
-    else:
-        bad = [(n, p.device) for n, p in m.named_parameters() if p.device != dev]
-
+    # check ONLY .type (not full device equality)
+    bad = [(n, p.device) for n, p in m.named_parameters() if p.device.type != dev.type]
     if bad:
-        raise RuntimeError(f"Not all params on {dev}. Example: {bad[:10]}")
+        raise RuntimeError(f"Not all params on {dev.type}. Example: {bad[:10]}")
     return m
 
 def make_trainer(
@@ -1126,6 +1172,7 @@ def make_trainer(
 ):
     global GLOBAL_AD_FACTS_LIST
     GLOBAL_AD_FACTS_LIST = ad_facts_list
+    saved_policy_with_vhead = None
 
     # --- Load the tokenizer ---
     tokenizer = AutoTokenizer.from_pretrained(
@@ -1151,8 +1198,11 @@ def make_trainer(
                     trust_remote_code=True,
                     token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
                     torch_dtype=torch.float16,  # Use float16 on GPU
+                    attn_implementation="sdpa",
+
                     low_cpu_mem_usage=True,  # Reduce memory usage during loading
                 )
+                saved_policy_with_vhead = policy
             except (RuntimeError, ValueError) as e:
                 raise
             policy = MyPPOTrainer.ensure_llamafactory_tuple_output(policy, logger)
@@ -1172,12 +1222,15 @@ def make_trainer(
         logger.error(f"❌ Failed to load model: {e}")
         raise e
 
+    # Create ref AFTER policy exists, but KEEP ref on CPU
     ref = create_reference_model(policy)
-    policy = force_valuehead_all_cuda(policy, "cuda")
-
-
-    if torch.cuda.is_available():
-        ref = force_valuehead_all_cuda(ref, "cuda")
+    MyPPOTrainer.ensure_llamafactory_tuple_output(ref, logger)
+    if hasattr(ref, "pretrained_model"):
+        MyPPOTrainer.ensure_llamafactory_tuple_output(ref.pretrained_model, logger)
+    ref.eval()
+    for p in ref.parameters():
+        p.requires_grad = False
+    ref.to("cpu")
 
     ref.eval()
     for p in ref.parameters():
@@ -1245,28 +1298,33 @@ def make_trainer(
         callbacks       = None,
         model           = policy,
         reward_model    = None,
-        ref_model       = ref,
+        ref_model       = None,
         tokenizer       = tokenizer,
         processor       = None,
         data_collator   = collator,
         train_dataset   = ds,
         ad_facts_list   = ad_facts_list,
     )
+    trainer.ref_model = ref
+    trainer._ref_model = ref
+    trainer.ref_model.to("cpu")
+    for p in trainer.ref_model.parameters():
+        p.requires_grad = False
+    trainer.ref_model.eval()
+    if saved_policy_with_vhead is not None:
+        trainer._policy_with_vhead = saved_policy_with_vhead
+    else:
+        trainer._policy_with_vhead = trainer.model  # fallback
+    
 
     dev = trainer.accelerator.device
-    trainer.model = force_valuehead_all_cuda(trainer.model, dev)
     print("accelerator.device:", trainer.accelerator.device)
     if trainer.ref_model is not None:
-        trainer.ref_model = force_valuehead_all_cuda(trainer.ref_model, dev)
-    u = trainer.accelerator.unwrap_model(trainer.model)
-    print("trainer.model param device:", next(trainer.model.parameters()).device)
-    uu = trainer.accelerator.unwrap_model(trainer.model)
-    print("unwrapped param device:", next(uu.parameters()).device)
-    assert next(u.parameters()).device.type == "cuda", f"policy still on {next(u.parameters()).device}"
+        trainer.ref_model.to("cpu")
+    
     if trainer.ref_model is not None:
         ru = trainer.accelerator.unwrap_model(trainer.ref_model)
-        assert next(ru.parameters()).device.type == "cuda", f"ref still on {next(ru.parameters()).device}"
-
+        print("ref device:", next(ru.parameters()).device)  # should be cpu
     pol_u = trainer.accelerator.unwrap_model(trainer.model)
     print("wrapper:", next(pol_u.parameters()).device)
     print("base:", next(pol_u.pretrained_model.parameters()).device)
