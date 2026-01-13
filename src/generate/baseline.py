@@ -1,58 +1,95 @@
+# baseline.py
+from __future__ import annotations
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
-def generate_baseline_response(query, ad_facts):
+_MODEL = None
+_TOKENIZER = None
+
+
+def _is_sharded(model) -> bool:
+    return hasattr(model, "hf_device_map") and isinstance(model.hf_device_map, dict) and len(model.hf_device_map) > 1
+
+
+def _tokenize_for_generate(prompt: str, tokenizer, model):
+    tok = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    # If model is not sharded, we can safely move inputs to model.device
+    if not _is_sharded(model):
+        tok = tok.to(model.device)
+    return tok
+
+
+def get_baseline_model(model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"):
+    """Load once per process."""
+    global _MODEL, _TOKENIZER
+    if _MODEL is None or _TOKENIZER is None:
+        _TOKENIZER = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        _MODEL = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+        )
+        _MODEL.eval()
+
+        if _TOKENIZER.pad_token_id is None:
+            _TOKENIZER.pad_token = _TOKENIZER.eos_token
+
+    return _MODEL, _TOKENIZER
+
+
+def extract_final_answer(text: str) -> str:
+    if "FINAL ANSWER:" in text:
+        return text.split("FINAL ANSWER:", 1)[-1].strip()
+    return text.strip()
+
+
+@torch.no_grad()
+def generate_baseline_response(query: str, ad_facts: dict) -> str:
     """
-    Generate a response with an ad using a simple prompt template without any training.
-    
-    Args:
-        query (str): The user's query
-        ad_facts (dict): Dictionary containing ad information (product, brand, url, description)
-    
-    Returns:
-        str: Generated response with ad
+    Baseline response WITH ad (no training).
+    Uses FINAL ANSWER marker to match prompts.py style.
     """
-    # Load model and tokenizer
-    model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
-    
-    # Create prompt template
-    prompt = f"""User Query: {query}
+    model, tokenizer = get_baseline_model()
 
-Please provide a helpful response to the user's query. Naturally incorporate the following product information into your response:
+    # support both keys
+    desc = ad_facts.get("description") or ad_facts.get("ad_description") or ""
 
-Product: {ad_facts['ad_product']}
-Brand: {ad_facts['brand']}
-Description: {ad_facts['description']}
-URL: {ad_facts['url']}
+    prompt = f"""You are a helpful assistant.
 
-Your response should:
-1. Directly answer the user's query
-2. Naturally mention the product once
-3. Include the product URL
-4. Maintain a helpful and conversational tone
+User Query: {query}
 
-Response:"""
-    
-    # Generate response
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+Naturally incorporate this product info once, only if it supports the user:
+Product: {ad_facts.get('ad_product','')}
+Brand: {ad_facts.get('brand','')}
+Description: {desc}
+URL: {ad_facts.get('url','')}
+
+FINAL ANSWER:
+"""
+
+    inputs = _tokenize_for_generate(prompt, tokenizer, model)
     outputs = model.generate(
         **inputs,
         max_new_tokens=200,
         temperature=0.7,
         top_p=0.9,
-        do_sample=True
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+        use_cache=False,
     )
-    
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
-    # Extract just the response part (after "Response:")
-    response = response.split("Response:")[-1].strip()
-    
-    return response 
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return extract_final_answer(decoded)
+
+
+def clear_baseline_model_cache():
+    """Free RAM/VRAM for a fresh start."""
+    global _MODEL, _TOKENIZER
+    _MODEL = None
+    _TOKENIZER = None
+    if torch.cuda.is_available():
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()

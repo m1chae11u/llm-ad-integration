@@ -33,6 +33,9 @@ from config import DATA_FILE
 import os
 import types
 from collections import deque
+import math
+import torch
+from trl.core import logprobs_from_logits
 
 # Note: We're now using processing_class instead of deprecated tokenizer
 # No need to suppress warnings since we're not using the deprecated attribute
@@ -128,21 +131,17 @@ class MyPPOTrainer(CustomPPOTrainer):
         ad_facts_list: Optional[List[dict]] = None,
         **kwargs,
     ):
-        # Extract data_collator from kwargs before passing to super
-        # We need to ensure our custom collator is used
+        
         custom_collator = kwargs.get('data_collator', None)
         
-        # CRITICAL: Extract and preserve train_dataset before parent __init__
-        # The parent class might filter or transform it, so we need to ensure it's preserved
+        
         train_dataset = kwargs.get('train_dataset', None)
         if train_dataset is not None:
             # Store original dataset length for verification
             original_len = len(train_dataset)
             logger.info(f"📊 Preserving train_dataset with {original_len} rows before parent __init__")
             
-            # CRITICAL: Store original dataset BEFORE calling super().__init__()
-            # This is needed because prepare_dataloader is called during super().__init__()
-            # and we need _original_train_dataset to be available then
+            
             self._original_train_dataset = train_dataset
             
             # NOTE: Do NOT add 'dataset' to kwargs - parent class doesn't accept it
@@ -156,6 +155,7 @@ class MyPPOTrainer(CustomPPOTrainer):
         # Call super first to initialize self.args, self.tokenizer, etc.
         # The parent class will handle train_dataset from kwargs
         super().__init__(*args, **kwargs)
+        
         
         # CRITICAL: Restore dataset if parent filtered it (double-check after init)
         if train_dataset is not None:
@@ -231,10 +231,6 @@ class MyPPOTrainer(CustomPPOTrainer):
         else:
             print("⚠️ train_dataset not yet available, will initialize dataloader when needed")
         
-        # # Force CPU mode by overriding current_device
-        # self.current_device = DEVICE
-        # print(f"🔧 Forced trainer to use device: {self.current_device}")
-
     @staticmethod
     def ensure_llamafactory_tuple_output(model, logger):
         import types, torch
@@ -242,35 +238,46 @@ class MyPPOTrainer(CustomPPOTrainer):
             return model
 
         original_forward = model.forward
+
         def patched_forward(self, *args, **kwargs):
             return_dict = kwargs.pop("return_dict", True)
             out = original_forward(*args, return_dict=return_dict, **kwargs)
 
+            # ✅ TRL ValueHead common case: (lm_out, values)
+            if isinstance(out, tuple) and len(out) >= 2 and hasattr(out[0], "logits"):
+                lm_out = out[0]
+                logits = lm_out.logits
+                pkv = getattr(lm_out, "past_key_values", None)
+                values = out[1]
+
+                # normalize values shape to [bs, seq]
+                if isinstance(values, torch.Tensor):
+                    if values.dim() == 1:
+                        values = values.unsqueeze(1).expand(-1, logits.shape[1])
+                    if values.dim() == 2 and values.shape[1] == 1:
+                        values = values.expand(-1, logits.shape[1])
+
+                return (logits, pkv, values)
+
+            # HF output object case (has logits)
             if hasattr(out, "logits"):
                 logits = out.logits
                 pkv = getattr(out, "past_key_values", None)
-                value = getattr(out, "value", None)
+                values = getattr(out, "value", None)
 
-                if value is None:
-                    bs = logits.shape[0]
-                    sl = logits.shape[1] if logits.dim() > 1 else 1
-                    value = torch.zeros(bs, sl, device=logits.device, dtype=logits.dtype)
+                if torch.is_tensor(values):
+                    # normalize values shape to [bs, seq]
+                    if values.dim() == 1:
+                        values = values.unsqueeze(1).expand(-1, logits.shape[1])
+                    if values.dim() == 2 and values.shape[1] == 1:
+                        values = values.expand(-1, logits.shape[1])
+                    return (logits, pkv, values)
 
-                if isinstance(value, torch.Tensor):
-                    if value.dim() == 1:
-                        value = value.unsqueeze(1).expand(-1, logits.shape[1])
-                    if value.dim() == 2 and value.shape[1] == 1:
-                        value = value.expand(-1, logits.shape[1])
+                # couldn't find value — just return original out (non-fatal)
+                return out
 
-                return (logits, pkv, value)
-
-            if isinstance(out, tuple):
-                return (out + (None, None, None))[:3]
-
-            if isinstance(out, dict):
-                return (out.get("logits"), out.get("past_key_values"), out.get("value", out.get("values")))
-
-            return (out, None, None)
+            # last resort
+            return out
 
         model.forward = types.MethodType(patched_forward, model)
         model._patched_forward_llf = True
@@ -401,46 +408,13 @@ class MyPPOTrainer(CustomPPOTrainer):
             for prompt, idx in zip(full_prompts_no_ad, dataset_idxs)
         ])
 
-        # Get model - CRITICAL: Don't move it! It's already on the correct device.
-        # Moving causes OOM because PyTorch creates a duplicate copy in memory.
+      
         model = self.accelerator.unwrap_model(self.model)
+        policy_u = self.accelerator.unwrap_model(self.model)
+        model_device = next(self.accelerator.unwrap_model(self.model).parameters()).device
+
         
-        # Determine model's actual device
-        # With device_map="auto", model should be on GPU
-        # Check base model first (value head might be on different device)
-        try:
-            # Try to get device from base model (more reliable)
-            if hasattr(model, 'pretrained_model'):
-                # This is a model with value head - check base model
-                base_model = model.pretrained_model
-                model_device = next(base_model.parameters()).device
-            elif hasattr(model, 'model'):
-                # Some models wrap in .model attribute
-                model_device = next(model.model.parameters()).device
-            else:
-                # Check multiple parameters to find the actual device
-                devices = set()
-                param_count = 0
-                for param in model.parameters():
-                    devices.add(param.device)
-                    param_count += 1
-                    if param_count >= 20:  # Check more parameters
-                        break
-                
-                # Prefer GPU if available
-                if torch.cuda.is_available() and any(d.type == "cuda" for d in devices):
-                    model_device = torch.device("cuda")
-                elif len(devices) == 1:
-                    model_device = devices.pop()
-                else:
-                    # Use first GPU device found, or first device
-                    cuda_devices = [d for d in devices if d.type == "cuda"]
-                    model_device = cuda_devices[0] if cuda_devices else next(iter(devices))
-        except (StopIteration, AttributeError, RuntimeError) as e:
-            # Fallback: if GPU available, use GPU; otherwise CPU
-            model_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            logger.debug(f"Device detection fallback: {e}")
-        
+    
         # Debug: log device info (only first time)
         if not hasattr(self, '_device_logged'):
             cur = getattr(self, "current_device", None) or getattr(self.accelerator, "device", None)
@@ -456,40 +430,39 @@ class MyPPOTrainer(CustomPPOTrainer):
         attention_mask_no_ad = batch_no_ad["attention_mask"].to(model_device)
 
         # --- Generate responses ---
-        gen_kwargs = self.generation_config.to_dict()
-        for k in ["skip_special_tokens", "max_length", "pad_token_id", "eos_token_id"]:
-            gen_kwargs.pop(k, None)
+        # gen_kwargs = self.generation_config.to_dict()
+        # for k in ["skip_special_tokens", "max_length", "pad_token_id", "eos_token_id"]:
+        #     gen_kwargs.pop(k, None)
 
         # Generate with ads
+        pad_id = self._custom_tokenizer.pad_token_id
+
         gen_out_ad = model.generate(
             generation_config=self.generation_config,
             input_ids=input_ids_ad,
             attention_mask=attention_mask_ad,
-            pad_token_id=self._custom_tokenizer.pad_token_id,
-            **gen_kwargs,
+            pad_token_id=pad_id,
         )
 
-        # Generate without ads
         gen_out_no_ad = model.generate(
             generation_config=self.generation_config,
             input_ids=input_ids_no_ad,
             attention_mask=attention_mask_no_ad,
-            pad_token_id=self._custom_tokenizer.pad_token_id,
-            **gen_kwargs,
+            pad_token_id=pad_id,
         )
 
         # --- Extract responses relative to prompt length ---
         response_tensors_ad = []
         response_tensors_no_ad = []
+        full_prompt_len_ad = input_ids_ad.size(1)
+        full_prompt_len_no = input_ids_no_ad.size(1)
         for i in range(input_ids_ad.size(0)):
-            prompt_len_ad = attention_mask_ad[i].sum().item()
-            prompt_len_no = attention_mask_no_ad[i].sum().item()
-            response_tensors_ad.append(gen_out_ad[i, prompt_len_ad:])
-            response_tensors_no_ad.append(gen_out_no_ad[i, prompt_len_no:])
+            response_tensors_ad.append(gen_out_ad[i, full_prompt_len_ad:])
+            response_tensors_no_ad.append(gen_out_no_ad[i, full_prompt_len_no:])
 
         # Store no-ad responses for detectability
         decoded_no_ad = [
-            self._custom_tokenizer.decode(t, skip_special_tokens=True)
+            self._custom_tokenizer.decode(t.detach().cpu().tolist(), skip_special_tokens=True)
             for t in response_tensors_no_ad
         ]
         self.no_ad_responses.extend(decoded_no_ad)
@@ -500,7 +473,15 @@ class MyPPOTrainer(CustomPPOTrainer):
 
         # Return query tensors (with-ad prompts) and response tensors
         # Ensure they are lists of tensors (not batched tensors)
-        query_tensors = [input_ids_ad[i].clone() for i in range(input_ids_ad.size(0))]
+        query_tensors = []
+        for i in range(input_ids_ad.size(0)):
+            nonpad = attention_mask_ad[i].nonzero(as_tuple=False)
+            if nonpad.numel() == 0:
+                query_tensors.append(input_ids_ad[i, -1:].clone())
+            else:
+                first = nonpad[0].item()
+                query_tensors.append(input_ids_ad[i, first:].clone())
+
         response_tensors = [r.clone() for r in response_tensors_ad]
         return query_tensors, response_tensors
 
@@ -577,69 +558,11 @@ class MyPPOTrainer(CustomPPOTrainer):
 
         return {"input_ids": input_ids, "attention_mask": attention_mask}
 
-    # @torch.no_grad()
-    # def get_rewards(
-    #     self,
-    #     queries: list[torch.Tensor],
-    #     responses: list[torch.Tensor],
-    # ) -> list[torch.Tensor]:
-    #     # Decode all prompts and responses to strings
-    #     prompts = [
-    #         self._custom_tokenizer.decode(q_ids, skip_special_tokens=True)
-    #         for q_ids in queries
-    #     ]
-    #     responses_text = [
-    #         self._custom_tokenizer.decode(r_ids, skip_special_tokens=True)
-    #         for r_ids in responses
-    #     ]
-    #     # Prepare ad text blocks: use the same batch ad_texts from generation if available
-    #     if hasattr(self, '_last_batch_ad_texts'):
-    #         ad_texts = self._last_batch_ad_texts
-    #     else:
-    #         ad_texts = []
-    #         # Use dataset_idx from the batch, not batch index
-    #         dataset_idxs = getattr(self, '_last_batch_dataset_idxs', list(range(len(prompts))))
-    #         for i, idx in enumerate(dataset_idxs):
-    #             if idx < len(self.ad_facts_list):
-    #                 ad = self.ad_facts_list[idx]
-    #                 ad_texts.append(
-    #                     f"Product: {ad['ad_product']}\n"
-    #                     f"Brand: {ad['brand']}\n"
-    #                     f"URL: {ad['url']}\n"
-    #                     f"Description: {ad['ad_description']}"
-    #                 )
-    #             else:
-    #                 logger.warning(f"Dataset index {idx} out of range for ad_facts_list (len={len(self.ad_facts_list)})")
-    #                 ad_texts.append("")
-    #     # Extract no-ad responses from buffer for detectability
-    #     # Ensure we have enough no-ad responses
-    #     # Pull matching no-ad responses for detectability (same batch size)
-    #     no_ads = [(PPO_NO_AD_BUFFER.popleft() if PPO_NO_AD_BUFFER else "") for _ in responses_text]
-    #     if any(x == "" for x in no_ads):
-    #         logger.warning("⚠️ detectability: buffer underflow (missing no-ad responses).")
-
-    #     # Batch all async judge calls
-    #     async def batch_judge():
-    #         sc_tasks = [judge_coherence_async(p, r) for p, r in zip(prompts, responses_text)]
-    #         sh_tasks = [judge_helpfulness_async(p, r) for p, r in zip(prompts, responses_text)]
-    #         ss_tasks = [
-    #             judge_ad_salience_async(p, r, ad_text)
-    #             for p, r, ad_text in zip(prompts, responses_text, ad_texts)
-    #         ]
-    #         det_tasks = [judge_detectability_async(r, na) for r, na in zip(responses_text, no_ads)]
-    #         return await asyncio.gather(
-    #             asyncio.gather(*sc_tasks),
-    #             asyncio.gather(*sh_tasks),
-    #             asyncio.gather(*ss_tasks),
-    #             asyncio.gather(*det_tasks),
-    #         )
-
-    #     sc_list, sh_list, ss_list, det_list = asyncio.run(batch_judge())
     @torch.no_grad()
     def get_rewards(self, queries, responses):
         #  response text only
         responses_text = [
-            self._custom_tokenizer.decode(r_ids, skip_special_tokens=True)
+            self._custom_tokenizer.decode(r_ids.detach().cpu().tolist(), skip_special_tokens=True)
             for r_ids in responses
         ]
 
@@ -672,6 +595,7 @@ class MyPPOTrainer(CustomPPOTrainer):
             sh_tasks  = [judge_helpfulness_async(q, r) for q, r in zip(raw_qs, responses_text)]
             ss_tasks  = [judge_ad_salience_async(q, r, a) for q, r, a in zip(raw_qs, responses_text, ad_infos)]
             det_tasks = [judge_detectability_async(r, na) for r, na in zip(responses_text, no_ads)]
+            
             return await asyncio.gather(
                 asyncio.gather(*sc_tasks),
                 asyncio.gather(*sh_tasks),
@@ -816,14 +740,168 @@ class MyPPOTrainer(CustomPPOTrainer):
         
         return rewards, non_score_reward, kls
 
-    def batched_forward_pass(self, model, queries, responses, model_inputs, return_logits=False, response_masks=None):
-        """
-        Override batched_forward_pass to ensure model output is converted to tuple format.
-        The parent class expects (logits, past_key_values, values) but our model returns ModelOutput.
-        Matches parent class signature exactly: (self, model, queries, responses, model_inputs, return_logits=False, response_masks=None)
-        """
-        result = super().batched_forward_pass(model, queries, responses, model_inputs, return_logits=return_logits, response_masks=response_masks)
-        return result
+    def batched_forward_pass(
+        self,
+        model,
+        queries,
+        responses,
+        model_inputs,
+        return_logits: bool = False,
+        response_masks=None,
+    ):
+        if not hasattr(self, "_vh_debugged"):
+            print("BFP model type:", type(model))
+            uw = self.accelerator.unwrap_model(model)
+            print("unwrapped type:", type(uw))
+            print("has v_head on model:", hasattr(model, "v_head"))
+            print("has v_head on unwrapped:", hasattr(uw, "v_head"))
+            self._vh_debugged = True
+        if not hasattr(self, "_bfp_seen"):
+            print("✅ USING MyPPOTrainer.batched_forward_pass")
+            self._bfp_seen = True
+
+        # LlamaFactory uses mini_batch_size from config
+        bs = len(queries)
+        fbs = getattr(self.config, "mini_batch_size", bs)
+
+        all_logprobs, all_logits, all_masks, all_values = [], [], [], []
+
+        for i in range(math.ceil(bs / fbs)):
+            input_kwargs = {k: v[i * fbs : (i + 1) * fbs] for k, v in model_inputs.items()}
+            query_batch = queries[i * fbs : (i + 1) * fbs]
+            response_batch = responses[i * fbs : (i + 1) * fbs]
+
+            unwrapped = self.accelerator.unwrap_model(model)
+            model_device = next(unwrapped.parameters()).device
+
+            # move tensors
+            for k, v in list(input_kwargs.items()):
+                if torch.is_tensor(v) and v.device != model_device:
+                    input_kwargs[k] = v.to(model_device)
+
+            # ✅ IMPORTANT: rebind AFTER move (so these are CUDA tensors)
+            input_ids = input_kwargs["input_ids"]
+            attention_mask = input_kwargs["attention_mask"]
+
+            # dtype hygiene
+            if "attention_mask" in input_kwargs and input_kwargs["attention_mask"].dtype != torch.long:
+                input_kwargs["attention_mask"] = input_kwargs["attention_mask"].long()
+                attention_mask = input_kwargs["attention_mask"]
+
+            with self.amp_context:
+                out = unwrapped(**input_kwargs, return_dict=True, use_cache=False)
+
+            values = None  
+
+            # ---- extract logits/values from first pass ----
+            if isinstance(out, tuple):
+                # (logits, pkv, values) from your patch
+                if len(out) == 3 and torch.is_tensor(out[0]) and torch.is_tensor(out[2]):
+                    logits, _, values = out
+                # TRL style: (lm_out, values)
+                elif len(out) >= 2 and hasattr(out[0], "logits") and torch.is_tensor(out[1]):
+                    logits = out[0].logits
+                    values = out[1]
+                else:
+                    raise TypeError(f"Unexpected tuple forward output: {[type(x) for x in out]}")
+            else:
+                if not hasattr(out, "logits"):
+                    raise TypeError(f"Forward output has no logits: {type(out)}")
+                logits = out.logits
+                if hasattr(out, "value") and torch.is_tensor(out.value):
+                    values = out.value
+
+            # ---- if values still missing, rerun with hidden states ----
+            if values is None:
+                with self.amp_context:
+                    out_hs = unwrapped(
+                        **input_kwargs,
+                        return_dict=True,
+                        use_cache=False,
+                        output_hidden_states=True,
+                    )
+
+                logits = out_hs.logits
+                hs = out_hs.hidden_states[-1]  # [B,T,H]
+
+                vh = getattr(unwrapped, "v_head", None) or getattr(model, "v_head", None)
+                if vh is None:
+                    values = torch.zeros(
+                        hs.shape[0], hs.shape[1],
+                        device=logits.device,
+                        dtype=hs.dtype,
+                    )
+                else:
+                    values = vh(hs).squeeze(-1)
+
+            # values must exist now
+            if not torch.is_tensor(values):
+                raise TypeError(f"values is not a tensor: {type(values)}")
+
+            logits_s = logits[:, :-1, :]
+            labels   = input_ids[:, 1:]
+            logp = torch.log_softmax(logits_s, dim=-1)
+            if not hasattr(self, "_devcheck"):
+                print("logits:", logits.device, "input_ids:", input_ids.device, "labels:", labels.device)
+                self._devcheck = True
+            logprobs = logp.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+
+            if not torch.is_tensor(logprobs):
+                raise TypeError(f"logprobs is not a Tensor: {type(logprobs)}")
+
+            values = values.to(logits.device)
+
+            # normalize values to [B, T]
+            if values.dim() == 1:
+                values = values.unsqueeze(1).expand(-1, logits.shape[1])
+            elif values.dim() == 2 and values.shape[1] == 1:
+                values = values.expand(-1, logits.shape[1])
+            elif values.dim() == 3 and values.shape[-1] == 1:
+                values = values.squeeze(-1)
+
+            # build masks (same as TRL/LF)
+            masks = torch.zeros_like(attention_mask)
+            masks[:, :-1] = attention_mask[:, 1:]
+
+            for j in range(len(query_batch)):
+                start = max(0, len(query_batch[j]) - 1)
+                end = start + len(response_batch[j])
+                end = min(end, masks.shape[1])
+
+                masks[j, :start] = 0
+                masks[j, end:] = 0
+
+                if response_masks is not None:
+                    rm = response_masks[i * fbs : (i + 1) * fbs][j]
+
+                    if torch.is_tensor(rm):
+                        rm = rm.to(model_device)
+                    else:
+                        rm = torch.tensor(rm, device=model_device)
+
+                    rm = rm.long().view(-1)  # [resp_len] ideally
+
+                    resp_len = end - start
+                    if rm.numel() != resp_len:
+                        # robust fallback: trim or pad with ones
+                        if rm.numel() > resp_len:
+                            rm = rm[:resp_len]
+                        else:
+                            rm = torch.cat([rm, torch.ones(resp_len - rm.numel(), device=model_device, dtype=rm.dtype)])
+
+                    masks[j, start:end] = masks[j, start:end] * rm
+            all_logprobs.append(logprobs)
+            all_values.append(values)
+            all_masks.append(masks)
+            if return_logits:
+                all_logits.append(logits)
+
+        return (
+            torch.cat(all_logprobs),
+            torch.cat(all_logits)[:, :-1] if return_logits else None,
+            torch.cat(all_values)[:, :-1],
+            torch.cat(all_masks)[:, :-1],
+        )
 
     def ppo_train(self, resume_from_checkpoint=None, start_step=0, start_query_idx=0):
         # Clear GPU cache at start to free up memory
@@ -903,9 +981,6 @@ class MyPPOTrainer(CustomPPOTrainer):
                     print(f"⏱️  Time: {datetime.now().strftime('%H:%M:%S')}")
                     
                     self.model.eval()
-                    
-                    # Batch from dataloader contains lists (raw data), not tensors
-                    # No need to move to device - get_inputs will handle tokenization and device placement
                     
                     print("  📝 Generating responses...")
                     gen_start = time.time()
@@ -1017,6 +1092,32 @@ class MyPPOTrainer(CustomPPOTrainer):
             print("❌ PPO training ended with 0 valid steps.")
             sys.exit(1)
 
+
+def force_valuehead_all_cuda(m, device="cuda"):
+    import torch
+
+    dev = torch.device(device)
+    m = m.to(dev)
+
+    # TRL ValueHead wrapper: base model sits here
+    if hasattr(m, "pretrained_model") and m.pretrained_model is not None:
+        m.pretrained_model = m.pretrained_model.to(dev)
+
+    # Value head
+    if hasattr(m, "v_head") and m.v_head is not None:
+        m.v_head = m.v_head.to(dev)
+
+    # ✅ Hard check:
+    # If dev is "cuda" (no index), accept ANY cuda:{i}.
+    if dev.type == "cuda" and dev.index is None:
+        bad = [(n, p.device) for n, p in m.named_parameters() if p.device.type != "cuda"]
+    else:
+        bad = [(n, p.device) for n, p in m.named_parameters() if p.device != dev]
+
+    if bad:
+        raise RuntimeError(f"Not all params on {dev}. Example: {bad[:10]}")
+    return m
+
 def make_trainer(
     model_name: str,
     hf_token: str,
@@ -1043,41 +1144,19 @@ def make_trainer(
     logger.info(f"💻 Loading model for {device_str} training...")
     try:
         if torch.cuda.is_available():
-            # Use float16 on GPU for speed and memory efficiency
-            # NOTE: Cannot use device_map="auto" with ValueHead models (they don't support CPU/disk offloading)
-            # Try device_map="cuda:0" first (forces GPU, no offloading)
-            # If that fails, fall back to loading to CPU then moving to GPU
             try:
-                logger.info("📥 Loading model directly to GPU (device_map='cuda:0')...")
+                logger.info("📥 Loading policy (CPU load, then move to CUDA)...")
                 policy = AutoModelForCausalLMWithValueHead.from_pretrained(
                     model_name,
                     trust_remote_code=True,
                     token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
                     torch_dtype=torch.float16,  # Use float16 on GPU
-                    device_map="cuda:0",  # Force GPU, no offloading
                     low_cpu_mem_usage=True,  # Reduce memory usage during loading
                 )
-                policy = MyPPOTrainer.ensure_llamafactory_tuple_output(policy, logger)
-                logger.info("✅ Model loaded directly to GPU")
             except (RuntimeError, ValueError) as e:
-                if "out of memory" in str(e).lower() or "offload" in str(e).lower():
-                    logger.warning(f"⚠️ Direct GPU loading failed: {e}")
-                    logger.info("📥 Falling back to CPU loading then GPU move...")
-                    # Fallback: load to CPU first, then move to GPU
-                    policy = AutoModelForCausalLMWithValueHead.from_pretrained(
-                        model_name,
-                        trust_remote_code=True,
-                        token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
-                        torch_dtype=torch.float16,
-                        device_map=None,  # Load to CPU
-                        low_cpu_mem_usage=True,
-                    )
-                    policy = MyPPOTrainer.ensure_llamafactory_tuple_output(policy, logger)
-                    logger.info("🚀 Moving model to GPU...")
-                    policy = policy.to("cuda")
-                    logger.info("✅ Model loaded and moved to GPU")
-                else:
-                    raise
+                raise
+            policy = MyPPOTrainer.ensure_llamafactory_tuple_output(policy, logger)
+            logger.info(f"💻 Policy param device after load: {next(policy.parameters()).device}")
         else:
             # Use float32 on CPU
             policy = AutoModelForCausalLMWithValueHead.from_pretrained(
@@ -1087,29 +1166,19 @@ def make_trainer(
                 torch_dtype=torch.float32,  # CPU mode
                 device_map=None,
             ).to(DEVICE)
-        logger.info(f"💻 Model loaded on {DEVICE}")
+            policy = MyPPOTrainer.ensure_llamafactory_tuple_output(policy, logger)
+            logger.info(f"💻 Policy param device after load: {next(policy.parameters()).device}")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         raise e
 
-    # Debug: Verify patch is applied
-    logger.info(f"✅ Patched model forward method: {type(policy.forward)}")
-    # Test the patch works
-    try:
-        test_input = tokenizer("test", return_tensors="pt").to(next(policy.parameters()).device)
-        test_result = policy(**test_input, return_dict=True, use_cache=False)
-        if isinstance(test_result, tuple) and len(test_result) == 3:
-            logger.info(f"✅ Patch verification: Model returns tuple format correctly")
-        else:
-            logger.warning(f"⚠️ Patch verification FAILED: Model returns {type(test_result)}, length {len(test_result) if isinstance(test_result, (tuple, list)) else 'N/A'}")
-    except Exception as e:
-        logger.warning(f"⚠️ Patch verification test failed: {e}")
-
-    # --- Frozen reference model ---
     ref = create_reference_model(policy)
-    ref = ref.to(next(policy.parameters()).device)
-    ref = MyPPOTrainer.ensure_llamafactory_tuple_output(ref, logger)
-    
+    policy = force_valuehead_all_cuda(policy, "cuda")
+
+
+    if torch.cuda.is_available():
+        ref = force_valuehead_all_cuda(ref, "cuda")
+
     ref.eval()
     for p in ref.parameters():
         p.requires_grad = False
@@ -1118,8 +1187,6 @@ def make_trainer(
     ds = load_dataset("csv", data_files={"train": data_path})["train"]
     ds = ds.add_column("dataset_idx", list(range(len(ds))))
     
-    # Set format to python dicts (not Arrow) so our collator can work with it
-    # Keep dataset in raw format - the collator will handle tokenization
     ds.set_format(type="python")  # Use python format, not torch or arrow
 
     # --- Collator (single source of truth) ---
@@ -1148,7 +1215,7 @@ def make_trainer(
         logging_steps=10,  # Log less frequently
         max_grad_norm=1.0,
         gradient_checkpointing=True,
-        dataloader_num_workers=2 if torch.cuda.is_available() else 0,  # Enable workers on GPU
+        dataloader_num_workers=0,
         no_cuda=not torch.cuda.is_available(),  # Auto-detect
         dataloader_pin_memory=torch.cuda.is_available(),  # Pin memory on GPU
     )
@@ -1168,6 +1235,7 @@ def make_trainer(
         max_new_tokens=max_new_tokens,
     )
 
+
     # --- Build trainer ---
     trainer = MyPPOTrainer(
         model_args      = model_args,
@@ -1185,6 +1253,35 @@ def make_trainer(
         ad_facts_list   = ad_facts_list,
     )
 
+    dev = trainer.accelerator.device
+    trainer.model = force_valuehead_all_cuda(trainer.model, dev)
+    print("accelerator.device:", trainer.accelerator.device)
+    if trainer.ref_model is not None:
+        trainer.ref_model = force_valuehead_all_cuda(trainer.ref_model, dev)
+    u = trainer.accelerator.unwrap_model(trainer.model)
+    print("trainer.model param device:", next(trainer.model.parameters()).device)
+    uu = trainer.accelerator.unwrap_model(trainer.model)
+    print("unwrapped param device:", next(uu.parameters()).device)
+    assert next(u.parameters()).device.type == "cuda", f"policy still on {next(u.parameters()).device}"
+    if trainer.ref_model is not None:
+        ru = trainer.accelerator.unwrap_model(trainer.ref_model)
+        assert next(ru.parameters()).device.type == "cuda", f"ref still on {next(ru.parameters()).device}"
+
+    pol_u = trainer.accelerator.unwrap_model(trainer.model)
+    print("wrapper:", next(pol_u.parameters()).device)
+    print("base:", next(pol_u.pretrained_model.parameters()).device)
+    print("v_head:", next(pol_u.v_head.parameters()).device)
+
+    if trainer.ref_model is not None:
+        ref_u = trainer.accelerator.unwrap_model(trainer.ref_model)
+        MyPPOTrainer.ensure_llamafactory_tuple_output(ref_u, logger)
+        if hasattr(ref_u, "pretrained_model"):
+            MyPPOTrainer.ensure_llamafactory_tuple_output(ref_u.pretrained_model, logger)
+
+  
+    print("policy device:", next(trainer.model.parameters()).device)
+    if trainer.ref_model is not None:
+        print("ref device:", next(trainer.ref_model.parameters()).device)
     # Expose args + objects
     trainer.data_args = data_args
     trainer.model_args = model_args
@@ -1192,9 +1289,8 @@ def make_trainer(
     trainer.finetuning_args = finetuning_args
     trainer.generating_args = generating_args
     trainer.train_dataset = ds
-    trainer.ref_model = ref
     trainer._custom_tokenizer = tokenizer  # still available, but collator is preferred
-    
+
     # Now that train_dataset is set, initialize the dataloader if it wasn't done in __init__
     if trainer._dataloader_iter is None:
         trainer._reset_dataloader()
