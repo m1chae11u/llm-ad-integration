@@ -1,7 +1,8 @@
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
 import llamafactory.train.ppo.workflow as _wf
 _wf.create_reward_model = lambda model, model_args, finetuning_args: None
 from llamafactory.train.ppo.workflow import CustomPPOTrainer
-import torch
 import asyncio
 import time
 from typing import List, Optional
@@ -30,7 +31,6 @@ from pathlib import Path
 import sys  # for handling interrupt and exit
 import json
 from config import DATA_FILE
-import os
 import types
 from collections import deque
 import math
@@ -52,7 +52,6 @@ GLOBAL_AD_FACTS_LIST: List[dict] = []
 # Auto-detect device (GPU if available, otherwise CPU)
 # Set memory fragmentation optimization for CUDA
 if torch.cuda.is_available():
-    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     DEVICE = torch.device("cuda")
     print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
     print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
@@ -318,7 +317,6 @@ class MyPPOTrainer(CustomPPOTrainer):
         return model
 
     def prepare_dataloader(self, dataset, data_collator):
-        import torch.utils.data
 
         # prefer preserved original dataset
         if getattr(self, "_original_train_dataset", None) is not None:
@@ -387,21 +385,22 @@ class MyPPOTrainer(CustomPPOTrainer):
                 raise RuntimeError(f"Failed to get batch: {e}")
     
    
-
     @torch.no_grad()
     def get_inputs(self, batch):
-        """Generate responses with and without ads."""
+        """Generate responses with and without ads (sequentially to reduce peak VRAM)."""
+
         # Handle both list-of-dicts and batched-dict formats from DataLoader
         if isinstance(batch, dict) and "vague_query" in batch:
-            # Batched dict format - convert to list of dicts
             batch_size = len(batch["vague_query"])
             batch = [
-                {key: batch[key][i] if isinstance(batch[key], (list, tuple)) else batch[key]
-                 for key in batch.keys()}
+                {
+                    key: (batch[key][i] if isinstance(batch[key], (list, tuple)) else batch[key])
+                    for key in batch.keys()
+                }
                 for i in range(batch_size)
             ]
-        
-        # Decode raw queries for logging
+
+        # Raw user queries for logging / judge inputs
         raw_qs = [ex["vague_query"] for ex in batch]
         self._last_batch_raw_qs = raw_qs
 
@@ -431,19 +430,16 @@ class MyPPOTrainer(CustomPPOTrainer):
         self._last_batch_ad_texts = ad_texts
         self._last_batch_dataset_idxs = dataset_idxs
 
-        # --- Use collator for tokenization & padding ---
-        # Tokenize prompts explicitly for clarity and error handling
-        batch_with_ad = self.data_collator([
-            {"text": prompt, "dataset_idx": idx}
-            for prompt, idx in zip(full_prompts_ad, dataset_idxs)
-        ])
-        batch_no_ad = self.data_collator([
-            {"text": prompt, "dataset_idx": idx}
-            for prompt, idx in zip(full_prompts_no_ad, dataset_idxs)
-        ])
+        # --- Tokenize via your collator (pads + returns tensors) ---
+        batch_with_ad = self.data_collator(
+            [{"text": prompt, "dataset_idx": idx} for prompt, idx in zip(full_prompts_ad, dataset_idxs)]
+        )
+        batch_no_ad = self.data_collator(
+            [{"text": prompt, "dataset_idx": idx} for prompt, idx in zip(full_prompts_no_ad, dataset_idxs)]
+        )
 
-      
-        model = self.model  # possibly wrapped
+        # --- Resolve the actual device of the policy model (handles accelerate wrapping) ---
+        model = self.model
         u = self.accelerator.unwrap_model(model)
         base = getattr(u, "pretrained_model", u)
         model_device = next(base.parameters()).device
@@ -454,68 +450,85 @@ class MyPPOTrainer(CustomPPOTrainer):
                 "Accelerate did not place model on GPU."
             )
 
-        
-    
         # Debug: log device info (only first time)
-        if not hasattr(self, '_device_logged'):
+        if not hasattr(self, "_device_logged"):
             cur = getattr(self, "current_device", None) or getattr(self.accelerator, "device", None)
             logger.info(f"🔧 Model device: {model_device}, Current device: {cur}")
             if model_device.type == "cpu" and torch.cuda.is_available():
-                logger.warning(f"⚠️ Model is on CPU but GPU is available - this will be very slow!")
+                logger.warning("⚠️ Model is on CPU but GPU is available - this will be very slow!")
             self._device_logged = True
-        
-        # Move inputs to model's device (not self.current_device which might be wrong)
+
+        # Move inputs to the model's device
         input_ids_ad = batch_with_ad["input_ids"].to(model_device)
         attention_mask_ad = batch_with_ad["attention_mask"].to(model_device)
         input_ids_no_ad = batch_no_ad["input_ids"].to(model_device)
         attention_mask_no_ad = batch_no_ad["attention_mask"].to(model_device)
 
-        # --- Generate responses ---
-        # gen_kwargs = self.generation_config.to_dict()
-        # for k in ["skip_special_tokens", "max_length", "pad_token_id", "eos_token_id"]:
-        #     gen_kwargs.pop(k, None)
-
-        # Generate with ads
         pad_id = self._custom_tokenizer.pad_token_id
+        bs = input_ids_ad.size(0)
+        full_prompt_len_ad = input_ids_ad.size(1)
+        full_prompt_len_no = input_ids_no_ad.size(1)
 
-        gen_out_ad = model.generate(
-            generation_config=self.generation_config,
-            input_ids=input_ids_ad,
-            attention_mask=attention_mask_ad,
-            pad_token_id=pad_id,
-        )
-
+        # =========================
+        # 1) Generate NO-AD FIRST
+        #    Decode/store for detectability, then free tensors to reduce peak VRAM.
+        # =========================
         gen_out_no_ad = model.generate(
             generation_config=self.generation_config,
             input_ids=input_ids_no_ad,
             attention_mask=attention_mask_no_ad,
             pad_token_id=pad_id,
+            use_cache=False,
         )
 
-        # --- Extract responses relative to prompt length ---
-        response_tensors_ad = []
-        response_tensors_no_ad = []
-        full_prompt_len_ad = input_ids_ad.size(1)
-        full_prompt_len_no = input_ids_no_ad.size(1)
-        for i in range(input_ids_ad.size(0)):
-            response_tensors_ad.append(gen_out_ad[i, full_prompt_len_ad:])
-            response_tensors_no_ad.append(gen_out_no_ad[i, full_prompt_len_no:])
+        response_tensors_no_ad = [
+            gen_out_no_ad[i, full_prompt_len_no:].detach().cpu()
+            for i in range(bs)
+        ]
 
-        # Store no-ad responses for detectability
         decoded_no_ad = [
-            self._custom_tokenizer.decode(t.detach().cpu().tolist(), skip_special_tokens=True)
+            self._custom_tokenizer.decode(t.tolist(), skip_special_tokens=True)
             for t in response_tensors_no_ad
         ]
+
+        # Store no-ad responses for detectability
         self.no_ad_responses.extend(decoded_no_ad)
         self._last_batch_no_ads = decoded_no_ad
-
         for t in decoded_no_ad:
             PPO_NO_AD_BUFFER.append(t)
 
-        # Return query tensors (with-ad prompts) and response tensors
-        # Ensure they are lists of tensors (not batched tensors)
+        # Free big no-ad tensors ASAP
+        del gen_out_no_ad, response_tensors_no_ad
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # optional; helps fragmentation in long runs
+
+        # =========================
+        # 2) Generate WITH-AD
+        #    This is what PPO optimizes on.
+        # =========================
+        gen_out_ad = model.generate(
+            generation_config=self.generation_config,
+            input_ids=input_ids_ad,
+            attention_mask=attention_mask_ad,
+            pad_token_id=pad_id,
+            use_cache=False,
+        )
+
+        response_tensors_ad = [
+            gen_out_ad[i, full_prompt_len_ad:].detach()
+            for i in range(bs)
+        ]
+
+        # Free full generated tensors (keep only response slices)
+        del gen_out_ad
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # =========================
+        # Build query_tensors from WITH-AD prompts (trim left padding)
+        # =========================
         query_tensors = []
-        for i in range(input_ids_ad.size(0)):
+        for i in range(bs):
             nonpad = attention_mask_ad[i].nonzero(as_tuple=False)
             if nonpad.numel() == 0:
                 query_tensors.append(input_ids_ad[i, -1:].clone())
@@ -525,6 +538,7 @@ class MyPPOTrainer(CustomPPOTrainer):
 
         response_tensors = [r.clone() for r in response_tensors_ad]
         return query_tensors, response_tensors
+
 
     def prepare_model_inputs(self, queries, responses):
         """
@@ -537,8 +551,6 @@ class MyPPOTrainer(CustomPPOTrainer):
             Dict[str, torch.Tensor]: {"input_ids": [B, T], "attention_mask": [B, T]}
             Both tensors are placed on the policy model's device.
         """
-        import torch
-
         # ✅ policy device (works with accelerate wrappers)
         u = self.accelerator.unwrap_model(self.model)
         base = getattr(u, "pretrained_model", u)
@@ -729,9 +741,7 @@ class MyPPOTrainer(CustomPPOTrainer):
             rewards: Per-token rewards, shape (batch_size, response_length)
             non_score_reward: KL penalty per token, shape (batch_size, response_length)
             kls: KL divergence per token, shape (batch_size, response_length)
-        """
-        import torch
-        
+        """        
         # CRITICAL: Ensure all tensors are on the same device
         # Get device from logprobs (policy model output, should be on CUDA)
         target_device = logprobs.device
@@ -942,7 +952,7 @@ class MyPPOTrainer(CustomPPOTrainer):
                 "device:", next(u2.parameters()).device)
         # Clear GPU cache at start to free up memory
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
             torch.cuda.synchronize()
             total_mem = torch.cuda.get_device_properties(0).total_memory
             allocated_mem = torch.cuda.memory_allocated(0)
@@ -1130,8 +1140,6 @@ class MyPPOTrainer(CustomPPOTrainer):
 
 
 def force_valuehead_all_cuda(m, device="cuda:0"):
-    import torch
-
     # normalize "cuda" -> "cuda:0"
     if device == "cuda":
         device = f"cuda:{torch.cuda.current_device()}"
@@ -1354,4 +1362,7 @@ def make_trainer(
         trainer._reset_dataloader()
 
     return trainer
+
+
+
 
