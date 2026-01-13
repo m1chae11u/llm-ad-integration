@@ -28,51 +28,103 @@ def _load_ad_facts(csv_path: str) -> list[dict]:
 
 def _rebind_model_and_optimizer_for_accelerate(trainer, model, tokenizer, ckpt_dir: Path | None):
     """
-    Make the checkpoint-loaded model usable inside an already-constructed Accelerate trainer:
+    Make a checkpoint-loaded model usable inside an already-constructed Accelerate trainer,
+    WITHOUT causing an extra model.to(cuda) pass (which is what OOMs).
+
+    Steps:
     - attach model + tokenizer
-    - rebuild optimizer on the new model params
-    - load optimizer state (optional)
-    - accelerator.prepare(model, optimizer)
-    - reapply forward patch
+    - ensure forward patch on the underlying model
+    - (optionally) move model to accelerator.device only if needed
+    - rebuild optimizer on new params
+    - load optimizer state (optional, CPU load)
+    - prepare optimizer with accelerate WITHOUT moving model again
     """
-    # Attach checkpoint model + tokenizer
+
+    if model is None or tokenizer is None:
+        print("No checkpoint model/tokenizer provided; skipping rebind.")
+        return
+    # ----------------------------
+    # 1) Attach checkpoint model + tokenizer
+    # ----------------------------
     trainer.model = model
     trainer._custom_tokenizer = tokenizer
 
-    # CRITICAL: keep this pointing to the vhead policy object that should be restored if LF overwrites
+    # Keep this pointing to the vhead policy object that should be restored if LF overwrites
     trainer._policy_with_vhead = model
 
-    # Rebuild optimizer so it binds to *this* model's parameter objects
+    # ----------------------------
+    # 2) Reapply forward patch early (checkpoint load can drop monkeypatches)
+    #    IMPORTANT: patch the *underlying* model object
+    # ----------------------------
+    trainer.model = MyPPOTrainer.ensure_llamafactory_tuple_output(trainer.model, logger)
+
+    # ----------------------------
+    # 3) Ensure model is on the right device (ONLY if needed)
+    #    Do NOT rely on accelerate.prepare(model, ...) to move it (that can OOM).
+    # ----------------------------
+    target_device = getattr(trainer.accelerator, "device", torch.device("cpu"))
+    try:
+        base = getattr(trainer.model, "pretrained_model", trainer.model)
+        cur_device = next(base.parameters()).device
+    except StopIteration:
+        cur_device = torch.device("cpu")
+
+    if cur_device != target_device:
+        if target_device.type == "cuda":
+            # Reduce fragmentation before a big move
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        trainer.model.to(target_device)
+
+    # ----------------------------
+    # 4) Rebuild optimizer bound to *this* model's params
+    # ----------------------------
     lr = getattr(trainer.args, "learning_rate", 5e-5) if hasattr(trainer, "args") else 5e-5
     wd = getattr(trainer.args, "weight_decay", 0.0) if hasattr(trainer, "args") else 0.0
     trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=lr, weight_decay=wd)
 
-    # Load optimizer state if available
+    # ----------------------------
+    # 5) Load optimizer state if available (CPU load first)
+    # ----------------------------
     if ckpt_dir is not None:
         opt_path = ckpt_dir / "optimizer.pt"
         if opt_path.exists():
-            # Load to CPU first; accelerate will move as needed
             state = torch.load(opt_path, map_location="cpu")
             trainer.optimizer.load_state_dict(state)
             print(f"✅ Loaded optimizer state from {opt_path}")
         else:
             print(f"⚠️ No optimizer.pt found at {opt_path} (continuing with fresh optimizer)")
 
-    # Re-wrap for accelerate so model + optimizer live consistently on the right device
-    trainer.model, trainer.optimizer = trainer.accelerator.prepare(trainer.model, trainer.optimizer)
+    # ----------------------------
+    # 6) Prepare optimizer with Accelerate WITHOUT moving model again
+    #    This is the critical part that avoids your OOM.
+    # ----------------------------
+    already_prepared = getattr(trainer, "_already_prepared", False)
 
-    # Reapply forward patch (checkpoint load can drop monkeypatches)
-    trainer.model = MyPPOTrainer.ensure_llamafactory_tuple_output(trainer.model, logger)
+    if already_prepared:
+        # Trainer/model are already wrapped; just prepare optimizer alone.
+        trainer.optimizer = trainer.accelerator.prepare(trainer.optimizer)
+    else:
+        # Prepare both, but DO NOT device-place the model (prevents model.to(cuda) inside accelerate)
+        trainer.model, trainer.optimizer = trainer.accelerator.prepare(
+            trainer.model,
+            trainer.optimizer,
+            device_placement=[False, True],
+        )
+        trainer._already_prepared = True
 
-    # Optional: sanity print device + v_head
+    # ----------------------------
+    # 7) Final sanity prints (use unwrapped)
+    # ----------------------------
     u = trainer.accelerator.unwrap_model(trainer.model)
-    base = getattr(u, "pretrained_model", u)
+    base_u = getattr(u, "pretrained_model", u)
     has_v = hasattr(u, "v_head") and (u.v_head is not None)
+
     print(f"🔎 Resume sanity: has_v_head={has_v}")
-    print(f"🔎 Resume sanity: base_device={next(base.parameters()).device}")
+    print(f"🔎 Resume sanity: base_device={next(base_u.parameters()).device}")
     if has_v:
         print(f"🔎 Resume sanity: v_head_device={next(u.v_head.parameters()).device}")
-
 
 def main():
     # 1) Load ad facts
@@ -110,13 +162,12 @@ def main():
         ckpt_dir = Path(ckpt_info["latest_checkpoint"])
         resume_step = int(ckpt_info.get("step", 0))
         print(f"⏯ Resuming from checkpoint: {ckpt_dir} (step={resume_step})")
+
+        _rebind_model_and_optimizer_for_accelerate(trainer, model, tokenizer, ckpt_dir)
     else:
         ckpt_dir = None
         resume_step = 0
         print("⏺ No valid checkpoint found, starting fresh PPO training")
-
-    # 4) Bind checkpoint model into trainer safely (accelerate + optimizer rebinding)
-    _rebind_model_and_optimizer_for_accelerate(trainer, model, tokenizer, ckpt_dir)
 
     # 5) Run PPO training
     print("⏱ Starting PPO training...")

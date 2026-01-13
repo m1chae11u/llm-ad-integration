@@ -1313,6 +1313,7 @@ def make_trainer(
         train_dataset   = ds,
         ad_facts_list   = ad_facts_list,
     )
+    trainer._already_prepared = True
     trainer.ref_model = ref
     trainer._ref_model = ref
     trainer.ref_model.to("cpu")
