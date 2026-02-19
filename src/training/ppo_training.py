@@ -1197,19 +1197,38 @@ def make_trainer(
     # --- Load the policy (with value head) ---
     device_str = "GPU" if torch.cuda.is_available() else "CPU"
     logger.info(f"💻 Loading model for {device_str} training...")
+    use_8bit = os.getenv("USE_8BIT", "false").lower() == "true"
     try:
         if torch.cuda.is_available():
             try:
-                logger.info("📥 Loading policy (CPU load, then move to CUDA)...")
-                policy = AutoModelForCausalLMWithValueHead.from_pretrained(
-                    model_name,
-                    trust_remote_code=True,
-                    token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
-                    torch_dtype=torch.float16,  # Use float16 on GPU
-                    attn_implementation="sdpa",
-
-                    low_cpu_mem_usage=True,  # Reduce memory usage during loading
-                )
+                if use_8bit:
+                    logger.info("📥 Loading policy with 8-bit quantization (reduces memory by ~50%)...")
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_8bit=True,
+                        llm_int8_threshold=6.0,
+                    )
+                    policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+                        model_name,
+                        trust_remote_code=True,
+                        token=hf_token,
+                        quantization_config=quantization_config,
+                        device_map="cuda:0",
+                        low_cpu_mem_usage=True,
+                    )
+                    if hasattr(policy, "gradient_checkpointing_enable"):
+                        policy.gradient_checkpointing_enable()
+                    elif hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "gradient_checkpointing_enable"):
+                        policy.pretrained_model.gradient_checkpointing_enable()
+                else:
+                    logger.info("📥 Loading policy (CPU load, then move to CUDA)...")
+                    policy = AutoModelForCausalLMWithValueHead.from_pretrained(
+                        model_name,
+                        trust_remote_code=True,
+                        token=hf_token,  # Use 'token' instead of deprecated 'use_auth_token'
+                        torch_dtype=torch.float16,  # Use float16 on GPU
+                        attn_implementation="sdpa",
+                        low_cpu_mem_usage=True,  # Reduce memory usage during loading
+                    )
                 saved_policy_with_vhead = policy
             except (RuntimeError, ValueError) as e:
                 raise
@@ -1263,14 +1282,17 @@ def make_trainer(
     # Speed optimization: Allow configurable batch size and epochs via environment variables
     # Reduced GPU batch size from 8 to 4 to avoid OOM errors
     batch_size = int(os.getenv("PPO_BATCH_SIZE", "4" if torch.cuda.is_available() else "4"))
+    gradient_accumulation_steps = int(os.getenv("PPO_GRADIENT_ACCUMULATION_STEPS", "1"))
+    mini_batch_size = int(os.getenv("PPO_MINI_BATCH_SIZE", "2"))  # Forward-pass sub-batch to reduce peak activation memory
     ppo_epochs = int(os.getenv("PPO_EPOCHS", "2" if torch.cuda.is_available() else "1"))  # Reduced from 4
     max_new_tokens = int(os.getenv("MAX_NEW_TOKENS", "256" if torch.cuda.is_available() else "128"))  # Reduced from 512
-    
-    print(f"⚙️ Training config: batch_size={batch_size}, epochs={ppo_epochs}, max_new_tokens={max_new_tokens}")
-    
+
+    print(f"⚙️ Training config: batch_size={batch_size}, gradient_accumulation_steps={gradient_accumulation_steps}, mini_batch_size={mini_batch_size}, epochs={ppo_epochs}, max_new_tokens={max_new_tokens}")
+
     training_args   = TrainingArguments(
         output_dir="logs/ppo_run",
         per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         save_strategy="steps",
         save_steps=100,  # Save less frequently to reduce I/O
         logging_steps=10,  # Log less frequently
@@ -1281,7 +1303,7 @@ def make_trainer(
         dataloader_pin_memory=torch.cuda.is_available(),  # Pin memory on GPU
     )
     finetuning_args = FinetuningArguments(
-        ppo_epochs=ppo_epochs, 
+        ppo_epochs=ppo_epochs,
         ppo_buffer_size=1,
         reward_model_type="api",  # Using custom get_rewards with API judges, not model-based
         ppo_target=0.1,  # Default KL divergence target for PPO
@@ -1314,6 +1336,12 @@ def make_trainer(
         ad_facts_list   = ad_facts_list,
     )
     trainer._already_prepared = True
+    # Forward-pass mini-batching: sub-batch size for batched_forward_pass to reduce peak activation memory
+    if hasattr(trainer, "config") and trainer.config is not None:
+        trainer.config.mini_batch_size = mini_batch_size
+    elif hasattr(trainer, "finetuning_args") and trainer.finetuning_args is not None:
+        trainer.finetuning_args.mini_batch_size = mini_batch_size
+
     trainer.ref_model = ref
     trainer._ref_model = ref
     trainer.ref_model.to("cpu")

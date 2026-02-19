@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Callable
 
@@ -64,12 +65,28 @@ class CheckpointManager:
         return (ckpt / "tokenizer_config.json").exists() or (ckpt / "tokenizer.json").exists()
 
     def _load_valuehead_model(self, path: str | Path):
-        # You can add torch_dtype/device_map here if you want,
-        # but keep it minimal/stable for resume correctness.
+        # Match training load: USE_8BIT and torch_dtype so resume does not OOM or mismatch.
+        use_8bit = os.getenv("USE_8BIT", "false").lower() == "true"
+        if use_8bit:
+            from transformers import BitsAndBytesConfig
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+            )
+            return AutoModelForCausalLMWithValueHead.from_pretrained(
+                path,
+                trust_remote_code=True,
+                token=self.hf_token,
+                quantization_config=quantization_config,
+                device_map="cuda:0" if torch.cuda.is_available() else None,
+                low_cpu_mem_usage=True,
+            )
         return AutoModelForCausalLMWithValueHead.from_pretrained(
             path,
             trust_remote_code=True,
             token=self.hf_token,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            low_cpu_mem_usage=True,
         )
 
     def _load_tokenizer(self, path: str | Path):
