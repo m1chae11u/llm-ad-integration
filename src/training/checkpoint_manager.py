@@ -51,6 +51,10 @@ class CheckpointManager:
 
     @staticmethod
     def _looks_like_model_dir(ckpt: Path) -> bool:
+        # Must have TRL v_head weights to be a valid PPO checkpoint
+        has_vhead = (ckpt / "pytorch_model_value_head.bin").exists()
+        if not has_vhead:
+            return False
         # Covers: sharded safetensors, single safetensors, pytorch_model.bin
         return (
             (ckpt / "model.safetensors").exists()
@@ -65,6 +69,9 @@ class CheckpointManager:
         return (ckpt / "tokenizer_config.json").exists() or (ckpt / "tokenizer.json").exists()
 
     def _load_valuehead_model(self, path: str | Path):
+        # TRL's from_pretrained requires a string (not PosixPath) and rejects relative local paths
+        p = Path(path)
+        path = str(p.resolve()) if p.exists() else str(path)
         # Match training load: USE_8BIT and torch_dtype so resume does not OOM or mismatch.
         use_8bit = os.getenv("USE_8BIT", "false").lower() == "true"
         if use_8bit:

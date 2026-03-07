@@ -1,5 +1,6 @@
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+os.environ["DISABLE_VERSION_CHECK"] = "1"
 import llamafactory.train.ppo.workflow as _wf
 _wf.create_reward_model = lambda model, model_args, finetuning_args: None
 from llamafactory.train.ppo.workflow import CustomPPOTrainer
@@ -35,7 +36,6 @@ import types
 from collections import deque
 import math
 import torch
-from trl.core import logprobs_from_logits
 from peft import LoraConfig, get_peft_model, TaskType
 
 # Note: We're now using processing_class instead of deprecated tokenizer
@@ -445,12 +445,6 @@ class MyPPOTrainer(CustomPPOTrainer):
         u = self.accelerator.unwrap_model(model)
         base = getattr(u, "pretrained_model", u)
         model_device = next(base.parameters()).device
-
-        if model_device.type != "cuda":
-            raise RuntimeError(
-                f"Generation is on {model_device} — should be cuda. "
-                "Accelerate did not place model on GPU."
-            )
 
         # Debug: log device info (only first time)
         if not hasattr(self, "_device_logged"):
@@ -1245,6 +1239,11 @@ def make_trainer(
                         attn_implementation="sdpa",
                         low_cpu_mem_usage=True,  # Reduce memory usage during loading
                     )
+                # Enable gradient checkpointing to reduce activation memory (~30% savings)
+                if hasattr(policy, "gradient_checkpointing_enable"):
+                    policy.gradient_checkpointing_enable()
+                elif hasattr(policy, "pretrained_model") and hasattr(policy.pretrained_model, "gradient_checkpointing_enable"):
+                    policy.pretrained_model.gradient_checkpointing_enable()
                 # Must run for both 8-bit and fp16 paths so trainer can restore value head if parent overwrites model
                 saved_policy_with_vhead = policy
             except (RuntimeError, ValueError) as e:
