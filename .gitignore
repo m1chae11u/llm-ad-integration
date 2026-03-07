@@ -13,3 +13,4 @@ generator_test_output.json
 checkpoints/ppo_llama/*.bin
 checkpoints/ppo_llama/*.safetensors
 checkpoints/ppo_llama/optimizer.pt
+logs/

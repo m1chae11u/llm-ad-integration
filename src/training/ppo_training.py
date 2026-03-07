@@ -36,6 +36,7 @@ from collections import deque
 import math
 import torch
 from trl.core import logprobs_from_logits
+from peft import LoraConfig, get_peft_model, TaskType
 
 # Note: We're now using processing_class instead of deprecated tokenizer
 # No need to suppress warnings since we're not using the deprecated attribute
@@ -173,7 +174,8 @@ class MyPPOTrainer(CustomPPOTrainer):
             # IMPORTANT: rebuild optimizer to match restored parameters
             lr = getattr(self.args, "learning_rate", 5e-5)
             wd = getattr(self.args, "weight_decay", 0.0)
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
+            trainable = [p for p in self.model.parameters() if p.requires_grad]
+            self.optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=wd)
 
             # prepare BOTH together so accelerate wraps consistently
             self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
@@ -832,9 +834,10 @@ class MyPPOTrainer(CustomPPOTrainer):
             response_batch = responses[i * fbs : (i + 1) * fbs]
 
             # move inputs to model_device (CUDA for policy; CPU for ref if you keep ref on CPU)
+            actual_device = next(base.parameters()).device
             for k, v in list(input_kwargs.items()):
-                if torch.is_tensor(v) and v.device != model_device:
-                    input_kwargs[k] = v.to(model_device)
+                if torch.is_tensor(v):
+                    input_kwargs[k] = v.to(actual_device)
             if "attention_mask" in input_kwargs:
                 input_kwargs["attention_mask"] = input_kwargs["attention_mask"].long()
 
@@ -863,7 +866,11 @@ class MyPPOTrainer(CustomPPOTrainer):
             # values:
             if need_values:
                 hs = out.hidden_states[-1]     # [B,T,H]
+                # free all other hidden states
+                del out
                 values = m_u.v_head(hs).squeeze(-1)  # [B,T]
+                del hs
+                torch.cuda.empty_cache()
             else:
                 # reference model: values not used; return zeros with correct shape
                 values = torch.zeros(
@@ -942,7 +949,8 @@ class MyPPOTrainer(CustomPPOTrainer):
             if not hasattr(self, "optimizer") or self.optimizer is None:
                 lr = getattr(self.args, "learning_rate", 5e-5)
                 wd = getattr(self.args, "weight_decay", 0.0)
-                self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
+                trainable = [p for p in self.model.parameters() if p.requires_grad]
+                self.optimizer = torch.optim.AdamW(trainable, lr=lr, weight_decay=wd)
 
             # prepare together so accelerate wraps consistently
             self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
@@ -1094,7 +1102,15 @@ class MyPPOTrainer(CustomPPOTrainer):
                             checkpoint_dir.mkdir(parents=True, exist_ok=True)
                             
                             # Save model and tokenizer
-                            self.model.save_pretrained(checkpoint_dir)
+                            u_save = self.accelerator.unwrap_model(self.model)
+                            base_save = getattr(u_save, "pretrained_model", u_save)
+                            if hasattr(base_save, "peft_config"):
+                                # LoRA: save adapter weights only (much smaller than full model)
+                                base_save.save_pretrained(checkpoint_dir)
+                                if hasattr(u_save, "v_head") and u_save.v_head is not None:
+                                    torch.save(u_save.v_head.state_dict(), checkpoint_dir / "v_head.pt")
+                            else:
+                                self.model.save_pretrained(checkpoint_dir)
                             if hasattr(self, '_custom_tokenizer') and self._custom_tokenizer:
                                 self._custom_tokenizer.save_pretrained(checkpoint_dir)
                             
@@ -1229,9 +1245,31 @@ def make_trainer(
                         attn_implementation="sdpa",
                         low_cpu_mem_usage=True,  # Reduce memory usage during loading
                     )
+                # Must run for both 8-bit and fp16 paths so trainer can restore value head if parent overwrites model
                 saved_policy_with_vhead = policy
             except (RuntimeError, ValueError) as e:
                 raise
+            # --- Apply LoRA to the backbone (reduces trainable params from 8B to ~20M) ---
+            use_lora = os.getenv("USE_LORA", "true").lower() == "true"
+            if use_lora:
+                lora_r = int(os.getenv("LORA_R", "16"))
+                lora_alpha = int(os.getenv("LORA_ALPHA", "32"))
+                lora_dropout = float(os.getenv("LORA_DROPOUT", "0.05"))
+                lora_targets = os.getenv("LORA_TARGET_MODULES", "q_proj,v_proj").split(",")
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=lora_r,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    target_modules=[m.strip() for m in lora_targets],
+                    bias="none",
+                )
+                policy.pretrained_model = get_peft_model(policy.pretrained_model, lora_config)
+                # Required for gradient checkpointing to work with PEFT
+                policy.pretrained_model.enable_input_require_grads()
+                policy.pretrained_model.print_trainable_parameters()
+                logger.info("LoRA applied to policy backbone.")
+
             policy = MyPPOTrainer.ensure_llamafactory_tuple_output(policy, logger)
             logger.info(f"💻 Policy param device after load: {next(policy.parameters()).device}")
         else:
