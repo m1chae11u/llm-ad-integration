@@ -13,21 +13,10 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import dotenv
-import google.generativeai as genai  # For Gemini judge API
+from google import genai
+from google.genai import types as genai_types
 import asyncio
 import aiohttp
-
-# Try to import new Google GenAI client for embeddings
-try:
-    from google import genai as google_genai
-    from google.genai import types as genai_types
-    HAS_NEW_GENAI = True
-except ImportError:
-    HAS_NEW_GENAI = False
-    # Only print warning if actually needed (suppress if package is installed but import fails for other reasons)
-    import sys
-    if "--verbose" in sys.argv or os.getenv("VERBOSE", "").lower() == "true":
-        print("⚠️ New google.genai package not found, will use REST API for embeddings")
 
 
 # Load environment variables
@@ -46,19 +35,7 @@ if not GOOGLE_API_KEY:
 # Use Google embeddings instead of OpenAI to avoid rate limits
 # Keep OpenAI client as optional fallback
 embedding_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-genai.configure(api_key=GOOGLE_API_KEY)  # For Gemini judge API
-
-# Initialize Google GenAI client for embeddings (new API)
-google_embedding_client = None
-if HAS_NEW_GENAI and GOOGLE_API_KEY:
-    try:
-        # The new google.genai.Client can be initialized with api_key parameter
-        google_embedding_client = google_genai.Client(api_key=GOOGLE_API_KEY)
-        print("✅ Google GenAI client initialized for embeddings")
-    except Exception as e:
-        print(f"⚠️ Failed to initialize Google GenAI client: {e}")
-        print(f"   Will use REST API fallback for embeddings")
-        HAS_NEW_GENAI = False
+gemini_client = genai.Client(api_key=GOOGLE_API_KEY)  # For Gemini judge + embeddings
 
 # Cache for embeddings and judge results
 _embedding_cache = {}
@@ -85,87 +62,16 @@ def get_embedding(text: str, model: str = None) -> np.ndarray:
     
     for attempt in range(max_retries):
         try:
-            # Try new Google GenAI client first (recommended)
-            if HAS_NEW_GENAI and google_embedding_client:
-                result = google_embedding_client.models.embed_content(
-                    model="gemini-embedding-001",
-                    contents=text,
-                    config=genai_types.EmbedContentConfig(
-                        output_dimensionality=1536,  # Match existing code dimension
-                        task_type="SEMANTIC_SIMILARITY"  # Good for similarity comparisons
-                    )
+            result = gemini_client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=text,
+                config=genai_types.EmbedContentConfig(
+                    output_dimensionality=1536,  # Match existing code dimension
+                    task_type="SEMANTIC_SIMILARITY"  # Good for similarity comparisons
                 )
-                # Extract embedding values
-                embedding = np.array(result.embeddings[0].values)
-                
-            else:
-                # Fallback: Use REST API directly
-                import requests
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
-                headers = {
-                    "x-goog-api-key": GOOGLE_API_KEY,
-                    "Content-Type": "application/json"
-                }
-                
-                # Try with minimal format first (required fields only)
-                data = {
-                    "content": {"parts": [{"text": text}]}
-                }
-                
-                response = requests.post(url, headers=headers, json=data, timeout=30)
-                
-                # If 403, try with model in data (some APIs require it)
-                if response.status_code == 403:
-                    data = {
-                        "model": "models/gemini-embedding-001",
-                        "content": {"parts": [{"text": text}]}
-                    }
-                    response = requests.post(url, headers=headers, json=data, timeout=30)
-                
-                # If still fails, try with optional params
-                if response.status_code == 403:
-                    data = {
-                        "model": "models/gemini-embedding-001",
-                        "content": {"parts": [{"text": text}]},
-                        "output_dimensionality": 1536
-                    }
-                    response = requests.post(url, headers=headers, json=data, timeout=30)
-                
-                # Check response - 403 means permission issue
-                if response.status_code == 403:
-                    error_detail = ""
-                    try:
-                        error_json = response.json()
-                        error_detail = error_json.get('error', {}).get('message', response.text)
-                    except:
-                        error_detail = response.text[:200]  # First 200 chars
-                    
-                    print(f"⚠️  Google Embedding API returned 403 Forbidden")
-                    print(f"   This usually means:")
-                    print(f"   1. Embedding API not enabled in Google Cloud Console")
-                    print(f"   2. API key doesn't have embedding permissions")
-                    print(f"   3. API key is invalid or expired")
-                    print(f"   Error details: {error_detail}")
-                    print(f"   Falling back to OpenAI embeddings...")
-                    raise Exception("Google Embedding API 403 - using fallback")
-                
-                response.raise_for_status()
-                result = response.json()
-                
-                # Handle different response formats
-                if 'embedding' in result:
-                    if 'values' in result['embedding']:
-                        embedding = np.array(result['embedding']['values'])
-                    else:
-                        embedding = np.array(result['embedding'])
-                elif 'embeddings' in result and len(result['embeddings']) > 0:
-                    if 'values' in result['embeddings'][0]:
-                        embedding = np.array(result['embeddings'][0]['values'])
-                    else:
-                        embedding = np.array(result['embeddings'][0])
-                else:
-                    raise ValueError(f"Unexpected response format: {result}")
-            
+            )
+            embedding = np.array(result.embeddings[0].values)
+
             # Normalize embedding for better similarity calculations (recommended for non-3072 dims)
             embedding = embedding / np.linalg.norm(embedding)
             
@@ -264,42 +170,19 @@ def clear_caches():
 
 async def call_gemini_api(prompt, keys, max_retries=3, backoff_factor=1.0):
     """Call Gemini API and extract JSON response asynchronously with retry logic."""
-    # Recommended models for judging (in order of preference):
-    # 1. gemini-2.5-flash: Stable, best price-performance, fast, supports structured outputs
-    # 2. gemini-3-flash-preview: Latest and fastest, but preview (may have issues)
-    # 3. gemini-2.5-pro: Better quality but slower/expensive
-    # 4. gemini-2.0-flash: Older but stable fallback
-    model_names = [
-        'gemini-2.5-flash',        # Best choice: stable, fast, cost-effective
-        'gemini-3-flash-preview',  # Latest preview (fastest, newest)
-        'gemini-2.5-pro',          # Higher quality but slower
-        'gemini-2.0-flash',        # Stable fallback
-    ]
-    
-    model = None
-    for model_name in model_names:
-        try:
-            model = genai.GenerativeModel(model_name)
-            # Test if model is accessible
-            break
-        except Exception as e:
-            continue
-    
-    if model is None:
-        # Final fallback
-        print(f"⚠️ Warning: Could not initialize any Gemini model. Using 'gemini-2.5-flash' as fallback...")
-        model = genai.GenerativeModel('gemini-2.5-flash')
-    
+    model_name = 'gemini-2.5-flash'  # Stable, best price-performance, fast, supports structured outputs
+
     for attempt in range(max_retries):
         try:
             response = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config={
-                    "temperature": 0.1,
-                    "top_p": 0.1,
-                    "top_k": 1,
-                }
+                gemini_client.models.generate_content,
+                model=model_name,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.1,
+                    top_p=0.1,
+                    top_k=1,
+                )
             )
             
             # Extract JSON from response with robust parsing

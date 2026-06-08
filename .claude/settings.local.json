@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep \"AutoModelForVision2Seq\" /lambda/nfs/KAJP-Storage/llm-ad-integration/venv/lib/python3.12/site-packages/transformers/__init__.py 2>/dev/null | head -3; python3 -c \"import transformers; print\\(transformers.__version__\\)\" 2>/dev/null || /lambda/nfs/KAJP-Storage/llm-ad-integration/venv/bin/python3 -c \"import transformers; print\\(transformers.__version__\\)\")"
+    ]
+  }
+}
